@@ -123,3 +123,4 @@ JSON output structure:
 - This is a triage helper, not a full malware sandbox or decompiler.
 - Behavioral detections are signature/heuristic based and may produce false positives or miss novel techniques.
 - Network-based runtime C2 resolution (`eth_call`) is best-effort and may fail due to missing indicators, RPC issues, or decoding variance.
+- Do NOT rely on this as a means to ensure your safety with any java application.
