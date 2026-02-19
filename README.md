@@ -43,6 +43,7 @@ Discord-focused detection includes:
 ## Inspiration
 
 I saw this on [YouTube](https://www.youtube.com/watch?v=bsZJo49RaBE):
+
 ![Loser](https://i.imgur.com/mlxkzbL.png)
 
 It was yet another super obvious Minecraft account stealer/trojan using a fake video to entice fools to lose their accounts.
