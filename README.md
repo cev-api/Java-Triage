@@ -43,11 +43,15 @@ Discord-focused detection includes:
 ## Inspiration
 
 I saw this on [YouTube](https://www.youtube.com/watch?v=bsZJo49RaBE):
-![Loser](https://i.imgur.com/u8gfP1j.png)
+![Loser](https://i.imgur.com/mlxkzbL.png)
 
 It was yet another super obvious Minecraft account stealer/trojan using a fake video to entice fools to lose their accounts.
 
 This led me to make this Python app to quickly triage such obvious distributions. Turns out yes, it does steal your Minecraft credentials and sends it to a Discord webhook, obfuscated behind another API. It then downloads another trojan which using JNIC (poorly) extracts a Windows binary for a second payload. Given that payload wasn't also Java my interest stopped there for now.
+
+Update: Mediafire has added a warning in response to this repo, how nice of them!
+
+![Media](https://i.imgur.com/nTrHgDA.png)
 
 ## Requirements
 
