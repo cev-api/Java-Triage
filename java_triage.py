@@ -28,7 +28,7 @@ BANNER = r"""     __              ______    _
  __ / /__ __  _____ /_  __/___(_)__ ____ ____ 
 / // / _ `/ |/ / _ `// / / __/ / _ `/ _ `/ -_)
 \___/\_,_/|___/\_,_//_/ /_/ /_/\_,_/\_, /\__/ 
-          github.com/cev-api      /___/      
+            github.com/cev-api      /___/      
     
     """
 
@@ -87,6 +87,16 @@ DISCORD_ID_CONTEXT_RE = re.compile(
     r"(?:\bguild(?:_id)?\b|\bserver(?:_id)?\b|\bchannel(?:_id)?\b|\buser(?:_id)?\b|\brole(?:_id)?\b|\bapplication(?:_id)?\b|\bdiscord\b)",
     re.IGNORECASE,
 )
+HTTP_HOST_RE = re.compile(r'https?://([^/:\s"\'<>]+)', re.IGNORECASE)
+ASSESSMENT_PREFIX = "assessment_"
+
+MINECRAFT_AUTH_HOSTS = {
+    "login.live.com",
+    "auth.xboxlive.com",
+    "user.auth.xboxlive.com",
+    "xsts.auth.xboxlive.com",
+    "api.minecraftservices.com",
+}
 
 
 @dataclass
@@ -556,6 +566,19 @@ def _extract_native_methods(text: str, contains_any: List[str]) -> List[str]:
     return sorted(set(methods))
 
 
+def _contains_any(text: str, needles: List[str]) -> bool:
+    return any(n in text for n in needles)
+
+
+def _extract_http_hosts(text: str) -> set[str]:
+    # Ignore URLs inside comments to reduce host classification false positives.
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    hosts: set[str] = set()
+    for m in HTTP_HOST_RE.finditer(text):
+        hosts.add(m.group(1).lower())
+    return hosts
+
+
 def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     text = path.read_text(encoding="utf-8", errors="replace")
     rel = str(path.relative_to(root))
@@ -603,47 +626,199 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
-    if "class_310.method_1551()" in text and "method_1548()" in text:
+    has_get_game_profile = _contains_any(text, ["method_7334()", "getGameProfile()"])
+    has_get_session = _contains_any(text, ["method_1548()", "getSession()", "getUser()"])
+    has_get_access_token = _contains_any(text, ["method_1674()", "getAccessToken()"])
+    has_fake_player_clone = False
+    has_self_name_filtering = False
+    has_session_profile_override = False
+    has_username_or_session_switching = False
+    has_token_sent_to_trusted_chain = False
+    has_mixed_token_destinations = False
+    has_possible_token_exfiltration = False
+    has_credential_exfil_post = False
+    has_internal_profile_key_usage = False
+    has_token_getter_passthrough = False
+
+    if has_get_game_profile:
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "class_310.method_1551()"),
+                line=find_line(text, "getGameProfile()") if "getGameProfile()" in text else find_line(text, "method_7334()"),
+                behavior="minecraft_gameprofile_access",
+                evidence="Reads player GameProfile (method_7334/getGameProfile)",
+            )
+        )
+
+    if has_get_session:
+        session_line = find_line(text, "getSession()")
+        if session_line == 1 and "getSession()" not in text:
+            session_line = find_line(text, "getUser()")
+        if session_line == 1 and "getUser()" not in text:
+            session_line = find_line(text, "method_1548()")
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=session_line,
                 behavior="minecraft_session_access",
-                evidence="Accesses Minecraft client session object",
+                evidence="Accesses Minecraft session/user object (method_1548/getSession/getUser)",
             )
         )
 
-    if "method_1676()" in text:
+    if "method_1676()" in text or ".getName()" in text:
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "method_1676()"),
+                line=find_line(text, "method_1676()") if "method_1676()" in text else find_line(text, ".getName()"),
                 behavior="minecraft_username_access",
-                evidence="Reads Minecraft session username (method_1676)",
+                evidence="Reads Minecraft session username (method_1676/getName)",
             )
         )
 
-    if "method_44717()" in text:
+    if "method_44717()" in text or ".getProfileId()" in text:
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "method_44717()"),
+                line=find_line(text, "method_44717()") if "method_44717()" in text else find_line(text, ".getProfileId()"),
                 behavior="minecraft_uuid_access",
-                evidence="Reads Minecraft session UUID (method_44717)",
+                evidence="Reads Minecraft session UUID (method_44717/getProfileId)",
             )
         )
 
-    if "method_1674()" in text:
+    if has_get_access_token:
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "method_1674()"),
+                line=find_line(text, "getAccessToken()") if "getAccessToken()" in text else find_line(text, "method_1674()"),
                 behavior="minecraft_access_token_access",
-                evidence="Reads Minecraft session access token (method_1674)",
+                evidence="Reads Minecraft session access token (method_1674/getAccessToken)",
+            )
+        )
+        if "private final String mcAccessToken;" in text and "return mcAccessToken;" in text:
+            has_token_getter_passthrough = True
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "return mcAccessToken;"),
+                    behavior="token_field_getter_passthrough",
+                    evidence="Access token is returned as a plain DTO/profile field accessor",
+                )
+            )
+
+    if "extends RemotePlayer" in text and "super(" in text and "getGameProfile()" in text:
+        has_fake_player_clone = True
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "super("),
+                behavior="profile_use_fake_player_clone",
+                evidence="Uses local GameProfile when constructing a fake/remote player clone",
+            )
+        )
+
+    if "getGameProfile().name()" in text and "names.remove(selfName)" in text:
+        has_self_name_filtering = True
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "getGameProfile().name()"),
+                behavior="profile_use_self_name_filtering",
+                evidence="Reads own GameProfile name and removes it from scanned player set",
+            )
+        )
+
+    if (
+        'method = "getGameProfile()Lcom/mojang/authlib/GameProfile;"' in text
+        and "new GameProfile(" in text
+        and ".getProfileId()" in text
+        and ".getName()" in text
+    ):
+        has_session_profile_override = True
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, 'method = "getGameProfile()Lcom/mojang/authlib/GameProfile;"'),
+                behavior="session_profile_override",
+                evidence="Intercepts getGameProfile and returns profile id/name derived from the active replacement session",
+            )
+        )
+
+    if "setWurstSession(" in text and "wurstSession" in text:
+        has_username_or_session_switching = True
+
+    if "setWurstSession(" in text and "new User(" in text:
+        has_username_or_session_switching = True
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "setWurstSession("),
+                behavior="username_or_session_switching",
+                evidence="Constructs replacement User session and switches the active client identity",
+            )
+        )
+
+    token_markers = [
+        "method_1674()",
+        "getAccessToken()",
+        "session.getAccessToken()",
+        "mcAccessToken",
+        "access_token",
+    ]
+    has_token_material = _contains_any(text, token_markers)
+    has_auth_header = "Authorization" in text and "Bearer " in text
+    if has_token_material and has_auth_header:
+        hosts = _extract_http_hosts(text)
+        trusted_hosts = {h for h in hosts if h in MINECRAFT_AUTH_HOSTS}
+        untrusted_hosts = hosts - MINECRAFT_AUTH_HOSTS
+        if trusted_hosts and not untrusted_hosts:
+            has_token_sent_to_trusted_chain = True
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "Authorization"),
+                    behavior="token_sent_to_minecraft_auth_chain",
+                    evidence="Bearer token appears limited to trusted Microsoft/Minecraft auth hosts: "
+                    + ", ".join(sorted(trusted_hosts)),
+                )
+            )
+        elif trusted_hosts and untrusted_hosts:
+            has_mixed_token_destinations = True
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "Authorization"),
+                    behavior="mixed_token_destinations_review",
+                    evidence="Bearer token usage touches trusted and non-trusted hosts; trusted="
+                    + ",".join(sorted(trusted_hosts))
+                    + " untrusted="
+                    + ",".join(sorted(untrusted_hosts)),
+                )
+            )
+        elif untrusted_hosts:
+            has_possible_token_exfiltration = True
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "Authorization"),
+                    behavior="possible_access_token_exfiltration",
+                    evidence="Bearer token usage appears on non-Microsoft/Minecraft hosts: "
+                    + ", ".join(sorted(untrusted_hosts)),
+                )
+            )
+
+    if has_get_access_token and ("createUserApiService(" in text or "ProfileKeyPairManager.create(" in text):
+        has_internal_profile_key_usage = True
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "createUserApiService(") if "createUserApiService(" in text else find_line(text, "ProfileKeyPairManager.create("),
+                behavior="token_use_profile_key_or_user_api_setup",
+                evidence="Uses access token for local profile-key/user-api initialization rather than outbound exfiltration flow",
             )
         )
 
     if "payload.addProperty" in text and "client.send(req" in text:
+        has_credential_exfil_post = True
         out.append(
             BehaviorFinding(
                 file=rel,
@@ -795,6 +970,87 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 line=find_line(text, "download"),
                 behavior="dropper_elevation_helper",
                 evidence="Contains helper logic for dropping files to disk and elevation workflow",
+            )
+        )
+
+    # Context-aware assessment layer for Minecraft-related findings.
+    if has_fake_player_clone:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "super("),
+                behavior="assessment_benign_fake_player_clone",
+                evidence="Benign context: GameProfile is used to build a local fake-player clone entity, not for credential exfiltration",
+            )
+        )
+
+    if has_self_name_filtering:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "getGameProfile().name()"),
+                behavior="assessment_benign_self_name_filtering",
+                evidence="Benign context: own username is removed from scanned player sets to avoid self-matches",
+            )
+        )
+
+    if has_session_profile_override and has_username_or_session_switching:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, 'method = "getGameProfile()Lcom/mojang/authlib/GameProfile;"'),
+                behavior="assessment_benign_session_override_for_alt_switching",
+                evidence="Benign context: profile override is tied to explicit local session switching (alt/account management behavior)",
+            )
+        )
+
+    if has_internal_profile_key_usage and not has_possible_token_exfiltration:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "createUserApiService(") if "createUserApiService(" in text else find_line(text, "ProfileKeyPairManager.create("),
+                behavior="assessment_benign_token_use_local_profilekey_setup",
+                evidence="Benign context: token is consumed by Minecraft auth/profile-key services for local session functionality",
+            )
+        )
+
+    if has_token_getter_passthrough and not has_possible_token_exfiltration:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "return mcAccessToken;"),
+                behavior="assessment_benign_token_getter_passthrough",
+                evidence="Benign context: token access is a local data-holder getter with no outbound network sink in this file",
+            )
+        )
+
+    if has_token_sent_to_trusted_chain and not has_possible_token_exfiltration and not has_mixed_token_destinations:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "Authorization"),
+                behavior="assessment_benign_token_use_minecraft_auth_chain",
+                evidence="Benign context: bearer token usage appears limited to Microsoft/Minecraft auth endpoints",
+            )
+        )
+
+    if has_get_access_token and not has_token_getter_passthrough and not has_internal_profile_key_usage and not has_token_sent_to_trusted_chain and not has_possible_token_exfiltration:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "getAccessToken()") if "getAccessToken()" in text else find_line(text, "method_1674()"),
+                behavior="assessment_needs_review_access_token_read_without_destination",
+                evidence="Access token is read but destination flow is not fully visible in this file; review call graph before labeling malicious",
+            )
+        )
+
+    if has_possible_token_exfiltration or has_credential_exfil_post:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "Authorization") if "Authorization" in text else find_line(text, "payload.addProperty"),
+                behavior="assessment_suspicious_possible_credential_exfiltration",
+                evidence="Potential exfiltration signal: token/credential material appears to be prepared for outbound transmission",
             )
         )
 
@@ -1117,6 +1373,27 @@ def scan_file(path: Path, root: Path) -> List[Finding]:
     return findings
 
 
+def summarize_assessments(behaviors: List[BehaviorFinding]) -> dict:
+    grouped = {"benign": [], "needs_review": [], "suspicious": []}
+    for b in behaviors:
+        if not b.behavior.startswith(ASSESSMENT_PREFIX):
+            continue
+        if b.behavior.startswith("assessment_benign_"):
+            grouped["benign"].append(b)
+        elif b.behavior.startswith("assessment_needs_review_"):
+            grouped["needs_review"].append(b)
+        elif b.behavior.startswith("assessment_suspicious_"):
+            grouped["suspicious"].append(b)
+
+    return {
+        "counts": {k: len(v) for k, v in grouped.items()},
+        "findings": {
+            k: [x.__dict__ for x in sorted(v, key=lambda y: (y.file, y.line, y.behavior))]
+            for k, v in grouped.items()
+        },
+    }
+
+
 def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifacts: List[ArtifactFinding]) -> dict:
     by_category: dict[str, int] = {}
     unique = set()
@@ -1130,6 +1407,7 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         if f.category in {"url", "credential_or_identity_field", "dynamic_execution", "rpc_template", "path"}
     ]
 
+    assessment_summary = summarize_assessments(behaviors)
     return {
         "total_findings": len(findings),
         "unique_decoded_strings": len(unique),
@@ -1137,6 +1415,7 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         "high_risk_count": len(high_risk),
         "behavior_findings": len(behaviors),
         "artifact_findings": len(artifacts),
+        "assessment_counts": assessment_summary["counts"],
     }
 
 
@@ -1148,6 +1427,15 @@ def render_text(
     for f in sorted(findings, key=lambda x: (x.file, x.line, x.decoded)):
         note = f" [{f.note}]" if f.note else ""
         out.append(f"[{f.category}] {f.file}:{f.line} ({f.function}) -> {f.decoded}{note}")
+
+    out.append("")
+    out.append("== Assessment Findings ==")
+    assessment = summarize_assessments(behaviors)
+    for label in ["benign", "needs_review", "suspicious"]:
+        entries = assessment["findings"][label]
+        out.append(f"{label}: {len(entries)}")
+        for item in entries:
+            out.append(f"- [{item['behavior']}] {item['file']}:{item['line']} -> {item['evidence']}")
 
     out.append("")
     out.append("== Behavioral Findings ==")
@@ -1193,6 +1481,9 @@ def render_text(
     out.append(f"High-risk findings: {summary['high_risk_count']}")
     out.append(f"Behavior findings: {summary['behavior_findings']}")
     out.append(f"Artifact findings: {summary['artifact_findings']}")
+    out.append("Assessment counts:")
+    for key, count in summary.get("assessment_counts", {}).items():
+        out.append(f"- {key}: {count}")
     out.append("Category counts:")
     for cat, count in summary["category_counts"].items():
         out.append(f"- {cat}: {count}")
@@ -1237,16 +1528,18 @@ def render_rich(
     summary: dict,
     runtime_c2: dict,
 ) -> None:
-    def short(s: str, n: int = 140) -> str:
+    def short(s: str, n: int = 220) -> str:
         return s if len(s) <= n else s[: n - 1] + "…"
+
+    assessment = summarize_assessments(behaviors)
 
     console.print(Rule("[bold blue]Decode + String Findings"))
     if findings:
-        t = Table(show_lines=False)
+        t = Table(show_lines=False, expand=True)
         t.add_column("Category", style="magenta")
         t.add_column("Location", style="cyan")
         t.add_column("Function", style="green")
-        t.add_column("Decoded", style="white")
+        t.add_column("Decoded", style="white", overflow="fold")
         for f in sorted(findings, key=lambda x: (x.file, x.line, x.decoded)):
             decoded = f.decoded if not f.note else f"{f.decoded} [{f.note}]"
             t.add_row(f.category, f"{f.file}:{f.line}", f.function, decoded)
@@ -1254,12 +1547,28 @@ def render_rich(
     else:
         console.print("[dim]None detected[/dim]")
 
+    console.print(Rule("[bold blue]Assessment Findings"))
+    at = Table(show_lines=False, box=box.SIMPLE, expand=True)
+    at.add_column("Category", style="green")
+    at.add_column("Location", style="cyan")
+    at.add_column("Assessment", style="yellow")
+    at.add_column("Evidence", style="white")
+    has_assessment_rows = False
+    for label in ["benign", "needs_review", "suspicious"]:
+        for item in assessment["findings"][label]:
+            has_assessment_rows = True
+            at.add_row(label, f"{item['file']}:{item['line']}", item["behavior"], short(item["evidence"]))
+    if has_assessment_rows:
+        console.print(at)
+    else:
+        console.print("[dim]None detected[/dim]")
+
     console.print(Rule("[bold blue]Behavioral Findings"))
     if behaviors:
-        t = Table(show_lines=False, box=box.SIMPLE, expand=False)
+        t = Table(show_lines=False, box=box.SIMPLE, expand=True)
         t.add_column("Behavior", style="yellow")
         t.add_column("Location", style="cyan")
-        t.add_column("Evidence", style="white")
+        t.add_column("Evidence", style="white", overflow="fold")
         for b in sorted(behaviors, key=lambda x: (x.file, x.line, x.behavior)):
             t.add_row(b.behavior, f"{b.file}:{b.line}", short(b.evidence))
         console.print(t)
@@ -1268,13 +1577,13 @@ def render_rich(
 
     console.print(Rule("[bold blue]Artifact Findings"))
     if artifacts:
-        t = Table(show_lines=False, box=box.SIMPLE, expand=False)
+        t = Table(show_lines=False, box=box.SIMPLE, expand=True)
         t.add_column("Type", style="red")
         t.add_column("Path", style="cyan")
         t.add_column("Filename", style="green")
         t.add_column("Size", justify="right")
         t.add_column("SHA256", style="white")
-        t.add_column("Evidence", style="white")
+        t.add_column("Evidence", style="white", overflow="fold")
         for a in artifacts:
             size_text = str(a.size) if a.size >= 0 else "unknown"
             hash_text = a.sha256 if a.sha256 else "<unknown>"
@@ -1308,6 +1617,8 @@ def render_rich(
     s.add_row("High-risk findings", str(summary["high_risk_count"]))
     s.add_row("Behavior findings", str(summary["behavior_findings"]))
     s.add_row("Artifact findings", str(summary["artifact_findings"]))
+    for k in ["benign", "needs_review", "suspicious"]:
+        s.add_row(f"Assessment {k}", str(summary.get("assessment_counts", {}).get(k, 0)))
     console.print(s)
     if summary["category_counts"]:
         c = Table(title="Category Counts", show_header=True)
@@ -1327,12 +1638,19 @@ def main() -> int:
     p.add_argument("--out", help="Write output to file")
     p.add_argument("--no-progress", action="store_true", help="Disable progress messages")
     p.add_argument("--no-network", action="store_true", help="Disable runtime C2 resolution over network")
+    p.add_argument(
+        "--rich-width",
+        type=int,
+        default=120,
+        help="Preferred Rich console width for final report/progress rendering",
+    )
     args = p.parse_args()
 
     root = resolve_target(args.target)
     show_progress = not args.no_progress
-    progress_console = Console(stderr=False) if RICH_AVAILABLE else None
-    report_console = Console() if RICH_AVAILABLE else None
+    pref_width = max(80, int(args.rich_width))
+    progress_console = Console(stderr=False, width=pref_width) if RICH_AVAILABLE else None
+    report_console = Console(width=pref_width) if RICH_AVAILABLE else None
     rich_progress_mode = bool(RICH_AVAILABLE and progress_console is not None and show_progress)
     phase_logs = show_progress and not rich_progress_mode
     progress(show_progress, f"target resolved to: {root}", progress_console)
@@ -1405,6 +1723,7 @@ def main() -> int:
         payload = {
             "root": str(root),
             "summary": summary,
+            "assessment_summary": summarize_assessments(behavior_findings),
             "runtime_c2": runtime_c2,
             "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
             "behavior_findings": [b.__dict__ for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))],
