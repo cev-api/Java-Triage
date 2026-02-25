@@ -20,6 +20,10 @@ It recursively scans `.java` files, decodes specific integer-array string obfusc
   - native payload extraction/loading
   - command execution and dropper/elevation helpers
   - CMSTP/UAC bypass and Defender tampering indicators
+- Splits assessment behavior findings into:
+  - `benign`
+  - `needs_review`
+  - `suspicious`
 - Identifies suspicious artifacts (`*.jar.*`, large opaque `.dat`/`.bin`, embedded resource payloads).
 - Produces:
   - human-readable text output (with optional rich terminal tables)
@@ -91,6 +95,9 @@ python java_triage.py ./sample_project --json --out report.json
 
 # Disable any network lookups during analysis
 python java_triage.py ./sample_project --no-network
+
+# Wider rich output
+python java_triage.py ./sample_project --rich-width 220
 ```
 
 ## CLI Options
@@ -100,22 +107,46 @@ python java_triage.py ./sample_project --no-network
 - `--out <path>`: write output to file
 - `--no-progress`: disable progress messages
 - `--no-network`: disable runtime C2 resolution over network
+- `--rich-width <int>`: preferred rich console width for progress/final report rendering (default: `120`, minimum effective width: `80`)
 
 ## Output
 
 Text output includes:
 - Decode + string findings
+- Assessment findings (`benign`, `needs_review`, `suspicious`)
 - Behavioral findings
 - Artifact findings
 - Runtime C2 resolution status
-- Summary counts (including high-risk finding count and category totals)
+- Summary counts (including high-risk finding count, assessment counts, and category totals)
+
+Rich output includes:
+- wider, expanded tables (`expand=True`) with folded long text
+- dedicated `Assessment Findings` table
 
 JSON output structure:
 
 ```json
 {
   "root": "scanned/path",
-  "summary": {},
+  "summary": {
+    "assessment_counts": {
+      "benign": 0,
+      "needs_review": 0,
+      "suspicious": 0
+    }
+  },
+  "assessment_summary": {
+    "counts": {
+      "benign": 0,
+      "needs_review": 0,
+      "suspicious": 0
+    },
+    "findings": {
+      "benign": [],
+      "needs_review": [],
+      "suspicious": []
+    }
+  },
   "runtime_c2": {},
   "findings": [],
   "behavior_findings": [],
