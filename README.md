@@ -1,7 +1,9 @@
 # Java Triage
 
-![1](https://i.imgur.com/5qDhgi3.png)
-![2](https://i.imgur.com/u7tBJCW.png)
+![1](https://i.imgur.com/UI2YkSr.png)
+![2](https://i.imgur.com/jBc8bNq.png)
+![3](https://i.imgur.com/kJiw9Uh.png)
+![4](https://i.imgur.com/QelAGpR.png)
 
 `java_triage.py` is a static triage tool for suspicious Java codebases.
 
@@ -12,6 +14,7 @@ It recursively scans `.java` files, decodes specific integer-array string obfusc
 - Decodes `load(new int[]{...}, new int[]{...}, k1, k2)` string obfuscation patterns.
 - Scans plain Java string literals for suspicious indicators (URLs, command execution strings, payload paths, encoded blobs, and keyword signals).
 - Detects Discord indicators, including bot tokens, webhook URLs, and snowflake IDs (guild/channel/user/role/application).
+- Detects additional comms indicators, including Telegram bot tokens/API patterns and generic non-Discord webhook patterns.
 - Detects additional encoded literals (Base64/Base32/hex/XOR-recovered text where possible).
 - Classifies decoded strings (URL, RPC templates, credential fields, paths, crypto-related values, etc.).
 - Flags behavior indicators such as:
@@ -24,6 +27,9 @@ It recursively scans `.java` files, decodes specific integer-array string obfusc
   - `benign`
   - `needs_review`
   - `suspicious`
+- Assigns behavior severities (`critical`/`high`/`medium`/`low`/`info`) and reports severity counts.
+- Adds a metadata preface (`Basic Properties`, `JAR Info`, `Bundle Info`) to text/rich reports.
+- Optionally enriches metadata with `Vhash`, `SSDEEP`, `TLSH`, `TrID`, and `Magika` when local tools/libraries are available.
 - Identifies suspicious artifacts (`*.jar.*`, large opaque `.dat`/`.bin`, embedded resource payloads).
 - Produces:
   - human-readable text output (with optional rich terminal tables)
@@ -37,6 +43,11 @@ String literal scanning (`"text"` style) includes:
 - path/payload indicators (`.exe`, `.dll`, `.jar`, `.dat`, `.bin`, temp/appdata paths)
 - high-entropy encoded blobs (base64/hex-like literals)
 - suspicious keywords (`token`, `authorization`, `webhook`, `defender`, etc.)
+
+Behavior scanning also includes:
+- environment variable access (`System.getenv`)
+- dynamic class loading via `URLClassLoader` (with extra signal if remote HTTP hosts are present)
+- local Minecraft session/account file path references (`session.json`, `launcher_accounts.json`, `.minecraft`) with optional exfiltration context
 
 Discord-focused detection includes:
 - bot tokens
@@ -62,6 +73,8 @@ Update: Mediafire has added a warning in response to this repo, how nice of them
 
 - Python 3.9+ recommended
 - Optional: [`rich`](https://pypi.org/project/rich/) for enhanced terminal output
+- Optional CLI tools for metadata enrichment: `ssdeep`, `tlsh`, `trid`, `vhash`
+- Optional Python package for metadata enrichment: [`magika`](https://pypi.org/project/magika/)
 
 ## Installation
 
@@ -70,6 +83,9 @@ No package install is required for the script itself.
 ```bash
 # optional, for rich UI output
 pip install rich
+
+# optional, for magika metadata enrichment
+pip install magika
 ```
 
 ## Usage
@@ -112,23 +128,41 @@ python java_triage.py ./sample_project --rich-width 220
 ## Output
 
 Text output includes:
+- Basic Properties (hashes + optional enrichments if available)
+- JAR Info (manifest + archive metadata)
+- Bundle Info (bundle counts, timestamps, extensions/types)
 - Decode + string findings
 - Assessment findings (`benign`, `needs_review`, `suspicious`)
-- Behavioral findings
+- Behavioral findings (with severity)
 - Artifact findings
 - Runtime C2 resolution status
-- Summary counts (including high-risk finding count, assessment counts, and category totals)
+- Summary counts (including high-risk findings, high-risk behaviors, assessment counts, category totals, behavior severity totals)
 
 Rich output includes:
 - wider, expanded tables (`expand=True`) with folded long text
+- dedicated metadata sections (`Basic Properties`, `JAR Info`, `Bundle Info`)
 - dedicated `Assessment Findings` table
+- `Behavioral Findings` with risk column
 
 JSON output structure:
 
 ```json
 {
   "root": "scanned/path",
+  "target_metadata": {
+    "basic_properties": {},
+    "jar_info": {},
+    "bundle_info": {}
+  },
   "summary": {
+    "high_risk_behavior_count": 0,
+    "behavior_severity_counts": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    },
     "assessment_counts": {
       "benign": 0,
       "needs_review": 0,
@@ -149,7 +183,11 @@ JSON output structure:
   },
   "runtime_c2": {},
   "findings": [],
-  "behavior_findings": [],
+  "behavior_findings": [
+    {
+      "severity": "info"
+    }
+  ],
   "artifact_findings": []
 }
 ```
@@ -159,4 +197,5 @@ JSON output structure:
 - This is a triage helper, not a full malware sandbox or decompiler.
 - Behavioral detections are signature/heuristic based and may produce false positives or miss novel techniques.
 - Network-based runtime C2 resolution (`eth_call`) is best-effort and may fail due to missing indicators, RPC issues, or decoding variance.
+- Metadata enrichments (`SSDEEP`/`TLSH`/`TrID`/`Magika`/`Vhash`) are best-effort and only appear when dependencies are present.
 - Do NOT rely on this as a means to ensure your safety with any java application.
