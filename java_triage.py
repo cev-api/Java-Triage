@@ -8,8 +8,10 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import zipfile
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -62,6 +64,13 @@ WINDOWS_PATH_RE = re.compile(r"^[A-Za-z]:\\")
 SUSPICIOUS_STRING_KEYWORDS = (
     "webhook",
     "discord",
+    "telegram",
+    "api.telegram.org",
+    "proguard",
+    "allatori",
+    "stringer",
+    "zelix",
+    "dasho",
     "api_key",
     "authorization",
     "bearer ",
@@ -81,6 +90,11 @@ DISCORD_WEBHOOK_RE = re.compile(
 DISCORD_BOT_TOKEN_RE = re.compile(
     r"\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,8}\.[A-Za-z0-9_-]{20,})\b"
 )
+TELEGRAM_BOT_TOKEN_RE = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,60}\b")
+GENERIC_WEBHOOK_URL_RE = re.compile(
+    r"^https?://[^\s\"'<>]+/(?:api/)?(?:v\d+/)?(?:webhook|webhooks|hooks?)/[^\s\"'<>]+$",
+    re.IGNORECASE,
+)
 DISCORD_SNOWFLAKE_RE = re.compile(r"^\d{17,20}$")
 DISCORD_SNOWFLAKE_ANY_RE = re.compile(r"\b\d{17,20}\b")
 DISCORD_ID_CONTEXT_RE = re.compile(
@@ -89,6 +103,57 @@ DISCORD_ID_CONTEXT_RE = re.compile(
 )
 HTTP_HOST_RE = re.compile(r'https?://([^/:\s"\'<>]+)', re.IGNORECASE)
 ASSESSMENT_PREFIX = "assessment_"
+BEHAVIOR_SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+BEHAVIOR_SEVERITY_MAP = {
+    "assessment_suspicious_possible_credential_exfiltration": "high",
+    "assessment_needs_review_access_token_read_without_destination": "medium",
+    "assessment_benign_fake_player_clone": "low",
+    "assessment_benign_self_name_filtering": "low",
+    "assessment_benign_session_override_for_alt_switching": "low",
+    "assessment_benign_token_use_local_profilekey_setup": "low",
+    "assessment_benign_token_getter_passthrough": "low",
+    "assessment_benign_token_use_minecraft_auth_chain": "low",
+    "uac_bypass_cmstp": "high",
+    "defender_tampering": "high",
+    "command_execution_capability": "high",
+    "credential_exfiltration_post": "high",
+    "possible_access_token_exfiltration": "high",
+    "remote_urlclassloader_usage": "high",
+    "possible_minecraft_session_file_exfiltration": "high",
+    "dropper_elevation_helper": "high",
+    "second_stage_jar_unpack": "high",
+    "embedded_native_payload_loader": "high",
+    "sandbox_escape_primitive_usage": "high",
+    "dynamic_urlclassloader_usage": "medium",
+    "obfuscator_or_packer_marker": "medium",
+    "binary_payload_download": "medium",
+    "dynamic_class_execution": "medium",
+    "stealth_relaunch": "medium",
+    "jnic_obfuscator_native_stub_usage": "medium",
+    "windows_arch_payload_slicing": "medium",
+    "native_code_execution_capability": "medium",
+    "minecraft_session_file_access": "medium",
+    "custom_decompression_runtime_internals": "medium",
+    "windows_amd64_payload_range": "info",
+    "windows_aarch64_payload_range": "info",
+    "telemetry_or_beaconing": "low",
+    "minecraft_gameprofile_access": "low",
+    "minecraft_session_access": "low",
+    "minecraft_username_access": "low",
+    "minecraft_uuid_access": "low",
+    "minecraft_access_token_access": "medium",
+    "token_field_getter_passthrough": "low",
+    "profile_use_fake_player_clone": "low",
+    "profile_use_self_name_filtering": "low",
+    "session_profile_override": "medium",
+    "username_or_session_switching": "medium",
+    "mixed_token_destinations_review": "medium",
+    "token_sent_to_minecraft_auth_chain": "low",
+    "token_use_profile_key_or_user_api_setup": "low",
+    "remote_config_rpc_with_signature": "medium",
+    "obfuscated_short_classname_cluster": "low",
+}
 
 MINECRAFT_AUTH_HOSTS = {
     "login.live.com",
@@ -211,6 +276,9 @@ def classify(decoded: str) -> str:
     discord_kind, _ = detect_discord_indicator(d)
     if discord_kind:
         return "discord_indicator"
+    endpoint_kind, _ = detect_external_endpoint_indicator(d)
+    if endpoint_kind:
+        return "comms_indicator"
     if URL_RE.match(d):
         return "url"
     if d in {"Content-Type", "application/json"}:
@@ -269,7 +337,7 @@ def _maybe_xor_recover(raw: bytes) -> tuple[str, str]:
             best_key = key
     text = _to_printable(best) if best else ""
     low = text.lower()
-    interesting = any(k in low for k in ["http", "json", "token", "cmd", "powershell", "defender", "discord", "api"])
+    interesting = any(k in low for k in ["http", "json", "token", "cmd", "powershell", "defender", "discord", "telegram", "webhook", "api"])
     if best and best_score >= 0.92 and interesting:
         return text, f"xor_single_byte_key=0x{best_key:02X}"
     return "", ""
@@ -428,6 +496,34 @@ def detect_discord_indicator(decoded: str) -> tuple[str, str]:
     return "", ""
 
 
+def detect_external_endpoint_indicator(decoded: str) -> tuple[str, str]:
+    d = decoded.strip()
+    low = d.lower()
+
+    tm = TELEGRAM_BOT_TOKEN_RE.search(d)
+    if tm:
+        token = tm.group(0)
+        masked = token[:6] + "..." + token[-6:] if len(token) > 16 else "<masked>"
+        return "telegram_bot_token", f"token={masked}"
+
+    if "api.telegram.org/bot" in low:
+        return "telegram_bot_api_path", "telegram_bot_api_pattern"
+
+    if low.startswith("bot ") and "telegram" in low:
+        return "telegram_authorization_header", "telegram_bot_header_like_literal"
+
+    if URL_RE.match(d):
+        if GENERIC_WEBHOOK_URL_RE.match(d):
+            return "generic_webhook_url", "generic_webhook_pattern"
+        if any(x in low for x in ("slack.com/api/", "hooks.slack.com/", "api.telegram.org/bot")):
+            return "third_party_webhook_or_bot_api", "known_non_discord_endpoint"
+
+    if any(x in low for x in ("webhook", "hooks.slack.com", "api.telegram.org/bot", "slack.com/api/")):
+        return "webhook_or_bot_api_fragment", "non_discord_endpoint_fragment"
+
+    return "", ""
+
+
 def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tuple[int, str]], max_hits: int = 40) -> List[Finding]:
     out: List[Finding] = []
     seen = set()
@@ -443,13 +539,17 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
         signal = ""
         category = ""
         discord_kind, discord_note = detect_discord_indicator(decoded)
+        endpoint_kind, endpoint_note = detect_external_endpoint_indicator(decoded)
 
-        if (not discord_kind) and generic_hits >= max_hits:
+        if (not discord_kind) and (not endpoint_kind) and generic_hits >= max_hits:
             continue
 
         if discord_kind:
             category = "discord_indicator"
             signal = discord_kind
+        elif endpoint_kind:
+            category = "comms_indicator"
+            signal = endpoint_kind
 
         elif URL_RE.match(decoded):
             category = "url"
@@ -483,8 +583,9 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
 
         line = offset_to_line(starts, m.start())
         function = nearest_method(decls, line)
-        extra_note = f" {discord_note}" if discord_note else ""
-        key = (line, decoded, category, signal, discord_note)
+        combined_note = " ".join([n for n in [discord_note, endpoint_note] if n]).strip()
+        extra_note = f" {combined_note}" if combined_note else ""
+        key = (line, decoded, category, signal, combined_note)
         if key in seen:
             continue
         seen.add(key)
@@ -498,7 +599,7 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
                 note=f"source=string_scanner signal={signal}{extra_note}",
             )
         )
-        if not discord_kind:
+        if not discord_kind and not endpoint_kind:
             generic_hits += 1
     return out
 
@@ -581,6 +682,7 @@ def _extract_http_hosts(text: str) -> set[str]:
 
 def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     text = path.read_text(encoding="utf-8", errors="replace")
+    low = text.lower()
     rel = str(path.relative_to(root))
     rel_low = rel.replace("\\", "/").lower()
     is_vendor_lib = rel_low.startswith("com/sun/jna/") or rel_low.startswith("org/json/")
@@ -616,6 +718,27 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
+    if "URLClassLoader" in text:
+        hosts = _extract_http_hosts(text)
+        if hosts:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "URLClassLoader"),
+                    behavior="remote_urlclassloader_usage",
+                    evidence="URLClassLoader is present alongside remote host URLs: " + ", ".join(sorted(hosts)),
+                )
+            )
+        else:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "URLClassLoader"),
+                    behavior="dynamic_urlclassloader_usage",
+                    evidence="Uses URLClassLoader to dynamically load classes/resources",
+                )
+            )
+
     if "HttpClient.newHttpClient()" in text and "BodyHandlers.ofByteArray()" in text:
         out.append(
             BehaviorFinding(
@@ -623,6 +746,16 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 line=find_line(text, "BodyHandlers.ofByteArray()"),
                 behavior="binary_payload_download",
                 evidence="Performs HTTP GET and downloads raw bytes",
+            )
+        )
+
+    if any(k in low for k in ["proguard", "allatori", "stringer", "zelix", "dasho", "yguard", "r8"]):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=1,
+                behavior="obfuscator_or_packer_marker",
+                evidence="Contains explicit obfuscator/packer marker strings (e.g., ProGuard/Allatori/Stringer/Zelix/DashO/R8)",
             )
         )
 
@@ -817,6 +950,57 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
+    if "System.getenv(" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "System.getenv("),
+                behavior="environment_variable_access",
+                evidence="Reads environment variables via System.getenv",
+            )
+        )
+
+    if "System.load(" in text or "System.loadLibrary(" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "System.load(") if "System.load(" in text else find_line(text, "System.loadLibrary("),
+                behavior="native_code_execution_capability",
+                evidence="Loads native code via System.load/System.loadLibrary",
+            )
+        )
+
+    if any(k in text for k in ["com.sun.jna", "jnr.ffi", "sun.misc.Unsafe", "jdk.internal.misc.Unsafe"]):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "com.sun.jna") if "com.sun.jna" in text else find_line(text, "Unsafe"),
+                behavior="sandbox_escape_primitive_usage",
+                evidence="Contains JNA/Unsafe style primitive often used to bridge outside normal JVM safety boundaries",
+            )
+        )
+
+    mc_session_files = ["session.json", "launcher_accounts.json", ".minecraft"]
+    has_mc_session_file_ref = any(x in low for x in mc_session_files)
+    if has_mc_session_file_ref:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "session.json") if "session.json" in low else find_line(text, ".minecraft"),
+                behavior="minecraft_session_file_access",
+                evidence="References local Minecraft session/account storage paths (session.json/launcher_accounts.json/.minecraft)",
+            )
+        )
+        if _extract_http_hosts(text) or ("HttpClient" in text and "send(" in text):
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "session.json") if "session.json" in low else find_line(text, "launcher_accounts.json"),
+                    behavior="possible_minecraft_session_file_exfiltration",
+                    evidence="Session/account file reference appears in file that also contains outbound HTTP activity",
+                )
+            )
+
     if "payload.addProperty" in text and "client.send(req" in text:
         has_credential_exfil_post = True
         out.append(
@@ -904,7 +1088,6 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 )
             )
 
-    low = text.lower()
     if "cmstp" in low and ("elevate" in low or "simulatepressenter" in low or "runcmstp" in low):
         cmstp_methods = _extract_native_methods(text, ["cmstp", "elevat", "simulatepressenter"])
         method_note = f" native_methods={','.join(cmstp_methods)}" if cmstp_methods else ""
@@ -1101,6 +1284,292 @@ def archive_signature_status(path: Path) -> str:
         return "signed" if has_sig else "unsigned_or_no_publisher_signature"
     except Exception:
         return "unknown"
+
+
+def _human_size(num_bytes: int) -> str:
+    units = ["bytes", "KB", "MB", "GB", "TB"]
+    size = float(max(0, num_bytes))
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(size)} {units[idx]}"
+    return f"{size:.2f} {units[idx]}"
+
+
+def _fmt_dt(ts: float | None) -> str:
+    if ts is None:
+        return ""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hash_file(path: Path, algo: str) -> str:
+    h = hashlib.new(algo)
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _run_command(args: List[str]) -> str:
+    try:
+        cp = subprocess.run(args, capture_output=True, text=True, timeout=20, check=False)
+    except Exception:
+        return ""
+    out = (cp.stdout or "").strip()
+    err = (cp.stderr or "").strip()
+    return out if out else err
+
+
+def _compute_ssdeep(path: Path) -> str:
+    if not shutil.which("ssdeep"):
+        return ""
+    out = _run_command(["ssdeep", str(path)])
+    if not out:
+        return ""
+    for line in out.splitlines():
+        s = line.strip()
+        if ":" in s and "," in s and not s.lower().startswith("ssdeep"):
+            return s.split(",", 1)[0].strip()
+    return ""
+
+
+def _compute_tlsh(path: Path) -> str:
+    if not shutil.which("tlsh"):
+        return ""
+    out = _run_command(["tlsh", "-f", str(path)])
+    if not out:
+        return ""
+    m = re.search(r"\bT[0-9A-F]{30,}\b", out, flags=re.IGNORECASE)
+    return m.group(0).upper() if m else ""
+
+
+def _compute_trid(path: Path) -> str:
+    if not shutil.which("trid"):
+        return ""
+    out = _run_command(["trid", str(path)])
+    if not out:
+        return ""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    score_lines = [ln for ln in lines if "%" in ln]
+    if score_lines:
+        return "   ".join(score_lines[:3])
+    return lines[-1] if lines else ""
+
+
+def _compute_magika(path: Path) -> str:
+    try:
+        from magika import Magika  # type: ignore
+    except Exception:
+        return ""
+    try:
+        m = Magika()
+        result = m.identify_path(path)
+        for candidate in [
+            getattr(result, "output", None),
+            getattr(result, "prediction", None),
+            result,
+        ]:
+            if candidate is None:
+                continue
+            for attr in ["label", "ct_label", "group", "value", "name"]:
+                v = getattr(candidate, attr, None)
+                if isinstance(v, str) and v.strip():
+                    return v.strip().upper()
+        return ""
+    except Exception:
+        return ""
+
+
+def _compute_vhash(path: Path) -> str:
+    # Optional external tool support only; no synthetic placeholder.
+    if not shutil.which("vhash"):
+        return ""
+    out = _run_command(["vhash", str(path)])
+    if not out:
+        return ""
+    m = re.search(r"\b[a-fA-F0-9]{16,64}\b", out)
+    return m.group(0).lower() if m else out.splitlines()[-1].strip()
+
+
+def _find_primary_jar(root: Path) -> Path | None:
+    jars = [p for p in root.rglob("*.jar") if p.is_file()]
+    if not jars:
+        return None
+    return max(jars, key=lambda p: p.stat().st_size)
+
+
+def _classify_bundle_type(ext: str) -> str:
+    low = ext.lower()
+    if low == ".json":
+        return "JSON"
+    if low == ".xml":
+        return "XML"
+    return "UNKNOWN"
+
+
+def _read_manifest_from_dir(root: Path) -> str:
+    candidates = [root / "META-INF" / "MANIFEST.MF"]
+    for p in root.rglob("MANIFEST.MF"):
+        if p not in candidates:
+            candidates.append(p)
+        if len(candidates) >= 5:
+            break
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c.read_text(encoding="utf-8", errors="replace").strip()
+    return ""
+
+
+def _read_manifest_from_jar(jar_path: Path) -> str:
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            raw = zf.read("META-INF/MANIFEST.MF")
+        return raw.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _archive_metadata_from_jar(jar_path: Path) -> dict:
+    out = {
+        "contained_directories": 0,
+        "max_directory_depth": 0,
+        "contained_files": 0,
+        "latest_content_modification": "",
+        "earliest_content_modification": "",
+        "contained_files_by_type": {},
+    }
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            infos = zf.infolist()
+        dirs = [i for i in infos if i.is_dir()]
+        files = [i for i in infos if not i.is_dir()]
+        out["contained_directories"] = len(dirs)
+        out["contained_files"] = len(files)
+        depths = [i.filename.strip("/").count("/") + 1 for i in infos if i.filename.strip("/")]
+        out["max_directory_depth"] = max(depths) if depths else 0
+        if files:
+            dt_values = [datetime(*i.date_time) for i in files]
+            out["earliest_content_modification"] = min(dt_values).strftime("%Y-%m-%d %H:%M:%S")
+            out["latest_content_modification"] = max(dt_values).strftime("%Y-%m-%d %H:%M:%S")
+        type_counts: dict[str, int] = {}
+        text_exts = {".mf", ".properties", ".txt", ".cfg", ".ini", ".java", ".xml", ".json", ".yml", ".yaml", ".pro"}
+        for i in files:
+            ext = Path(i.filename).suffix.lower()
+            t = "xml" if ext == ".xml" else ("ascii" if ext in text_exts else "unknown")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        out["contained_files_by_type"] = dict(sorted(type_counts.items(), key=lambda x: (-x[1], x[0])))
+    except Exception:
+        pass
+    return out
+
+
+def collect_target_metadata(root: Path) -> dict:
+    primary_jar = _find_primary_jar(root)
+    total_size = 0
+    earliest_ts = None
+    latest_ts = None
+    file_count = 0
+    dir_count = 0
+    by_ext: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+
+    for p in root.rglob("*"):
+        if p.is_dir():
+            dir_count += 1
+            continue
+        if not p.is_file():
+            continue
+        st = p.stat()
+        file_count += 1
+        total_size += st.st_size
+        mt = st.st_mtime
+        earliest_ts = mt if earliest_ts is None else min(earliest_ts, mt)
+        latest_ts = mt if latest_ts is None else max(latest_ts, mt)
+        ext = p.suffix[1:].upper() if p.suffix else "NOEXT"
+        by_ext[ext] = by_ext.get(ext, 0) + 1
+        t = _classify_bundle_type(p.suffix)
+        by_type[t] = by_type.get(t, 0) + 1
+
+    by_type["DIRECTORY"] = dir_count
+    by_type = dict(sorted(by_type.items(), key=lambda x: (-x[1], x[0])))
+    by_ext = dict(sorted(by_ext.items(), key=lambda x: (-x[1], x[0])))
+
+    basic = {
+        "subject": str(primary_jar.relative_to(root)) if primary_jar else str(root),
+        "md5": "",
+        "sha1": "",
+        "sha256": "",
+        "file_type": "JAR" if primary_jar else "DIRECTORY",
+        "compressed": "jar" if primary_jar else "",
+        "magic": "Zip archive data (JAR)" if primary_jar else "Directory bundle",
+        "file_size_text": "",
+        "file_size_bytes": 0,
+    }
+
+    if primary_jar:
+        sz = primary_jar.stat().st_size
+        basic["md5"] = _hash_file(primary_jar, "md5")
+        basic["sha1"] = _hash_file(primary_jar, "sha1")
+        basic["sha256"] = _hash_file(primary_jar, "sha256")
+        ssdeep = _compute_ssdeep(primary_jar)
+        if ssdeep:
+            basic["ssdeep"] = ssdeep
+        tlsh = _compute_tlsh(primary_jar)
+        if tlsh:
+            basic["tlsh"] = tlsh
+        trid = _compute_trid(primary_jar)
+        if trid:
+            basic["trid"] = trid
+        magika = _compute_magika(primary_jar)
+        if magika:
+            basic["magika"] = magika
+        vhash = _compute_vhash(primary_jar)
+        if vhash:
+            basic["vhash"] = vhash
+        basic["file_size_text"] = _human_size(sz)
+        basic["file_size_bytes"] = sz
+    else:
+        basic["file_size_text"] = _human_size(total_size)
+        basic["file_size_bytes"] = total_size
+
+    manifest = _read_manifest_from_jar(primary_jar) if primary_jar else _read_manifest_from_dir(root)
+    if primary_jar:
+        archive_meta = _archive_metadata_from_jar(primary_jar)
+    else:
+        archive_meta = {
+            "contained_directories": dir_count,
+            "max_directory_depth": max((len(p.relative_to(root).parts) for p in root.rglob("*")), default=0),
+            "contained_files": file_count,
+            "latest_content_modification": _fmt_dt(latest_ts),
+            "earliest_content_modification": _fmt_dt(earliest_ts),
+            "contained_files_by_type": {
+                "xml": by_type.get("XML", 0),
+                "ascii": file_count - by_type.get("XML", 0),
+            },
+        }
+
+    jar_info = {
+        "manifest": manifest,
+        "archive_metadata": archive_meta,
+    }
+
+    bundle_info = {
+        "contained_files": file_count,
+        "uncompressed_size_text": _human_size(total_size),
+        "uncompressed_size_bytes": total_size,
+        "earliest_content_modification": _fmt_dt(earliest_ts),
+        "latest_content_modification": _fmt_dt(latest_ts),
+        "contained_files_by_type": by_type,
+        "contained_files_by_extension": by_ext,
+    }
+
+    return {
+        "basic_properties": basic,
+        "jar_info": jar_info,
+        "bundle_info": bundle_info,
+    }
 
 
 def discover_structural_behaviors(root: Path) -> List[BehaviorFinding]:
@@ -1394,6 +1863,19 @@ def summarize_assessments(behaviors: List[BehaviorFinding]) -> dict:
     }
 
 
+def behavior_severity(behavior: str) -> str:
+    sev = BEHAVIOR_SEVERITY_MAP.get(behavior)
+    if sev:
+        return sev
+    if behavior.startswith("assessment_suspicious_"):
+        return "high"
+    if behavior.startswith("assessment_needs_review_"):
+        return "medium"
+    if behavior.startswith("assessment_benign_"):
+        return "low"
+    return "info"
+
+
 def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifacts: List[ArtifactFinding]) -> dict:
     by_category: dict[str, int] = {}
     unique = set()
@@ -1406,6 +1888,9 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         for f in findings
         if f.category in {"url", "credential_or_identity_field", "dynamic_execution", "rpc_template", "path"}
     ]
+    behavior_severity_counts = {k: 0 for k in ["critical", "high", "medium", "low", "info"]}
+    for b in behaviors:
+        behavior_severity_counts[behavior_severity(b.behavior)] += 1
 
     assessment_summary = summarize_assessments(behaviors)
     return {
@@ -1414,15 +1899,73 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         "category_counts": dict(sorted(by_category.items(), key=lambda x: (-x[1], x[0]))),
         "high_risk_count": len(high_risk),
         "behavior_findings": len(behaviors),
+        "high_risk_behavior_count": behavior_severity_counts["critical"] + behavior_severity_counts["high"],
+        "behavior_severity_counts": behavior_severity_counts,
         "artifact_findings": len(artifacts),
         "assessment_counts": assessment_summary["counts"],
     }
 
 
 def render_text(
-    findings: List[Finding], behaviors: List[BehaviorFinding], artifacts: List[ArtifactFinding], summary: dict, runtime_c2: dict
+    findings: List[Finding], behaviors: List[BehaviorFinding], artifacts: List[ArtifactFinding], summary: dict, runtime_c2: dict, target_metadata: dict
 ) -> str:
     out = []
+    basic = target_metadata.get("basic_properties", {})
+    jar_info = target_metadata.get("jar_info", {})
+    bundle_info = target_metadata.get("bundle_info", {})
+
+    out.append("== Basic Properties ==")
+    out.append(f"Subject: {basic.get('subject', '')}")
+    out.append(f"MD5: {basic.get('md5', '')}")
+    out.append(f"SHA-1: {basic.get('sha1', '')}")
+    out.append(f"SHA-256: {basic.get('sha256', '')}")
+    if basic.get("vhash"):
+        out.append(f"Vhash: {basic.get('vhash', '')}")
+    if basic.get("ssdeep"):
+        out.append(f"SSDEEP: {basic.get('ssdeep', '')}")
+    if basic.get("tlsh"):
+        out.append(f"TLSH: {basic.get('tlsh', '')}")
+    out.append(f"File type: {basic.get('file_type', '')}")
+    out.append(f"Compressed: {basic.get('compressed', '')}")
+    out.append(f"Magic: {basic.get('magic', '')}")
+    if basic.get("trid"):
+        out.append(f"TrID: {basic.get('trid', '')}")
+    if basic.get("magika"):
+        out.append(f"Magika: {basic.get('magika', '')}")
+    out.append(f"File size: {basic.get('file_size_text', '')} ({basic.get('file_size_bytes', 0)} bytes)")
+
+    out.append("")
+    out.append("== JAR Info ==")
+    out.append("Manifest:")
+    manifest = jar_info.get("manifest", "")
+    out.append(manifest if manifest else "<not found>")
+    am = jar_info.get("archive_metadata", {})
+    out.append("Archive Metadata:")
+    out.append(f"Contained Directories: {am.get('contained_directories', 0)}")
+    out.append(f"Max. Directory Depth: {am.get('max_directory_depth', 0)}")
+    out.append(f"Contained Files: {am.get('contained_files', 0)}")
+    out.append(f"Latest Content Modification: {am.get('latest_content_modification', '')}")
+    out.append(f"Earliest Content Modification: {am.get('earliest_content_modification', '')}")
+    out.append("Contained Files By Type:")
+    for k, v in am.get("contained_files_by_type", {}).items():
+        out.append(f"- {k}: {v}")
+
+    out.append("")
+    out.append("== Bundle Info ==")
+    out.append(f"Contained Files: {bundle_info.get('contained_files', 0)}")
+    out.append(
+        f"Uncompressed Size: {bundle_info.get('uncompressed_size_text', '')} ({bundle_info.get('uncompressed_size_bytes', 0)} bytes)"
+    )
+    out.append(f"Earliest Content Modification: {bundle_info.get('earliest_content_modification', '')}")
+    out.append(f"Latest Content Modification: {bundle_info.get('latest_content_modification', '')}")
+    out.append("Contained Files By Type:")
+    for k, v in bundle_info.get("contained_files_by_type", {}).items():
+        out.append(f"- {k}: {v}")
+    out.append("Contained Files By Extension:")
+    for k, v in bundle_info.get("contained_files_by_extension", {}).items():
+        out.append(f"- {k}: {v}")
+
+    out.append("")
     out.append("== Decode + String Findings ==")
     for f in sorted(findings, key=lambda x: (x.file, x.line, x.decoded)):
         note = f" [{f.note}]" if f.note else ""
@@ -1441,7 +1984,8 @@ def render_text(
     out.append("== Behavioral Findings ==")
     if behaviors:
         for b in sorted(behaviors, key=lambda x: (x.file, x.line, x.behavior)):
-            out.append(f"[{b.behavior}] {b.file}:{b.line} -> {b.evidence}")
+            sev = behavior_severity(b.behavior)
+            out.append(f"[{sev}] [{b.behavior}] {b.file}:{b.line} -> {b.evidence}")
     else:
         out.append("None detected")
 
@@ -1480,6 +2024,7 @@ def render_text(
     out.append(f"Unique decoded strings: {summary['unique_decoded_strings']}")
     out.append(f"High-risk findings: {summary['high_risk_count']}")
     out.append(f"Behavior findings: {summary['behavior_findings']}")
+    out.append(f"High-risk behaviors: {summary['high_risk_behavior_count']}")
     out.append(f"Artifact findings: {summary['artifact_findings']}")
     out.append("Assessment counts:")
     for key, count in summary.get("assessment_counts", {}).items():
@@ -1487,6 +2032,9 @@ def render_text(
     out.append("Category counts:")
     for cat, count in summary["category_counts"].items():
         out.append(f"- {cat}: {count}")
+    out.append("Behavior severity counts:")
+    for sev, count in summary["behavior_severity_counts"].items():
+        out.append(f"- {sev}: {count}")
     return "\n".join(out)
 
 
@@ -1527,11 +2075,83 @@ def render_rich(
     artifacts: List[ArtifactFinding],
     summary: dict,
     runtime_c2: dict,
+    target_metadata: dict,
 ) -> None:
     def short(s: str, n: int = 220) -> str:
         return s if len(s) <= n else s[: n - 1] + "…"
 
     assessment = summarize_assessments(behaviors)
+    basic = target_metadata.get("basic_properties", {})
+    jar_info = target_metadata.get("jar_info", {})
+    bundle_info = target_metadata.get("bundle_info", {})
+
+    console.print(Rule("[bold blue]Basic Properties"))
+    bt = Table(show_header=False, box=box.SIMPLE)
+    bt.add_row("Subject", str(basic.get("subject", "")))
+    bt.add_row("MD5", str(basic.get("md5", "")))
+    bt.add_row("SHA-1", str(basic.get("sha1", "")))
+    bt.add_row("SHA-256", str(basic.get("sha256", "")))
+    if basic.get("vhash"):
+        bt.add_row("Vhash", str(basic.get("vhash", "")))
+    if basic.get("ssdeep"):
+        bt.add_row("SSDEEP", str(basic.get("ssdeep", "")))
+    if basic.get("tlsh"):
+        bt.add_row("TLSH", str(basic.get("tlsh", "")))
+    bt.add_row("File type", str(basic.get("file_type", "")))
+    bt.add_row("Compressed", str(basic.get("compressed", "")))
+    bt.add_row("Magic", str(basic.get("magic", "")))
+    if basic.get("trid"):
+        bt.add_row("TrID", str(basic.get("trid", "")))
+    if basic.get("magika"):
+        bt.add_row("Magika", str(basic.get("magika", "")))
+    bt.add_row("File size", f"{basic.get('file_size_text', '')} ({basic.get('file_size_bytes', 0)} bytes)")
+    console.print(bt)
+
+    console.print(Rule("[bold blue]JAR Info"))
+    mt = Table(show_header=False, box=box.SIMPLE)
+    mt.add_row("Manifest", short(jar_info.get("manifest", "") or "<not found>", 800))
+    am = jar_info.get("archive_metadata", {})
+    mt.add_row("Contained Directories", str(am.get("contained_directories", 0)))
+    mt.add_row("Max. Directory Depth", str(am.get("max_directory_depth", 0)))
+    mt.add_row("Contained Files", str(am.get("contained_files", 0)))
+    mt.add_row("Latest Content Modification", str(am.get("latest_content_modification", "")))
+    mt.add_row("Earliest Content Modification", str(am.get("earliest_content_modification", "")))
+    console.print(mt)
+    am_types = am.get("contained_files_by_type", {})
+    if am_types:
+        amt = Table(title="Archive Types", show_header=True)
+        amt.add_column("Type")
+        amt.add_column("Count", justify="right")
+        for k, v in am_types.items():
+            amt.add_row(str(k), str(v))
+        console.print(amt)
+
+    console.print(Rule("[bold blue]Bundle Info"))
+    bmt = Table(show_header=False, box=box.SIMPLE)
+    bmt.add_row("Contained Files", str(bundle_info.get("contained_files", 0)))
+    bmt.add_row(
+        "Uncompressed Size",
+        f"{bundle_info.get('uncompressed_size_text', '')} ({bundle_info.get('uncompressed_size_bytes', 0)} bytes)",
+    )
+    bmt.add_row("Earliest Content Modification", str(bundle_info.get("earliest_content_modification", "")))
+    bmt.add_row("Latest Content Modification", str(bundle_info.get("latest_content_modification", "")))
+    console.print(bmt)
+    b_types = bundle_info.get("contained_files_by_type", {})
+    if b_types:
+        btt = Table(title="Bundle Types", show_header=True)
+        btt.add_column("Type")
+        btt.add_column("Count", justify="right")
+        for k, v in b_types.items():
+            btt.add_row(str(k), str(v))
+        console.print(btt)
+    b_ext = bundle_info.get("contained_files_by_extension", {})
+    if b_ext:
+        bet = Table(title="Bundle Extensions", show_header=True)
+        bet.add_column("Extension")
+        bet.add_column("Count", justify="right")
+        for k, v in b_ext.items():
+            bet.add_row(str(k), str(v))
+        console.print(bet)
 
     console.print(Rule("[bold blue]Decode + String Findings"))
     if findings:
@@ -1566,11 +2186,12 @@ def render_rich(
     console.print(Rule("[bold blue]Behavioral Findings"))
     if behaviors:
         t = Table(show_lines=False, box=box.SIMPLE, expand=True)
+        t.add_column("Risk", style="red")
         t.add_column("Behavior", style="yellow")
         t.add_column("Location", style="cyan")
         t.add_column("Evidence", style="white", overflow="fold")
         for b in sorted(behaviors, key=lambda x: (x.file, x.line, x.behavior)):
-            t.add_row(b.behavior, f"{b.file}:{b.line}", short(b.evidence))
+            t.add_row(behavior_severity(b.behavior), b.behavior, f"{b.file}:{b.line}", short(b.evidence))
         console.print(t)
     else:
         console.print("[dim]None detected[/dim]")
@@ -1616,6 +2237,7 @@ def render_rich(
     s.add_row("Unique decoded strings", str(summary["unique_decoded_strings"]))
     s.add_row("High-risk findings", str(summary["high_risk_count"]))
     s.add_row("Behavior findings", str(summary["behavior_findings"]))
+    s.add_row("High-risk behaviors", str(summary["high_risk_behavior_count"]))
     s.add_row("Artifact findings", str(summary["artifact_findings"]))
     for k in ["benign", "needs_review", "suspicious"]:
         s.add_row(f"Assessment {k}", str(summary.get("assessment_counts", {}).get(k, 0)))
@@ -1627,6 +2249,13 @@ def render_rich(
         for cat, count in summary["category_counts"].items():
             c.add_row(cat, str(count))
         console.print(c)
+    if summary["behavior_severity_counts"]:
+        b = Table(title="Behavior Severity Counts", show_header=True)
+        b.add_column("Severity", style="red")
+        b.add_column("Count", justify="right")
+        for sev, count in summary["behavior_severity_counts"].items():
+            b.add_row(sev, str(count))
+        console.print(b)
 
 
 def main() -> int:
@@ -1662,6 +2291,8 @@ def main() -> int:
         print(f"error: target is not a directory: {root}", file=sys.stderr)
         return 2
 
+    progress(phase_logs, "collecting target metadata", progress_console)
+    target_metadata = collect_target_metadata(root)
     progress(phase_logs, "discovering Java files", progress_console)
     if not args.json:
         if rich_progress_mode:
@@ -1722,18 +2353,22 @@ def main() -> int:
     if args.json:
         payload = {
             "root": str(root),
+            "target_metadata": target_metadata,
             "summary": summary,
             "assessment_summary": summarize_assessments(behavior_findings),
             "runtime_c2": runtime_c2,
             "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
-            "behavior_findings": [b.__dict__ for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))],
+            "behavior_findings": [
+                {**b.__dict__, "severity": behavior_severity(b.behavior)}
+                for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))
+            ],
             "artifact_findings": [a.__dict__ for a in artifact_findings],
         }
         output = json.dumps(payload, indent=2)
     else:
         width = max(40, shutil.get_terminal_size((120, 20)).columns)
         centered_banner = "\n".join(line.center(width) for line in BANNER.splitlines())
-        output = render_text(all_findings, behavior_findings, artifact_findings, summary, runtime_c2)
+        output = render_text(all_findings, behavior_findings, artifact_findings, summary, runtime_c2, target_metadata)
         output = f"{centered_banner}\n\n{output}"
 
     if args.out:
@@ -1751,7 +2386,7 @@ def main() -> int:
             print(output)
         else:
             print_banner(report_console, to_stderr=False)
-            render_rich(report_console, all_findings, behavior_findings, artifact_findings, summary, runtime_c2)
+            render_rich(report_console, all_findings, behavior_findings, artifact_findings, summary, runtime_c2, target_metadata)
         progress(show_progress, "done", progress_console)
 
     return 0
