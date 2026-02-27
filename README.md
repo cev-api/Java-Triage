@@ -7,13 +7,16 @@
 
 `java_triage.py` is a static triage tool for suspicious Java codebases.
 
-It recursively scans `.java` files, decodes specific integer-array string obfuscation patterns, scans suspicious string literals, surfaces behavioral indicators, finds suspicious artifact files, and can optionally resolve runtime C2 hints from on-chain config data.
+It recursively scans `.java` files, deobfuscates known string call patterns, scans suspicious string literals, surfaces behavioral indicators, finds suspicious artifact files, and can optionally resolve runtime C2 hints from on-chain config data.
 
 ## Features
 
-- Decodes `load(new int[]{...}, new int[]{...}, k1, k2)` string obfuscation patterns.
+- Deobfuscates `StringDecrypt.decrypt(new byte[]{...})` calls (multi-pass rewrite).
+- Deobfuscates `load(new int[]{...}, new int[]{...}, k1, k2)` patterns (multi-pass rewrite).
+- Includes deterministic length-seeded XOR-stream candidate support used by common Java obfuscators.
+- Tracks deobfuscation stats (seen/replaced/unresolved, per-family counts, pass count).
 - Scans plain Java string literals for suspicious indicators (URLs, command execution strings, payload paths, encoded blobs, and keyword signals).
-- Detects Discord indicators, including bot tokens, webhook URLs, and snowflake IDs (guild/channel/user/role/application).
+- Detects Discord indicators, including bot tokens, webhook URLs, and snowflake IDs (guiQld/channel/user/role/application).
 - Detects additional comms indicators, including Telegram bot tokens/API patterns and generic non-Discord webhook patterns.
 - Detects additional encoded literals (Base64/Base32/hex/XOR-recovered text where possible).
 - Classifies decoded strings (URL, RPC templates, credential fields, paths, crypto-related values, etc.).
@@ -34,6 +37,25 @@ It recursively scans `.java` files, decodes specific integer-array string obfusc
 - Produces:
   - human-readable text output (with optional rich terminal tables)
   - machine-readable JSON output
+
+## Default Deobfuscation Behavior
+
+By default, running:
+
+```bash
+python java_triage.py <target>
+```
+
+will:
+
+1. copy `<target>` to a deobfuscated working folder in the current directory
+2. rewrite supported obfuscated string calls in that copy
+3. scan the rewritten tree (post-decryption scan mode)
+
+Auto output folder naming:
+
+- `<target_name>_deobfuscated`
+- if it exists: `<target_name>_deobfuscated_2`, `_3`, etc.
 
 ## String + Discord Coverage
 
@@ -103,6 +125,18 @@ python java_triage.py
 # Scan a specific unpacked source tree
 python java_triage.py ./sample_project
 
+# Disable default auto-decrypt copy/rewrite and scan source directly
+python java_triage.py ./sample_project --no-auto-decrypt
+
+# Explicitly write decrypted copy to a chosen path, then scan it
+python java_triage.py ./sample_project --decrypt-codebase-out ./sample_project_deobf
+
+# Rewrite in-place (destructive to target tree)
+python java_triage.py ./sample_project --decrypt-codebase-in-place
+
+# Rewrite only; skip post-decrypt triage scan
+python java_triage.py ./sample_project --no-rescan-after-decrypt
+
 # JSON output to stdout
 python java_triage.py ./sample_project --json
 
@@ -124,6 +158,10 @@ python java_triage.py ./sample_project --rich-width 220
 - `--no-progress`: disable progress messages
 - `--no-network`: disable runtime C2 resolution over network
 - `--rich-width <int>`: preferred rich console width for progress/final report rendering (default: `120`, minimum effective width: `80`)
+- `--decrypt-codebase-in-place`: rewrite supported encrypted string calls in target tree directly
+- `--decrypt-codebase-out <path>`: copy tree to `<path>`, rewrite there, then scan that rewritten tree
+- `--no-rescan-after-decrypt`: perform rewrite stage only and exit
+- `--no-auto-decrypt`: disable default auto-decrypt copy/rewrite behavior
 
 ## Output
 
@@ -132,29 +170,54 @@ Text output includes:
 - JAR Info (manifest + archive metadata)
 - Bundle Info (bundle counts, timestamps, extensions/types)
 - Decode + string findings
+  - includes source line numbers (`file:line`)
+  - includes explicit decrypted categories:
+    - `xor_decrypted_string`
+    - `decrypted_string`
 - Assessment findings (`benign`, `needs_review`, `suspicious`)
 - Behavioral findings (with severity)
 - Artifact findings
 - Runtime C2 resolution status
 - Summary counts (including high-risk findings, high-risk behaviors, assessment counts, category totals, behavior severity totals)
+- Decryption-aware summary counters:
+  - `XOR decrypted strings`
+  - `Other decrypted strings`
+  - populated from deobfuscation rewrite stats in decrypt mode
 
 Rich output includes:
+- startup banner shown before staged processing
+- deobfuscation progress stage and scanning progress stage before final report
 - wider, expanded tables (`expand=True`) with folded long text
 - dedicated metadata sections (`Basic Properties`, `JAR Info`, `Bundle Info`)
 - dedicated `Assessment Findings` table
 - `Behavioral Findings` with risk column
+- `Decode + String Findings` category column width constrained for better readability
 
 JSON output structure:
 
 ```json
 {
   "root": "scanned/path",
+  "scan_mode": "post_decryption_only",
+  "deobfuscation": {
+    "calls_seen": 0,
+    "replaced": 0,
+    "unresolved": 0,
+    "stringdecrypt_xor_replaced": 0,
+    "stringdecrypt_other_replaced": 0,
+    "load_calls_seen": 0,
+    "load_replaced": 0,
+    "load_unresolved": 0,
+    "passes_run": 0
+  },
   "target_metadata": {
     "basic_properties": {},
     "jar_info": {},
     "bundle_info": {}
   },
   "summary": {
+    "xor_decrypted_count": 0,
+    "decrypted_string_count": 0,
     "high_risk_behavior_count": 0,
     "behavior_severity_counts": {
       "critical": 0,
@@ -195,6 +258,7 @@ JSON output structure:
 ## Notes and Limits
 
 - This is a triage helper, not a full malware sandbox or decompiler.
+- The deobfuscation stage is deterministic and heuristic-based; unsupported custom routines may still remain unresolved.
 - Behavioral detections are signature/heuristic based and may produce false positives or miss novel techniques.
 - Network-based runtime C2 resolution (`eth_call`) is best-effort and may fail due to missing indicators, RPC issues, or decoding variance.
 - Metadata enrichments (`SSDEEP`/`TLSH`/`TrID`/`Magika`/`Vhash`) are best-effort and only appear when dependencies are present.
