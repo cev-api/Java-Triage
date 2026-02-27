@@ -14,7 +14,7 @@ import zipfile
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 from urllib import error, request
 try:
     from rich.console import Console
@@ -42,6 +42,12 @@ LOAD_CALL_RE = re.compile(
 # Match standard Java string literals and avoid crossing line boundaries.
 STRING_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\\r\n]){16,})"')
 STRING_ANY_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\\r\n]){4,})"')
+STRING_DECRYPT_CALL_RE = re.compile(
+    r"(?P<call>(?:\b[\w$.]*StringDecrypt\s*\.\s*)?decrypt\s*\(\s*new\s+byte\s*\[\s*\]\s*\{(?P<bytes>.*?)\}\s*\))",
+    re.DOTALL,
+)
+NEW_BYTE_ARRAY_LITERAL_RE = re.compile(r"new\s+byte\s*\[\s*\]\s*\{(?P<body>.*?)\}", re.DOTALL)
+JAVA_BYTE_TOKEN_RE = re.compile(r"(?:\(\s*byte\s*\)\s*)?(-?\d+)")
 
 METHOD_RE = re.compile(
     r"^\s*(?:public|private|protected|static|final|synchronized|native|abstract|strictfp|default|\s)+"
@@ -192,9 +198,262 @@ class ArtifactFinding:
     evidence: str
 
 
+@dataclass
+class DecryptProfile:
+    key_arrays: List[List[int]]
+    xor_consts: List[int]
+    add_consts: List[int]
+    sub_consts: List[int]
+
+
 def parse_int_list(raw: str) -> List[int]:
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     return [int(p) for p in parts]
+
+
+def _to_signed_byte(n: int) -> int:
+    n = int(n)
+    n &= 0xFF
+    return n - 256 if n >= 128 else n
+
+
+def parse_java_byte_list(raw: str) -> List[int]:
+    vals: List[int] = []
+    for m in JAVA_BYTE_TOKEN_RE.finditer(raw):
+        vals.append(_to_signed_byte(int(m.group(1))))
+    return vals
+
+
+def _java_string_escape(s: str) -> str:
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif 32 <= code <= 126:
+            out.append(ch)
+        else:
+            out.append(f"\\u{code:04x}")
+    return "".join(out)
+
+
+def _extract_candidate_consts(text: str, op: str) -> List[int]:
+    vals = set()
+    pattern = re.compile(rf"\{re.escape(op)}\s*(?:\(\s*byte\s*\)\s*)?(-?\d+)")
+    for m in pattern.finditer(text):
+        v = int(m.group(1))
+        if -255 <= v <= 255:
+            vals.add(v & 0xFF)
+    return sorted(vals)
+
+
+def build_decrypt_profile(root: Path) -> Optional[DecryptProfile]:
+    keys: List[List[int]] = []
+    xor_consts: List[int] = []
+    add_consts: List[int] = []
+    sub_consts: List[int] = []
+
+    decrypt_files = [p for p in root.rglob("*StringDecrypt*.java") if p.is_file()]
+    if not decrypt_files:
+        return None
+
+    for p in decrypt_files:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        for m in NEW_BYTE_ARRAY_LITERAL_RE.finditer(text):
+            arr = parse_java_byte_list(m.group("body"))
+            if 2 <= len(arr) <= 64:
+                keys.append(arr)
+
+        xor_consts.extend(_extract_candidate_consts(text, "^"))
+        add_consts.extend(_extract_candidate_consts(text, "+"))
+        sub_consts.extend(_extract_candidate_consts(text, "-"))
+
+    key_unique = []
+    seen_keys = set()
+    for k in keys:
+        t = tuple(k)
+        if t in seen_keys:
+            continue
+        seen_keys.add(t)
+        key_unique.append(k)
+
+    xor_unique = sorted(set(xor_consts))
+    add_unique = sorted(set(add_consts))
+    sub_unique = sorted(set(sub_consts))
+    return DecryptProfile(
+        key_arrays=key_unique,
+        xor_consts=xor_unique,
+        add_consts=add_unique,
+        sub_consts=sub_unique,
+    )
+
+
+def _score_plaintext(s: str) -> float:
+    if not s:
+        return 0.0
+    printable = sum(1 for ch in s if ch == "\n" or ch == "\r" or ch == "\t" or 32 <= ord(ch) <= 126)
+    ratio = printable / len(s)
+    alpha = sum(1 for ch in s if ch.isalpha()) / len(s)
+    common = ["http", "post", "get", "authorization", "content-type", "json", "token", "hwid", "user-agent", "accept"]
+    low = s.lower()
+    bonus = 0.0
+    for tok in common:
+        if tok in low:
+            bonus += 0.2
+    return ratio * 1.6 + alpha * 0.4 + bonus
+
+
+def _looks_meaningful_text(s: str) -> bool:
+    if not s:
+        return False
+    ascii_printable = sum(1 for ch in s if ch in "\t\r\n" or 32 <= ord(ch) <= 126)
+    ratio = ascii_printable / len(s)
+    if ratio < 0.95:
+        return False
+    stripped = s.strip()
+    if not stripped:
+        return False
+    if len(stripped) <= 3:
+        allowed_short = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OK", "ID", "API"}
+        return stripped.upper() in allowed_short
+    letters = sum(1 for ch in stripped if ch.isalpha())
+    digits = sum(1 for ch in stripped if ch.isdigit())
+    symbols = len(stripped) - letters - digits - sum(1 for ch in stripped if ch.isspace())
+    if letters == 0:
+        return False
+    if letters < 2 and len(stripped) >= 5:
+        return False
+    if symbols > max(4, len(stripped) // 2):
+        return False
+    return True
+
+
+def _bytes_to_text(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return raw.decode("latin-1", errors="replace")
+
+
+def _decode_len_seed_xor_stream(raw: bytes, seed_magic: int, mul_const: int) -> bytes:
+    key = (len(raw) ^ seed_magic) & 0xFF
+    out = bytearray(len(raw))
+    for i, b in enumerate(raw):
+        key = ((key * mul_const) >> 16) & 0xFF
+        out[i] = (b ^ key ^ (i >> 1)) & 0xFF
+        key ^= i
+    return bytes(out)
+
+
+def _candidate_decodes_for_byte_array(vals: List[int], profile: Optional[DecryptProfile]) -> List[tuple[str, str]]:
+    if not vals:
+        return []
+    raw = bytes(v & 0xFF for v in vals)
+    out: List[tuple[str, str]] = []
+    seen = set()
+
+    def add_candidate(b: bytes, why: str) -> None:
+        t = _bytes_to_text(b)
+        key = (t, why)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((t, why))
+
+    add_candidate(raw, "byte_array_raw")
+    # Deterministic length-seeded XOR stream family (common in commodity Java obfuscators).
+    add_candidate(
+        _decode_len_seed_xor_stream(raw, seed_magic=1313161813, mul_const=73244475),
+        "byte_array_len_seed_xor_stream magic=1313161813 mul=73244475",
+    )
+
+    for key in range(1, 256):
+        dec = bytes((b ^ key) & 0xFF for b in raw)
+        add_candidate(dec, f"byte_array_xor_single key=0x{key:02X}")
+
+    if profile:
+        for c in profile.xor_consts:
+            dec = bytes((b ^ c) & 0xFF for b in raw)
+            add_candidate(dec, f"byte_array_xor_const key=0x{c:02X}")
+        for c in profile.add_consts:
+            dec = bytes((b + c) & 0xFF for b in raw)
+            add_candidate(dec, f"byte_array_add_const n={c}")
+        for c in profile.sub_consts:
+            dec = bytes((b - c) & 0xFF for b in raw)
+            add_candidate(dec, f"byte_array_sub_const n={c}")
+        for arr in profile.key_arrays:
+            if not arr:
+                continue
+            dec = bytes(((b ^ (arr[i % len(arr)] & 0xFF)) & 0xFF) for i, b in enumerate(raw))
+            add_candidate(dec, f"byte_array_xor_keyarray len={len(arr)}")
+
+    return out
+
+
+def decode_stringdecrypt_bytes(vals: List[int], profile: Optional[DecryptProfile]) -> tuple[str, str]:
+    best = ""
+    best_note = ""
+    best_score = 0.0
+    for text, note in _candidate_decodes_for_byte_array(vals, profile):
+        score = _score_plaintext(text)
+        if score > best_score:
+            best_score = score
+            best = text
+            best_note = note
+    if best and best_score >= 1.50 and _looks_meaningful_text(best):
+        return best, best_note
+    return "", ""
+
+
+def decode_stringdecrypt_bytes_fallback(vals: List[int], profile: Optional[DecryptProfile]) -> tuple[str, str]:
+    best = ""
+    best_note = ""
+    best_score = 0.0
+    for text, note in _candidate_decodes_for_byte_array(vals, profile):
+        score = _score_plaintext(text)
+        if score > best_score:
+            best_score = score
+            best = text
+            best_note = note
+    if not best:
+        return "", ""
+    # Lower-confidence fallback for standard scan mode to avoid dropping all encrypted literals.
+    ascii_printable = sum(1 for ch in best if ch in "\t\r\n" or 32 <= ord(ch) <= 126)
+    ratio = ascii_printable / len(best) if best else 0.0
+    if ratio < 0.75:
+        return "", ""
+    if "\x00" in best:
+        return "", ""
+    if best_score < 1.10:
+        return "", ""
+    return best, f"{best_note} forced_low_confidence"
+
+
+def decode_stringdecrypt_bytes_force(vals: List[int], profile: Optional[DecryptProfile]) -> tuple[str, str]:
+    best = ""
+    best_note = ""
+    best_score = -1.0
+    for text, note in _candidate_decodes_for_byte_array(vals, profile):
+        score = _score_plaintext(text)
+        if score > best_score:
+            best_score = score
+            best = text
+            best_note = note
+    if not best:
+        return "", ""
+    if "\x00" in best:
+        best = best.replace("\x00", "")
+    if not best:
+        return "", ""
+    return best, f"{best_note} forced_any"
 
 
 def decode_obf(d1: List[int], d2: List[int], k1: int, k2: int) -> str:
@@ -524,6 +783,13 @@ def detect_external_endpoint_indicator(decoded: str) -> tuple[str, str]:
     return "", ""
 
 
+def classify_stringdecrypt_decoded(decoded: str, decode_note: str) -> str:
+    low_note = (decode_note or "").lower()
+    if "xor" in low_note or "len_seed_xor_stream" in low_note:
+        return "xor_decrypted_string"
+    return "decrypted_string"
+
+
 def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tuple[int, str]], max_hits: int = 40) -> List[Finding]:
     out: List[Finding] = []
     seen = set()
@@ -602,6 +868,278 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
         if not discord_kind and not endpoint_kind:
             generic_hits += 1
     return out
+
+
+def scan_all_string_literals(
+    text: str,
+    rel: str,
+    starts: List[int],
+    decls: List[tuple[int, str]],
+    max_hits: int = 300,
+) -> List[Finding]:
+    out: List[Finding] = []
+    seen = set()
+    hits = 0
+    for m in STRING_ANY_LITERAL_RE.finditer(text):
+        if hits >= max_hits:
+            break
+        decoded = _unescape_java_literal(m.group(1)).strip()
+        if len(decoded) < 4:
+            continue
+        key = decoded
+        if key in seen:
+            continue
+        seen.add(key)
+        line = offset_to_line(starts, m.start())
+        function = nearest_method(decls, line)
+        out.append(
+            Finding(
+                file=rel,
+                line=line,
+                function=function,
+                decoded=decoded,
+                category="string",
+                note="source=string_literal_fullscan",
+            )
+        )
+        hits += 1
+    return out
+
+
+def scan_stringdecrypt_calls(
+    text: str,
+    rel: str,
+    starts: List[int],
+    decls: List[tuple[int, str]],
+    profile: Optional[DecryptProfile],
+    max_hits: int = 120,
+) -> List[Finding]:
+    out: List[Finding] = []
+    seen = set()
+    hits = 0
+    unresolved_total = 0
+    unresolved_markers = 0
+    unresolved_marker_cap = 5
+    for m in STRING_DECRYPT_CALL_RE.finditer(text):
+        if hits >= max_hits:
+            break
+        vals = parse_java_byte_list(m.group("bytes"))
+        if not vals:
+            continue
+        decoded, note = decode_stringdecrypt_bytes(vals, profile)
+        line = offset_to_line(starts, m.start())
+        function = nearest_method(decls, line)
+        if not decoded:
+            decoded, note = decode_stringdecrypt_bytes_fallback(vals, profile)
+        if not decoded:
+            decoded, note = decode_stringdecrypt_bytes_force(vals, profile)
+        if not decoded:
+            unresolved_total += 1
+            if unresolved_markers < unresolved_marker_cap:
+                out.append(
+                    Finding(
+                        file=rel,
+                        line=line,
+                        function=function,
+                        decoded="<encrypted StringDecrypt byte[] literal (unresolved)>",
+                        category="encrypted_or_unresolved",
+                        note="source=stringdecrypt_scanner signal=unresolved_byte_array_decrypt",
+                    )
+                )
+                unresolved_markers += 1
+                hits += 1
+            continue
+        category = classify_stringdecrypt_decoded(decoded, note)
+        key = (line, decoded, category)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            Finding(
+                file=rel,
+                line=line,
+                function=function,
+                decoded=decoded,
+                category=category,
+                note=f"source=stringdecrypt_scanner signal=byte_array_decrypt {note}".strip(),
+            )
+        )
+        hits += 1
+    if unresolved_total > unresolved_marker_cap:
+        out.append(
+            Finding(
+                file=rel,
+                line=1,
+                function="<file>",
+                decoded=f"<{unresolved_total} encrypted StringDecrypt byte[] literals unresolved>",
+                category="encrypted_or_unresolved",
+                note="source=stringdecrypt_scanner signal=unresolved_summary",
+            )
+        )
+    return out
+
+
+def deobfuscate_stringdecrypt_calls_in_file(path: Path, profile: Optional[DecryptProfile]) -> dict:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    changed = 0
+    unresolved = 0
+    xor_changed = 0
+    other_changed = 0
+    parts: List[str] = []
+    last = 0
+
+    for m in STRING_DECRYPT_CALL_RE.finditer(text):
+        parts.append(text[last : m.start("call")])
+        vals = parse_java_byte_list(m.group("bytes"))
+        decoded, _note = decode_stringdecrypt_bytes(vals, profile)
+        if not decoded:
+            decoded, _note = decode_stringdecrypt_bytes_fallback(vals, profile)
+        if not decoded:
+            decoded, _note = decode_stringdecrypt_bytes_force(vals, profile)
+        if decoded:
+            parts.append(f"\"{_java_string_escape(decoded)}\"")
+            changed += 1
+            low_note = (_note or "").lower()
+            if "xor" in low_note or "len_seed_xor_stream" in low_note:
+                xor_changed += 1
+            else:
+                other_changed += 1
+        else:
+            parts.append(m.group("call"))
+            unresolved += 1
+        last = m.end("call")
+    parts.append(text[last:])
+    if changed > 0:
+        path.write_text("".join(parts), encoding="utf-8")
+    return {
+        "changed": changed,
+        "unresolved": unresolved,
+        "xor_changed": xor_changed,
+        "other_changed": other_changed,
+    }
+
+
+def deobfuscate_load_calls_in_file(path: Path) -> tuple[int, int]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    changed = 0
+    unresolved = 0
+    parts: List[str] = []
+    last = 0
+
+    for m in LOAD_CALL_RE.finditer(text):
+        parts.append(text[last : m.start(0)])
+        try:
+            d1 = parse_int_list(m.group("d1"))
+            d2 = parse_int_list(m.group("d2"))
+            k1 = int(m.group("k1"))
+            k2 = int(m.group("k2"))
+            decoded = decode_obf(d1, d2, k1, k2)
+        except Exception:
+            decoded = ""
+        if decoded:
+            parts.append(f"\"{_java_string_escape(decoded)}\"")
+            changed += 1
+        else:
+            parts.append(m.group(0))
+            unresolved += 1
+        last = m.end(0)
+    parts.append(text[last:])
+    if changed > 0:
+        path.write_text("".join(parts), encoding="utf-8")
+    return changed, unresolved
+
+
+def deobfuscate_codebase(root: Path, profile: Optional[DecryptProfile], enabled_progress: bool, progress_console=None) -> dict:
+    files = list(iter_java_files(root))
+    file_changes = 0
+    total_replaced = 0
+    total_unresolved = 0
+    calls_seen = 0
+    files_with_calls = 0
+    load_calls_seen = 0
+    load_replaced = 0
+    load_unresolved = 0
+    stringdecrypt_xor_replaced = 0
+    stringdecrypt_other_replaced = 0
+
+    max_passes = 3
+    pass_count = 0
+    use_rich_progress = bool(enabled_progress and RICH_AVAILABLE and progress_console is not None)
+
+    def run_passes(progress_task=None, progress_obj=None) -> None:
+        nonlocal calls_seen, load_calls_seen, files_with_calls
+        nonlocal file_changes, total_replaced, total_unresolved
+        nonlocal load_replaced, load_unresolved, pass_count
+        nonlocal stringdecrypt_xor_replaced, stringdecrypt_other_replaced
+        for pass_idx in range(1, max_passes + 1):
+            pass_count = pass_idx
+            pass_changes = 0
+            for idx, p in enumerate(files, start=1):
+                text = p.read_text(encoding="utf-8", errors="replace")
+                if pass_idx == 1:
+                    c = len(list(STRING_DECRYPT_CALL_RE.finditer(text)))
+                    lc = len(list(LOAD_CALL_RE.finditer(text)))
+                    calls_seen += c
+                    load_calls_seen += lc
+                    if c > 0 or lc > 0:
+                        files_with_calls += 1
+
+                s_stats = deobfuscate_stringdecrypt_calls_in_file(p, profile)
+                l_changed, l_unresolved = deobfuscate_load_calls_in_file(p)
+                changed = int(s_stats.get("changed", 0))
+                unresolved = int(s_stats.get("unresolved", 0))
+                stringdecrypt_xor_replaced += int(s_stats.get("xor_changed", 0))
+                stringdecrypt_other_replaced += int(s_stats.get("other_changed", 0))
+                changed_total = changed + l_changed
+                if changed_total > 0:
+                    file_changes += 1
+                    pass_changes += changed_total
+                total_replaced += changed
+                total_unresolved += unresolved
+                load_replaced += l_changed
+                load_unresolved += l_unresolved
+
+                if progress_task is not None and progress_obj is not None:
+                    progress_obj.advance(progress_task)
+                elif enabled_progress and (idx == 1 or idx % 40 == 0 or idx == len(files)):
+                    progress(
+                        enabled_progress,
+                        f"deobf pass{pass_idx} file {idx}/{len(files)} replaced={total_replaced + load_replaced} unresolved={total_unresolved + load_unresolved}",
+                        progress_console,
+                    )
+            if pass_changes == 0:
+                break
+
+    if use_rich_progress:
+        with Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[bold cyan]Deobfuscating Java files"),
+            BarColumn(bar_width=30),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=progress_console,
+            transient=False,
+        ) as prog:
+            task = prog.add_task("deobf", total=len(files) * max_passes)
+            run_passes(task, prog)
+            prog.update(task, completed=len(files) * max_passes)
+    else:
+        run_passes()
+
+    return {
+        "java_files": len(files),
+        "calls_seen": calls_seen,
+        "replaced": total_replaced,
+        "unresolved": total_unresolved,
+        "stringdecrypt_xor_replaced": stringdecrypt_xor_replaced,
+        "stringdecrypt_other_replaced": stringdecrypt_other_replaced,
+        "load_calls_seen": load_calls_seen,
+        "load_replaced": load_replaced,
+        "load_unresolved": load_unresolved,
+        "files_changed": file_changes,
+        "files_with_calls": files_with_calls,
+        "passes_run": pass_count,
+    }
 
 
 def iter_java_files(root: Path) -> Iterable[Path]:
@@ -1776,7 +2314,12 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
     return out
 
 
-def scan_file(path: Path, root: Path) -> List[Finding]:
+def scan_file(
+    path: Path,
+    root: Path,
+    decrypt_profile: Optional[DecryptProfile] = None,
+    include_all_literals: bool = False,
+) -> List[Finding]:
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     decls = find_method_declarations(lines)
@@ -1792,14 +2335,24 @@ def scan_file(path: Path, root: Path) -> List[Finding]:
             d2 = parse_int_list(m.group("d2"))
             k1 = int(m.group("k1"))
             k2 = int(m.group("k2"))
-            decoded = decode_obf(d1, d2, k1, k2)
+            decoded_raw = decode_obf(d1, d2, k1, k2)
         except Exception as exc:
-            decoded = f"<decode_error: {exc}>"
+            decoded_raw = f"<decode_error: {exc}>"
 
         line = offset_to_line(starts, m.start())
         function = nearest_method(decls, line)
-        category = classify(decoded)
-        note = base64_note(decoded) if category == "base64_blob" else ""
+        if decoded_raw.startswith("<decode_error:"):
+            decoded = decoded_raw
+            category = "encrypted_or_unresolved"
+            note = "source=load_scanner signal=decode_error"
+        elif _looks_meaningful_text(decoded_raw):
+            decoded = decoded_raw
+            category = classify(decoded)
+            note = base64_note(decoded) if category == "base64_blob" else ""
+        else:
+            decoded = "<load(...) literal decode appears encrypted/unresolved>"
+            category = "encrypted_or_unresolved"
+            note = "source=load_scanner signal=low_confidence_decode"
         findings.append(
             Finding(
                 file=rel,
@@ -1812,6 +2365,8 @@ def scan_file(path: Path, root: Path) -> List[Finding]:
         )
 
     if not is_vendor_lib:
+        if include_all_literals:
+            findings.extend(scan_all_string_literals(text, rel, starts, decls))
         seen = set()
         literal_hits = 0
         for m in STRING_LITERAL_RE.finditer(text):
@@ -1838,6 +2393,7 @@ def scan_file(path: Path, root: Path) -> List[Finding]:
                 literal_hits += 1
                 if literal_hits >= 30:
                     break
+        findings.extend(scan_stringdecrypt_calls(text, rel, starts, decls, decrypt_profile))
         findings.extend(scan_string_literals(text, rel, starts, decls))
     return findings
 
@@ -1893,10 +2449,14 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         behavior_severity_counts[behavior_severity(b.behavior)] += 1
 
     assessment_summary = summarize_assessments(behaviors)
+    xor_decrypted_count = by_category.get("xor_decrypted_string", 0)
+    decrypted_string_count = by_category.get("decrypted_string", 0)
     return {
         "total_findings": len(findings),
         "unique_decoded_strings": len(unique),
         "category_counts": dict(sorted(by_category.items(), key=lambda x: (-x[1], x[0]))),
+        "xor_decrypted_count": xor_decrypted_count,
+        "decrypted_string_count": decrypted_string_count,
         "high_risk_count": len(high_risk),
         "behavior_findings": len(behaviors),
         "high_risk_behavior_count": behavior_severity_counts["critical"] + behavior_severity_counts["high"],
@@ -2022,6 +2582,8 @@ def render_text(
     out.append("== Summary ==")
     out.append(f"Total findings: {summary['total_findings']}")
     out.append(f"Unique decoded strings: {summary['unique_decoded_strings']}")
+    out.append(f"XOR decrypted strings: {summary.get('xor_decrypted_count', 0)}")
+    out.append(f"Other decrypted strings: {summary.get('decrypted_string_count', 0)}")
     out.append(f"High-risk findings: {summary['high_risk_count']}")
     out.append(f"Behavior findings: {summary['behavior_findings']}")
     out.append(f"High-risk behaviors: {summary['high_risk_behavior_count']}")
@@ -2156,7 +2718,7 @@ def render_rich(
     console.print(Rule("[bold blue]Decode + String Findings"))
     if findings:
         t = Table(show_lines=False, expand=True)
-        t.add_column("Category", style="magenta")
+        t.add_column("Category", style="magenta", max_width=22, no_wrap=True, overflow="ellipsis")
         t.add_column("Location", style="cyan")
         t.add_column("Function", style="green")
         t.add_column("Decoded", style="white", overflow="fold")
@@ -2235,6 +2797,8 @@ def render_rich(
     s = Table(show_header=False, box=None)
     s.add_row("Total findings", str(summary["total_findings"]))
     s.add_row("Unique decoded strings", str(summary["unique_decoded_strings"]))
+    s.add_row("XOR decrypted strings", str(summary.get("xor_decrypted_count", 0)))
+    s.add_row("Other decrypted strings", str(summary.get("decrypted_string_count", 0)))
     s.add_row("High-risk findings", str(summary["high_risk_count"]))
     s.add_row("Behavior findings", str(summary["behavior_findings"]))
     s.add_row("High-risk behaviors", str(summary["high_risk_behavior_count"]))
@@ -2273,6 +2837,25 @@ def main() -> int:
         default=120,
         help="Preferred Rich console width for final report/progress rendering",
     )
+    p.add_argument(
+        "--decrypt-codebase-in-place",
+        action="store_true",
+        help="Rewrite StringDecrypt.decrypt(new byte[]{...}) calls in the target tree with decoded string literals",
+    )
+    p.add_argument(
+        "--decrypt-codebase-out",
+        help="Copy target tree to this directory, rewrite encrypted StringDecrypt byte-array calls there, then scan that output tree",
+    )
+    p.add_argument(
+        "--no-rescan-after-decrypt",
+        action="store_true",
+        help="When decrypt mode is used, perform rewrite only and skip the follow-up triage scan",
+    )
+    p.add_argument(
+        "--no-auto-decrypt",
+        action="store_true",
+        help="Disable default behavior that decrypts a copied target tree before scanning",
+    )
     args = p.parse_args()
 
     root = resolve_target(args.target)
@@ -2282,7 +2865,7 @@ def main() -> int:
     report_console = Console(width=pref_width) if RICH_AVAILABLE else None
     rich_progress_mode = bool(RICH_AVAILABLE and progress_console is not None and show_progress)
     phase_logs = show_progress and not rich_progress_mode
-    progress(show_progress, f"target resolved to: {root}", progress_console)
+    progress(phase_logs, f"target resolved to: {root}", progress_console)
 
     if not root.exists():
         print(f"error: target does not exist: {root}", file=sys.stderr)
@@ -2291,15 +2874,98 @@ def main() -> int:
         print(f"error: target is not a directory: {root}", file=sys.stderr)
         return 2
 
-    progress(phase_logs, "collecting target metadata", progress_console)
-    target_metadata = collect_target_metadata(root)
-    progress(phase_logs, "discovering Java files", progress_console)
     if not args.json:
         if rich_progress_mode:
             print_banner(progress_console, to_stderr=False)
         else:
             print_banner(None, to_stderr=True)
-    files = list(iter_java_files(root))
+
+    if args.decrypt_codebase_in_place and args.decrypt_codebase_out:
+        print("error: use only one of --decrypt-codebase-in-place or --decrypt-codebase-out", file=sys.stderr)
+        return 2
+
+    user_decrypt_mode = bool(args.decrypt_codebase_in_place or args.decrypt_codebase_out)
+    auto_decrypt_mode = (not user_decrypt_mode) and (not args.no_auto_decrypt)
+    decrypt_mode = user_decrypt_mode or auto_decrypt_mode
+    scan_root = root
+    deobf_stats = None
+
+    if args.decrypt_codebase_out:
+        out_root = Path(args.decrypt_codebase_out).resolve()
+        if out_root.exists():
+            print(f"error: decrypt output already exists: {out_root}", file=sys.stderr)
+            return 2
+        progress(phase_logs, f"copying target to decrypt output: {out_root}", progress_console)
+        shutil.copytree(root, out_root)
+        scan_root = out_root
+    elif auto_decrypt_mode:
+        base_out = Path.cwd() / f"{root.name}_deobfuscated"
+        out_root = base_out
+        if out_root.exists():
+            idx = 2
+            while True:
+                candidate = Path.cwd() / f"{root.name}_deobfuscated_{idx}"
+                if not candidate.exists():
+                    out_root = candidate
+                    break
+                idx += 1
+        progress(phase_logs, f"default auto-decrypt: copying target to {out_root}", progress_console)
+        shutil.copytree(root, out_root)
+        scan_root = out_root
+
+    decrypt_profile = None
+    if decrypt_mode:
+        progress(phase_logs, "building StringDecrypt profile", progress_console)
+        decrypt_profile = build_decrypt_profile(scan_root)
+        progress(phase_logs, "rewriting encrypted StringDecrypt byte-array calls", progress_console)
+        deobf_stats = deobfuscate_codebase(scan_root, decrypt_profile, show_progress, progress_console)
+        files_total = max(1, int(deobf_stats.get("java_files", 0)))
+        files_ratio = float(deobf_stats.get("files_with_calls", 0)) / files_total
+        majorly_encrypted = bool(deobf_stats.get("calls_seen", 0) >= 200 or files_ratio >= 0.20)
+        deobf_stats["majorly_encrypted"] = majorly_encrypted
+        deobf_stats["scan_mode"] = "post_decryption_only"
+        deobf_stats["auto_decrypt_default"] = auto_decrypt_mode
+        deobf_stats["source_root"] = str(root)
+        deobf_stats["scan_root"] = str(scan_root)
+        progress(
+            phase_logs,
+            f"deobf complete: stringdecrypt_calls={deobf_stats.get('calls_seen', 0)} stringdecrypt_replaced={deobf_stats.get('replaced', 0)} "
+            f"stringdecrypt_unresolved={deobf_stats.get('unresolved', 0)} load_calls={deobf_stats.get('load_calls_seen', 0)} "
+            f"load_replaced={deobf_stats.get('load_replaced', 0)} load_unresolved={deobf_stats.get('load_unresolved', 0)}",
+            progress_console,
+        )
+        progress(phase_logs, "pre-decryption scan skipped; scanning post-decryption tree", progress_console)
+        if args.no_rescan_after_decrypt:
+            if args.json:
+                payload = {"root": str(scan_root), "deobfuscation": deobf_stats}
+                out_text = json.dumps(payload, indent=2)
+            else:
+                out_text = (
+                    "== Deobfuscation ==\n"
+                    f"Root: {scan_root}\n"
+                    f"Java files scanned: {deobf_stats.get('java_files', 0)}\n"
+                    f"StringDecrypt calls found: {deobf_stats.get('calls_seen', 0)}\n"
+                    f"StringDecrypt calls replaced: {deobf_stats.get('replaced', 0)}\n"
+                    f"StringDecrypt calls unresolved: {deobf_stats.get('unresolved', 0)}\n"
+                    f"load(...) calls found: {deobf_stats.get('load_calls_seen', 0)}\n"
+                    f"load(...) calls replaced: {deobf_stats.get('load_replaced', 0)}\n"
+                    f"load(...) calls unresolved: {deobf_stats.get('load_unresolved', 0)}\n"
+                    f"Files changed: {deobf_stats.get('files_changed', 0)}"
+                )
+            if args.out:
+                Path(args.out).write_text(out_text, encoding="utf-8")
+            else:
+                print(out_text)
+            progress(show_progress, "done", progress_console)
+            return 0
+
+    if decrypt_profile is None:
+        decrypt_profile = build_decrypt_profile(scan_root)
+
+    progress(phase_logs, "collecting target metadata", progress_console)
+    target_metadata = collect_target_metadata(scan_root)
+    progress(phase_logs, "discovering Java files", progress_console)
+    files = list(iter_java_files(scan_root))
     progress(phase_logs, f"found {len(files)} Java file(s)", progress_console)
 
     all_findings: List[Finding] = []
@@ -2312,21 +2978,21 @@ def main() -> int:
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             console=progress_console,
-            transient=True,
+            transient=False,
         ) as prog:
             task = prog.add_task("scan", total=len(files))
             for file_path in files:
-                all_findings.extend(scan_file(file_path, root))
-                behavior_findings.extend(scan_behavior(file_path, root))
+                all_findings.extend(scan_file(file_path, scan_root, decrypt_profile, include_all_literals=decrypt_mode))
+                behavior_findings.extend(scan_behavior(file_path, scan_root))
                 prog.advance(task)
     else:
         for idx, file_path in enumerate(files, start=1):
             if show_progress and (idx == 1 or idx % 50 == 0 or idx == len(files)):
                 progress(show_progress, f"scanning file {idx}/{len(files)}", progress_console)
-            all_findings.extend(scan_file(file_path, root))
-            behavior_findings.extend(scan_behavior(file_path, root))
+            all_findings.extend(scan_file(file_path, scan_root, decrypt_profile, include_all_literals=decrypt_mode))
+            behavior_findings.extend(scan_behavior(file_path, scan_root))
 
-    behavior_findings.extend(discover_structural_behaviors(root))
+    behavior_findings.extend(discover_structural_behaviors(scan_root))
     behavior_findings = sorted(
         {(b.file, b.line, b.behavior, b.evidence): b for b in behavior_findings}.values(),
         key=lambda x: (x.file, x.line, x.behavior),
@@ -2335,7 +3001,7 @@ def main() -> int:
     progress(phase_logs, f"collected {len(all_findings)} decode/string finding(s)", progress_console)
     progress(phase_logs, f"detected {len(behavior_findings)} behavior indicator(s)", progress_console)
     progress(phase_logs, "discovering suspicious artifacts", progress_console)
-    artifact_findings = discover_artifacts(root)
+    artifact_findings = discover_artifacts(scan_root)
     progress(phase_logs, f"detected {len(artifact_findings)} artifact indicator(s)", progress_console)
     runtime_c2 = {"attempted": False, "resolved": False}
     if not args.no_network:
@@ -2349,11 +3015,18 @@ def main() -> int:
     progress(phase_logs, "building summary", progress_console)
 
     summary = summarize(all_findings, behavior_findings, artifact_findings)
+    if deobf_stats:
+        summary["xor_decrypted_count"] = int(deobf_stats.get("stringdecrypt_xor_replaced", 0))
+        summary["decrypted_string_count"] = int(
+            deobf_stats.get("stringdecrypt_other_replaced", 0)
+        ) + int(deobf_stats.get("load_replaced", 0))
 
     if args.json:
         payload = {
-            "root": str(root),
+            "root": str(scan_root),
             "target_metadata": target_metadata,
+            "scan_mode": "post_decryption_only" if decrypt_mode else "standard",
+            "deobfuscation": deobf_stats if deobf_stats else {},
             "summary": summary,
             "assessment_summary": summarize_assessments(behavior_findings),
             "runtime_c2": runtime_c2,
