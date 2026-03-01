@@ -169,6 +169,13 @@ MINECRAFT_AUTH_HOSTS = {
     "api.minecraftservices.com",
 }
 
+AUTO_DECRYPT_TRIGGER_MIN_CALLS = 1
+AUTO_DECRYPT_TRIGGER_MIN_FILE_RATIO = 0.0
+AUTO_DECRYPT_TRIGGER_MIN_FILES_WITH_CALLS = 1
+MAJOR_ENCRYPTED_MIN_CALLS = 200
+MAJOR_ENCRYPTED_MIN_FILE_RATIO = 0.20
+MAJOR_ENCRYPTED_MIN_FILES_WITH_CALLS = 5
+
 
 @dataclass
 class Finding:
@@ -1144,6 +1151,57 @@ def deobfuscate_codebase(root: Path, profile: Optional[DecryptProfile], enabled_
 
 def iter_java_files(root: Path) -> Iterable[Path]:
     yield from root.rglob("*.java")
+
+
+def assess_auto_decrypt_need(root: Path) -> dict:
+    files = list(iter_java_files(root))
+    java_files = len(files)
+    stringdecrypt_calls = 0
+    load_calls = 0
+    files_with_calls = 0
+
+    for p in files:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        sd_calls = sum(1 for _ in STRING_DECRYPT_CALL_RE.finditer(text))
+        load_sd_calls = sum(1 for _ in LOAD_CALL_RE.finditer(text))
+        if sd_calls or load_sd_calls:
+            files_with_calls += 1
+            stringdecrypt_calls += sd_calls
+            load_calls += load_sd_calls
+
+    total_obf_calls = stringdecrypt_calls + load_calls
+    files_ratio = float(files_with_calls) / max(1, java_files)
+    enabled = bool(
+        total_obf_calls >= AUTO_DECRYPT_TRIGGER_MIN_CALLS
+        or (
+            files_with_calls >= AUTO_DECRYPT_TRIGGER_MIN_FILES_WITH_CALLS
+            and files_ratio >= AUTO_DECRYPT_TRIGGER_MIN_FILE_RATIO
+        )
+    )
+    reason = "no_obfuscated_calls"
+    if java_files == 0:
+        reason = "no_java_files"
+    elif enabled:
+        reason = "obfuscated_calls_detected"
+
+    return {
+        "enabled": enabled,
+        "reason": reason,
+        "java_files": java_files,
+        "files_with_calls": files_with_calls,
+        "files_with_calls_ratio": files_ratio,
+        "stringdecrypt_calls": stringdecrypt_calls,
+        "load_calls": load_calls,
+        "total_obfuscated_calls": total_obf_calls,
+        "thresholds": {
+            "min_calls": AUTO_DECRYPT_TRIGGER_MIN_CALLS,
+            "min_file_ratio": AUTO_DECRYPT_TRIGGER_MIN_FILE_RATIO,
+            "min_files_with_calls": AUTO_DECRYPT_TRIGGER_MIN_FILES_WITH_CALLS,
+        },
+    }
 
 
 def find_line(text: str, needle: str) -> int:
@@ -2719,7 +2777,7 @@ def render_rich(
     if findings:
         t = Table(show_lines=False, expand=True)
         t.add_column("Category", style="magenta", max_width=22, no_wrap=True, overflow="ellipsis")
-        t.add_column("Location", style="cyan")
+        t.add_column("Location", style="cyan", overflow="fold")
         t.add_column("Function", style="green")
         t.add_column("Decoded", style="white", overflow="fold")
         for f in sorted(findings, key=lambda x: (x.file, x.line, x.decoded)):
@@ -2732,7 +2790,7 @@ def render_rich(
     console.print(Rule("[bold blue]Assessment Findings"))
     at = Table(show_lines=False, box=box.SIMPLE, expand=True)
     at.add_column("Category", style="green")
-    at.add_column("Location", style="cyan")
+    at.add_column("Location", style="cyan", overflow="fold")
     at.add_column("Assessment", style="yellow")
     at.add_column("Evidence", style="white")
     has_assessment_rows = False
@@ -2750,7 +2808,7 @@ def render_rich(
         t = Table(show_lines=False, box=box.SIMPLE, expand=True)
         t.add_column("Risk", style="red")
         t.add_column("Behavior", style="yellow")
-        t.add_column("Location", style="cyan")
+        t.add_column("Location", style="cyan", overflow="fold")
         t.add_column("Evidence", style="white", overflow="fold")
         for b in sorted(behaviors, key=lambda x: (x.file, x.line, x.behavior)):
             t.add_row(behavior_severity(b.behavior), b.behavior, f"{b.file}:{b.line}", short(b.evidence))
@@ -2854,7 +2912,7 @@ def main() -> int:
     p.add_argument(
         "--no-auto-decrypt",
         action="store_true",
-        help="Disable default behavior that decrypts a copied target tree before scanning",
+        help="Disable opportunistic default auto-decrypt behavior (threshold-based probe + copy/rewrite)",
     )
     args = p.parse_args()
 
@@ -2885,7 +2943,34 @@ def main() -> int:
         return 2
 
     user_decrypt_mode = bool(args.decrypt_codebase_in_place or args.decrypt_codebase_out)
-    auto_decrypt_mode = (not user_decrypt_mode) and (not args.no_auto_decrypt)
+    auto_decrypt_requested = (not user_decrypt_mode) and (not args.no_auto_decrypt)
+    auto_decrypt_probe = None
+    auto_decrypt_mode = False
+    if auto_decrypt_requested:
+        progress(phase_logs, "evaluating auto-decrypt need", progress_console)
+        auto_decrypt_probe = assess_auto_decrypt_need(root)
+        if auto_decrypt_probe["enabled"]:
+            auto_decrypt_mode = True
+            progress(
+                phase_logs,
+                "auto-decrypt enabled: "
+                f"java_files={auto_decrypt_probe['java_files']} "
+                f"obfuscated_calls={auto_decrypt_probe['total_obfuscated_calls']} "
+                f"files_with_calls={auto_decrypt_probe['files_with_calls']} "
+                f"ratio={auto_decrypt_probe['files_with_calls_ratio']:.2%}",
+                progress_console,
+            )
+        else:
+            progress(
+                phase_logs,
+                "auto-decrypt skipped: "
+                f"reason={auto_decrypt_probe['reason']} "
+                f"java_files={auto_decrypt_probe['java_files']} "
+                f"obfuscated_calls={auto_decrypt_probe['total_obfuscated_calls']} "
+                f"files_with_calls={auto_decrypt_probe['files_with_calls']} "
+                f"ratio={auto_decrypt_probe['files_with_calls_ratio']:.2%}",
+                progress_console,
+            )
     decrypt_mode = user_decrypt_mode or auto_decrypt_mode
     scan_root = root
     deobf_stats = None
@@ -2921,10 +3006,20 @@ def main() -> int:
         deobf_stats = deobfuscate_codebase(scan_root, decrypt_profile, show_progress, progress_console)
         files_total = max(1, int(deobf_stats.get("java_files", 0)))
         files_ratio = float(deobf_stats.get("files_with_calls", 0)) / files_total
-        majorly_encrypted = bool(deobf_stats.get("calls_seen", 0) >= 200 or files_ratio >= 0.20)
+        total_obf_calls = int(deobf_stats.get("calls_seen", 0)) + int(deobf_stats.get("load_calls_seen", 0))
+        majorly_encrypted = bool(
+            total_obf_calls >= MAJOR_ENCRYPTED_MIN_CALLS
+            or (
+                int(deobf_stats.get("files_with_calls", 0)) >= MAJOR_ENCRYPTED_MIN_FILES_WITH_CALLS
+                and files_ratio >= MAJOR_ENCRYPTED_MIN_FILE_RATIO
+            )
+        )
         deobf_stats["majorly_encrypted"] = majorly_encrypted
         deobf_stats["scan_mode"] = "post_decryption_only"
-        deobf_stats["auto_decrypt_default"] = auto_decrypt_mode
+        deobf_stats["auto_decrypt_default"] = auto_decrypt_requested
+        deobf_stats["auto_decrypt_selected"] = auto_decrypt_mode
+        if auto_decrypt_probe is not None:
+            deobf_stats["auto_decrypt_probe"] = auto_decrypt_probe
         deobf_stats["source_root"] = str(root)
         deobf_stats["scan_root"] = str(scan_root)
         progress(
