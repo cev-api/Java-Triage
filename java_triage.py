@@ -1577,12 +1577,34 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
         )
 
     mc_session_files = ["session.json", "launcher_accounts.json", ".minecraft"]
-    has_mc_session_file_ref = any(x in low for x in mc_session_files)
-    if has_mc_session_file_ref:
+    # Limit detection to explicit string literals to avoid import-only or comment noise.
+    string_literals = [m.group(1).lower() for m in STRING_ANY_LITERAL_RE.finditer(text)]
+    lit_ref_hit = any(any(tok in lit for tok in mc_session_files) for lit in string_literals)
+    # Require likely file I/O usage hints to classify as file access.
+    fileio_markers = [
+        "new File(",
+        "Paths.get(",
+        "Files.read",
+        "FileInputStream(",
+        "FileReader(",
+        "Files.newBufferedReader(",
+        "Files.newInputStream(",
+        "Scanner(",
+        "Files.lines(",
+    ]
+    has_fileio = any(marker in text for marker in fileio_markers)
+    if lit_ref_hit and has_fileio:
+        # Choose the earliest referenced token for accurate line reporting.
+        chosen_token = None
+        for tok in mc_session_files:
+            if any(tok in lit for lit in string_literals):
+                chosen_token = tok
+                break
+        chosen_token = chosen_token or "session.json"
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "session.json") if "session.json" in low else find_line(text, ".minecraft"),
+                line=find_line(text, chosen_token),
                 behavior="minecraft_session_file_access",
                 evidence="References local Minecraft session/account storage paths (session.json/launcher_accounts.json/.minecraft)",
             )
@@ -1591,7 +1613,7 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             out.append(
                 BehaviorFinding(
                     file=rel,
-                    line=find_line(text, "session.json") if "session.json" in low else find_line(text, "launcher_accounts.json"),
+                    line=find_line(text, chosen_token),
                     behavior="possible_minecraft_session_file_exfiltration",
                     evidence="Session/account file reference appears in file that also contains outbound HTTP activity",
                 )
