@@ -84,6 +84,32 @@ Discord-focused detection includes:
 - snowflake IDs (`17-20` digit IDs)
 - contextual IDs in literals containing labels like `guild_id`, `channel_id`, `user_id`, `role_id`, `application_id`
 
+## Minecraft Session File Access Detection
+
+To reduce false positives, session/account path detection requires:
+
+- The token to appear inside a Java string literal: `session.json`, `launcher_accounts.json`, or `.minecraft`.
+- File I/O usage in the same file (e.g., `new File(`, `Paths.get(`, `Files.read...`, `FileInputStream(`, `FileReader(`).
+
+This prevents import-only or UI text from being misclassified as file access. If outbound HTTP is also present in that file, an additional high-severity signal is raised for possible exfiltration.
+
+## Minecraft Identity Exfiltration Detection
+
+The scanner flags a high-severity indicator when user identifiers are read and outbound HTTP appears in the same file:
+
+- Username reads: `method_1676()`, `getName()`, `getUsername()`
+- UUID reads: `method_44717()`, `GameProfile.getId()`, `Session.getUuid()`, and mapped/yarn variants
+- Outbound HTTP markers: discovered host URLs, `HttpClient.send(...)`, `OkHttpClient.newCall(...)`, `HttpURLConnection`
+
+If any username/UUID read appears with outbound HTTP, the tool emits `possible_minecraft_identity_exfiltration` with the source location and evidence.
+
+Additionally, alias coverage for Minecraft session/user/profile access has been expanded (Mojmap/Yarn) to improve detection across versions:
+
+- Session presence/access: `method_1548()`, `getSession()`, `getUser()`, `net.minecraft.client.util.Session`, `new Session(...)`
+- Username access: `method_1676()`, `getName()`, `getUsername()`
+- UUID access: `method_44717()`, `getProfileId()`, `getUuid()`, `GameProfile.getId()`
+- Token access: `method_1674()`, `getAccessToken()`, `session.getAccessToken()`
+
 ## Inspiration
 
 I saw this on [YouTube](https://www.youtube.com/watch?v=bsZJo49RaBE):
@@ -269,32 +295,6 @@ JSON output structure:
   "artifact_findings": []
 }
 ```
-
-## Minecraft Session File Access Detection
-
-To reduce false positives, session/account path detection requires:
-
-- The token to appear inside a Java string literal: `session.json`, `launcher_accounts.json`, or `.minecraft`.
-- File I/O usage in the same file (e.g., `new File(`, `Paths.get(`, `Files.read...`, `FileInputStream(`, `FileReader(`).
-
-This prevents import-only or UI text from being misclassified as file access. If outbound HTTP is also present in that file, an additional high-severity signal is raised for possible exfiltration.
-
-## Minecraft Identity Exfiltration Detection
-
-The scanner flags a high-severity indicator when user identifiers are read and outbound HTTP appears in the same file:
-
-- Username reads: `method_1676()`, `getName()`, `getUsername()`
-- UUID reads: `method_44717()`, `GameProfile.getId()`, `Session.getUuid()`, and mapped/yarn variants
-- Outbound HTTP markers: discovered host URLs, `HttpClient.send(...)`, `OkHttpClient.newCall(...)`, `HttpURLConnection`
-
-If any username/UUID read appears with outbound HTTP, the tool emits `possible_minecraft_identity_exfiltration` with the source location and evidence.
-
-Additionally, alias coverage for Minecraft session/user/profile access has been expanded (Mojmap/Yarn) to improve detection across versions:
-
-- Session presence/access: `method_1548()`, `getSession()`, `getUser()`, `net.minecraft.client.util.Session`, `new Session(...)`
-- Username access: `method_1676()`, `getName()`, `getUsername()`
-- UUID access: `method_44717()`, `getProfileId()`, `getUuid()`, `GameProfile.getId()`
-- Token access: `method_1674()`, `getAccessToken()`, `session.getAccessToken()`
 
 ## Notes and Limits
 
