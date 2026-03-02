@@ -127,6 +127,7 @@ BEHAVIOR_SEVERITY_MAP = {
     "possible_access_token_exfiltration": "high",
     "remote_urlclassloader_usage": "high",
     "possible_minecraft_session_file_exfiltration": "high",
+    "possible_minecraft_identity_exfiltration": "high",
     "dropper_elevation_helper": "high",
     "second_stage_jar_unpack": "high",
     "embedded_native_payload_loader": "high",
@@ -149,6 +150,7 @@ BEHAVIOR_SEVERITY_MAP = {
     "minecraft_username_access": "low",
     "minecraft_uuid_access": "low",
     "minecraft_access_token_access": "medium",
+    "minecraft_session_id_access": "medium",
     "token_field_getter_passthrough": "low",
     "profile_use_fake_player_clone": "low",
     "profile_use_self_name_filtering": "low",
@@ -1355,9 +1357,23 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
-    has_get_game_profile = _contains_any(text, ["method_7334()", "getGameProfile()"])
-    has_get_session = _contains_any(text, ["method_1548()", "getSession()", "getUser()"])
-    has_get_access_token = _contains_any(text, ["method_1674()", "getAccessToken()"])
+    has_get_game_profile = _contains_any(text, [
+        "method_7334()",
+        "getGameProfile()",
+        "getGameProfile("
+    ])
+    has_get_session = _contains_any(text, [
+        "method_1548()",
+        "getSession()",
+        "getUser()",
+        "net.minecraft.client.util.Session",
+        "new Session("
+    ])
+    has_get_access_token = _contains_any(text, [
+        "method_1674()",
+        "getAccessToken()",
+        "session.getAccessToken()"
+    ])
     has_fake_player_clone = False
     has_self_name_filtering = False
     has_session_profile_override = False
@@ -1368,6 +1384,8 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     has_credential_exfil_post = False
     has_internal_profile_key_usage = False
     has_token_getter_passthrough = False
+    has_username_access_signal = False
+    has_uuid_access_signal = False
 
     if has_get_game_profile:
         out.append(
@@ -1394,25 +1412,45 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
-    if "method_1676()" in text or ".getName()" in text:
+    if "method_1676()" in text or ".getName()" in text or ".getUsername()" in text:
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "method_1676()") if "method_1676()" in text else find_line(text, ".getName()"),
+                line=(
+                    find_line(text, "method_1676()")
+                    if "method_1676()" in text
+                    else (find_line(text, ".getUsername()") if ".getUsername()" in text else find_line(text, ".getName()"))
+                ),
                 behavior="minecraft_username_access",
-                evidence="Reads Minecraft session username (method_1676/getName)",
+                evidence="Reads Minecraft session username (method_1676/getName/getUsername)",
             )
         )
+        has_username_access_signal = True
 
-    if "method_44717()" in text or ".getProfileId()" in text:
+    # UUID access via multiple mappings: method_44717, getProfileId (mapped), getUuid (Session), getId (GameProfile)
+    if (
+        "method_44717()" in text
+        or ".getProfileId()" in text
+        or ".getUuid()" in text
+        or (".getId()" in text and ("GameProfile" in text or "getGameProfile()" in text))
+    ):
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "method_44717()") if "method_44717()" in text else find_line(text, ".getProfileId()"),
+                line=(
+                    find_line(text, "method_44717()")
+                    if "method_44717()" in text
+                    else (
+                        find_line(text, ".getProfileId()")
+                        if ".getProfileId()" in text
+                        else (find_line(text, ".getUuid()") if ".getUuid()" in text else find_line(text, ".getId()"))
+                    )
+                ),
                 behavior="minecraft_uuid_access",
-                evidence="Reads Minecraft session UUID (method_44717/getProfileId)",
+                evidence="Reads Minecraft session UUID (method_44717/getProfileId/getUuid/getId)",
             )
         )
+        has_uuid_access_signal = True
 
     if has_get_access_token:
         out.append(
@@ -1421,6 +1459,16 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 line=find_line(text, "getAccessToken()") if "getAccessToken()" in text else find_line(text, "method_1674()"),
                 behavior="minecraft_access_token_access",
                 evidence="Reads Minecraft session access token (method_1674/getAccessToken)",
+            )
+        )
+    # Session ID access (older flows); track separately
+    if ".getSessionId()" in text or "session.getSessionId()" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, ".getSessionId()"),
+                behavior="minecraft_session_id_access",
+                evidence="Reads Minecraft session ID (getSessionId)",
             )
         )
         if "private final String mcAccessToken;" in text and "return mcAccessToken;" in text:
@@ -1618,6 +1666,18 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                     evidence="Session/account file reference appears in file that also contains outbound HTTP activity",
                 )
             )
+
+    # Identity exfiltration: username/UUID present with outbound HTTP usage in same file.
+    outbound_http_present = bool(_extract_http_hosts(text) or ("HttpClient" in text and "send(" in text) or ("OkHttpClient" in text and ".newCall(" in text) or ("HttpURLConnection" in text))
+    if outbound_http_present and (has_username_access_signal or has_uuid_access_signal):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=(find_line(text, ".getUsername()") if has_username_access_signal else find_line(text, ".getUuid()")),
+                behavior="possible_minecraft_identity_exfiltration",
+                evidence="Username/UUID read present alongside outbound HTTP activity",
+            )
+        )
 
     if "payload.addProperty" in text and "client.send(req" in text:
         has_credential_exfil_post = True
