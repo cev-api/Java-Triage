@@ -7,7 +7,7 @@
 
 `java_triage.py` is a static triage tool for suspicious Java codebases.
 
-It recursively scans `.java` files, deobfuscates known string call patterns, scans suspicious string literals, surfaces behavioral indicators, finds suspicious artifact files, and can optionally resolve runtime C2 hints from on-chain config data.
+It recursively scans `.java` files, deobfuscates known string call patterns, scans suspicious string literals, surfaces behavioral indicators, finds suspicious artifact files, can resolve runtime C2 hints from on-chain config data, and can optionally fetch/analyze a resolved stage-2 JAR in static-only mode.
 
 ## Features
 
@@ -34,6 +34,8 @@ It recursively scans `.java` files, deobfuscates known string call patterns, sca
 - Adds a metadata preface (`Basic Properties`, `JAR Info`, `Bundle Info`) to text/rich reports.
 - Optionally enriches metadata with `Vhash`, `SSDEEP`, `TLSH`, `TrID`, and `Magika` when local tools/libraries are available.
 - Identifies suspicious artifacts (`*.jar.*`, large opaque `.dat`/`.bin`, embedded resource payloads).
+- Optionally downloads a resolved stage-2 payload JAR and performs static-only archive/content triage (no class or JAR execution).
+- Extracts blockchain indicators from decoded strings (contracts/selectors/RPC hosts and URLs).
 - Produces:
   - human-readable text output (with optional rich terminal tables)
   - machine-readable JSON output
@@ -126,7 +128,7 @@ Update: Mediafire has added a warning in response to this repo, how nice of them
 
 ## Requirements
 
-- Python 3.9+ recommended
+- Python 3.10+ recommended
 - Optional: [`rich`](https://pypi.org/project/rich/) for enhanced terminal output
 - Optional CLI tools for metadata enrichment: `ssdeep`, `tlsh`, `trid`, `vhash`
 - Optional Python package for metadata enrichment: [`magika`](https://pypi.org/project/magika/)
@@ -185,6 +187,9 @@ python java_triage.py ./sample_project --json --out report.json
 # Disable any network lookups during analysis
 python java_triage.py ./sample_project --no-network
 
+# Resolve payload endpoint and run static-only stage-2 JAR analysis
+python java_triage.py ./sample_project --analyze-stage2
+
 # Wider rich output
 python java_triage.py ./sample_project --rich-width 220
 ```
@@ -196,6 +201,7 @@ python java_triage.py ./sample_project --rich-width 220
 - `--out <path>`: write output to file
 - `--no-progress`: disable progress messages
 - `--no-network`: disable runtime C2 resolution over network
+- `--analyze-stage2`: after resolving runtime payload endpoint, download stage-2 JAR and perform static-only analysis (never executes jars/classes)
 - `--rich-width <int>`: preferred rich console width for progress/final report rendering (default: `120`, minimum effective width: `80`)
 - `--decrypt-codebase-in-place`: rewrite supported encrypted string calls in target tree directly
 - `--decrypt-codebase-out <path>`: copy tree to `<path>`, rewrite there, then scan that rewritten tree
@@ -205,7 +211,6 @@ python java_triage.py ./sample_project --rich-width 220
 ## Output
 
 Text output includes:
-- Analysis Context (original target vs active scan root)
 - Basic Properties (hashes + optional enrichments if available)
 - JAR Info (manifest + archive metadata)
 - Bundle Info (bundle counts, timestamps, extensions/types)
@@ -218,6 +223,8 @@ Text output includes:
 - Behavioral findings (with severity)
 - Artifact findings
 - Runtime C2 resolution status
+- Stage2 Analysis status (including manual payload URL guidance and static-only stage-2 metadata/findings when enabled)
+- Blockchain Indicators summary (contracts, method selectors, RPC hosts/URLs)
 - Summary counts (including high-risk findings, high-risk behaviors, assessment counts, category totals, behavior severity totals)
 - Decryption-aware summary counters:
   - `XOR decrypted strings`
@@ -228,11 +235,11 @@ Rich output includes:
 - startup banner shown before staged processing
 - deobfuscation progress stage and scanning progress stage before final report
 - wider, expanded tables (`expand=True`) with folded long text
-- `Analysis Context` table showing when analysis is running on a deobfuscated/extracted copy path
 - dedicated metadata sections (`Basic Properties`, `JAR Info`, `Bundle Info`)
 - dedicated `Assessment Findings` table
 - `Behavioral Findings` with risk column
 - `Decode + String Findings` category column width constrained for better readability
+- dedicated runtime/stage2/blockchain sections equivalent to text output
 
 JSON output structure:
 
@@ -286,6 +293,20 @@ JSON output structure:
     }
   },
   "runtime_c2": {},
+  "stage2_analysis": {
+    "enabled": false,
+    "attempted": false,
+    "static_only_no_execution": true,
+    "error": ""
+  },
+  "stage2_manual_payload_url": "",
+  "blockchain_indicators": {
+    "contracts": [],
+    "selectors": [],
+    "rpc_urls": [],
+    "rpc_hosts": [],
+    "api_key_urls": []
+  },
   "findings": [],
   "behavior_findings": [
     {
