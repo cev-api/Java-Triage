@@ -10,12 +10,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib import error, request
+from urllib.parse import urlparse
 try:
     from rich.console import Console
     from rich.table import Table
@@ -57,6 +59,7 @@ METHOD_RE = re.compile(
 
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 HEX_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{8,}$")
+ETH_SELECTOR_RE = re.compile(r"^0x[a-fA-F0-9]{8}$")
 BASE64_RE = re.compile(r"^[A-Za-z0-9+/=]{80,}$")
 BASE32_RE = re.compile(r"^[A-Z2-7=]{16,}$")
 HEX_BLOB_RE = re.compile(r"^(?:[A-Fa-f0-9]{2}){8,}$")
@@ -124,6 +127,9 @@ BEHAVIOR_SEVERITY_MAP = {
     "defender_tampering": "high",
     "command_execution_capability": "high",
     "credential_exfiltration_post": "high",
+    "credential_handoff_to_dynamic_stage": "critical",
+    "staged_remote_jar_execution": "critical",
+    "blockchain_backed_c2_bootstrap": "high",
     "possible_access_token_exfiltration": "high",
     "remote_urlclassloader_usage": "high",
     "possible_minecraft_session_file_exfiltration": "high",
@@ -829,9 +835,15 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
         elif URL_RE.match(decoded):
             category = "url"
             signal = "literal_url"
+        elif ETH_SELECTOR_RE.match(decoded):
+            category = "hex_or_contract"
+            signal = "literal_eth_method_selector"
         elif HEX_ADDR_RE.match(decoded) and len(decoded) == 42:
             category = "hex_or_contract"
             signal = "literal_contract_address"
+        elif "jsonrpc" in low or "eth_call" in low:
+            category = "rpc_template"
+            signal = "literal_eth_rpc_template"
         elif COMMAND_LITERAL_RE.search(decoded):
             category = "dynamic_execution"
             signal = "literal_command_or_lolbin"
@@ -1316,6 +1328,22 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
+    if (
+        "JarInputStream" in text
+        and "getNextJarEntry" in text
+        and "loadClass(" in text
+        and ".invoke(" in text
+        and ("BodyHandlers.ofByteArray()" in text or "HttpClient.newHttpClient()" in text)
+    ):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "JarInputStream"),
+                behavior="staged_remote_jar_execution",
+                evidence="Downloads remote JAR bytes, unpacks classes in-memory, and reflectively executes staged entrypoint",
+            )
+        )
+
     if "URLClassLoader" in text:
         hosts = _extract_http_hosts(text)
         if hosts:
@@ -1690,6 +1718,20 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
+    if (
+        has_get_access_token
+        and 'context.add("minecraftInfo"' in text
+        and "Helper.stageWithContext(context)" in text
+    ):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, 'context.add("minecraftInfo"'),
+                behavior="credential_handoff_to_dynamic_stage",
+                evidence="Collects username/UUID/access token into context and hands it to second-stage loader flow",
+            )
+        )
+
     if ("$jnicLoader" in text or "$jnicClinit" in text or "JNICLoader.init()" in text):
         out.append(
             BehaviorFinding(
@@ -1803,6 +1845,18 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 evidence="Uses HTTP/RPC flow with signature/crypto checks to validate remote config",
             )
         )
+        contracts = sorted(set(re.findall(r"0x[a-fA-F0-9]{40}", text)))
+        selectors = sorted(set(re.findall(r"0x[a-fA-F0-9]{8}", text)))
+        contract_note = contracts[0] if contracts else "unknown"
+        selector_note = selectors[0] if selectors else "unknown"
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "eth_call") if "eth_call" in text else find_line(text, "jsonrpc"),
+                behavior="blockchain_backed_c2_bootstrap",
+                evidence=f"Bootstraps remote config over Ethereum RPC (eth_call) with signature verification contract={contract_note} selector={selector_note}",
+            )
+        )
 
     if "telemetry" in low and ("init" in low or "send" in low):
         out.append(
@@ -1895,7 +1949,14 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
-    if has_get_access_token and not has_token_getter_passthrough and not has_internal_profile_key_usage and not has_token_sent_to_trusted_chain and not has_possible_token_exfiltration:
+    if (
+        has_get_access_token
+        and not has_token_getter_passthrough
+        and not has_internal_profile_key_usage
+        and not has_token_sent_to_trusted_chain
+        and not has_possible_token_exfiltration
+        and not has_credential_exfil_post
+    ):
         out.append(
             BehaviorFinding(
                 file=rel,
@@ -2377,17 +2438,126 @@ def discover_artifacts(root: Path) -> List[ArtifactFinding]:
 
 
 def decode_abi_string(hex_result: str) -> str:
-    data = hex_result[2:] if hex_result.startswith("0x") else hex_result
-    if len(data) < 128:
+    raw = decode_abi_dynamic_bytes(hex_result)
+    if not raw:
         return ""
-    strlen = int(data[64:128], 16)
-    payload_hex = data[128 : 128 + strlen * 2]
-    chars = []
-    for i in range(0, len(payload_hex), 2):
-        b = int(payload_hex[i : i + 2], 16)
-        if b != 0:
-            chars.append(chr(b))
-    return "".join(chars)
+    return raw.decode("utf-8", errors="replace").replace("\x00", "").strip()
+
+
+def decode_abi_dynamic_bytes(hex_result: str) -> bytes:
+    data = hex_result[2:] if hex_result.startswith("0x") else hex_result
+    if len(data) < 64:
+        return b""
+    try:
+        offset = int(data[:64], 16) * 2
+        if offset + 64 > len(data):
+            return b""
+        strlen = int(data[offset : offset + 64], 16)
+        payload_hex = data[offset + 64 : offset + 64 + (strlen * 2)]
+        if len(payload_hex) < strlen * 2:
+            return b""
+        return bytes.fromhex(payload_hex)
+    except Exception:
+        return b""
+
+
+def bytes_entropy(raw: bytes) -> float:
+    if not raw:
+        return 0.0
+    freq = [0] * 256
+    for b in raw:
+        freq[b] += 1
+    ent = 0.0
+    for c in freq:
+        if c:
+            p = c / len(raw)
+            ent -= p * math.log2(p)
+    return ent
+
+
+def analyze_runtime_payload(decoded: str, layers: List[tuple[str, str, str]], abi_raw: bytes) -> dict:
+    decoded_text = (decoded or "").strip()
+    low = decoded_text.lower()
+    ent = bytes_entropy(abi_raw)
+    printable = _mostly_printable(abi_raw) if abi_raw else False
+    category = "unknown"
+    encryption_likely = False
+    key_inference = "unknown"
+    signature_detected = False
+    signature_bytes = 0
+    signature_algorithm_guess = ""
+    notes: List[str] = []
+
+    # Explicitly classify "url|base64sig" runtime config as signed bootstrap data.
+    if "|" in decoded_text:
+        left, right = decoded_text.rsplit("|", 1)
+        left = left.strip()
+        right_compact = "".join(right.split())
+        try:
+            sig_raw = base64.b64decode(right_compact, validate=True)
+            if URL_RE.match(left) and len(sig_raw) in (256, 384, 512):
+                signature_detected = True
+                signature_bytes = len(sig_raw)
+                signature_algorithm_guess = f"RSA-{len(sig_raw) * 8} signature (likely SHA256withRSA or similar)"
+                category = "signed_config_rsa_signature"
+                key_inference = "no_key_needed_signature_verification_only"
+                notes.append("Runtime payload is signed config (URL + RSA signature), not exfiltrated victim data.")
+                return {
+                    "classification": category,
+                    "encryption_likely": False,
+                    "key_inference": key_inference,
+                    "signature_detected": signature_detected,
+                    "signature_bytes": signature_bytes,
+                    "signature_algorithm_guess": signature_algorithm_guess,
+                    "abi_bytes": len(abi_raw),
+                    "abi_entropy": round(ent, 3),
+                    "abi_mostly_printable": printable,
+                    "notes": notes,
+                }
+        except Exception:
+            pass
+
+    if decoded_text and (URL_RE.match(decoded_text) or "json" in low or "http" in low or "|" in decoded_text):
+        category = "plaintext_or_structured_text"
+        key_inference = "no_key_needed"
+        notes.append("ABI payload decodes directly into readable text/URL structure.")
+    elif decoded_text and layers:
+        category = "encoded_then_decoded"
+        key_inference = "no_key_needed"
+        notes.append("Payload is encoded (base64/hex/base32) but decodable without a secret key.")
+    elif abi_raw:
+        if (not printable and ent >= 7.2) or decoded_text.startswith("<binary "):
+            category = "binary_or_ciphertext_likely"
+            encryption_likely = True
+            key_inference = "key_likely_in_malware_or_backend_not_on_chain"
+            notes.append(f"High-entropy/non-printable ABI bytes suggest encrypted or packed payload (entropy={ent:.3f}).")
+        else:
+            category = "binary_or_nontext"
+            key_inference = "unknown"
+            notes.append(f"ABI payload exists but is not clearly readable text (entropy={ent:.3f}).")
+    else:
+        notes.append("No decodable ABI bytes were recovered from eth_call response.")
+
+    if any("xor_recovered" in c for c, _d, _n in layers):
+        notes.append("Recovered text via XOR implies obfuscation, not strong cryptography.")
+    if any(c.endswith("_decoded_binary") for c, _d, _n in layers):
+        encryption_likely = encryption_likely or True
+        if key_inference == "unknown":
+            key_inference = "key_likely_in_malware_or_backend_not_on_chain"
+        notes.append("Decoded layer remains binary/high-entropy, consistent with ciphertext or packed bytes.")
+
+    return {
+        "classification": category,
+        "encryption_likely": encryption_likely,
+        "key_inference": key_inference,
+        "signature_detected": signature_detected,
+        "signature_bytes": signature_bytes,
+        "signature_algorithm_guess": signature_algorithm_guess,
+        "abi_bytes": len(abi_raw),
+        "abi_entropy": round(ent, 3),
+        "abi_mostly_printable": printable,
+        "notes": notes,
+    }
 
 
 def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
@@ -2400,6 +2570,19 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
         "rpc_used": "",
         "decoded_response": "",
         "decoded_response_layers": [],
+        "raw_result_hex": "",
+        "payload_analysis": {
+            "classification": "unknown",
+            "encryption_likely": False,
+            "key_inference": "unknown",
+            "signature_detected": False,
+            "signature_bytes": 0,
+            "signature_algorithm_guess": "",
+            "abi_bytes": 0,
+            "abi_entropy": 0.0,
+            "abi_mostly_printable": False,
+            "notes": [],
+        },
         "c2_base_url": "",
         "exfil_endpoint": "",
         "payload_endpoint": "",
@@ -2431,20 +2614,26 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
             result_hex = data.get("result", "")
             if not isinstance(result_hex, str) or not result_hex.startswith("0x"):
                 continue
+            out["raw_result_hex"] = result_hex
+            abi_raw = decode_abi_dynamic_bytes(result_hex)
+            if not abi_raw:
+                continue
             decoded = decode_abi_string(result_hex)
             if not decoded:
-                continue
+                decoded = f"<binary {len(abi_raw)} bytes>"
             out["resolved"] = True
             out["rpc_used"] = rpc
             out["decoded_response"] = decoded
-            layered = decode_encoded_fragments(decoded.strip())
+            layered = decode_encoded_fragments(decoded.strip()) if not decoded.startswith("<binary ") else []
             out["decoded_response_layers"] = [
                 {"category": cat, "decoded": dec, "note": note} for cat, dec, note in layered
             ]
-            c2_url = decoded.split("|", 1)[0].strip()
-            out["c2_base_url"] = c2_url
-            out["exfil_endpoint"] = f"{c2_url}/api/delivery/handler"
-            out["payload_endpoint"] = f"{c2_url}/files/jar/module"
+            out["payload_analysis"] = analyze_runtime_payload(decoded, layered, abi_raw)
+            c2_url = decoded.split("|", 1)[0].strip() if decoded and not decoded.startswith("<binary ") else ""
+            if URL_RE.match(c2_url):
+                out["c2_base_url"] = c2_url
+                out["exfil_endpoint"] = f"{c2_url}/api/delivery/handler"
+                out["payload_endpoint"] = f"{c2_url}/files/jar/module"
             return out
         except Exception as exc:
             out["error"] = str(exc)
@@ -2452,6 +2641,100 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
     if not out["resolved"] and not out["error"]:
         out["error"] = "unable to decode runtime c2 response"
     return out
+
+
+def _safe_extract_jar(jar_path: Path, dest: Path, max_entries: int = 20000, max_bytes: int = 300 * 1024 * 1024) -> dict:
+    result = {"extracted_entries": 0, "extracted_bytes": 0, "error": ""}
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            infos = zf.infolist()
+            if len(infos) > max_entries:
+                result["error"] = f"too many entries ({len(infos)})"
+                return result
+            total = sum(i.file_size for i in infos if not i.is_dir())
+            if total > max_bytes:
+                result["error"] = f"archive too large when extracted ({total} bytes)"
+                return result
+            for info in infos:
+                name = info.filename.replace("\\", "/")
+                if name.startswith("/") or ".." in Path(name).parts:
+                    continue
+                out_path = (dest / name).resolve()
+                if not str(out_path).startswith(str(dest.resolve())):
+                    continue
+                if info.is_dir():
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    continue
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, "r") as src, out_path.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                result["extracted_entries"] += 1
+                result["extracted_bytes"] += int(info.file_size)
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def analyze_stage2_payload(payload_url: str, timeout: int = 20) -> dict:
+    out = {
+        "enabled": True,
+        "attempted": False,
+        "resolved_payload_url": payload_url or "",
+        "static_only_no_execution": True,
+        "downloaded": False,
+        "download_path": "",
+        "download_size": 0,
+        "download_sha256": "",
+        "archive_signature": "",
+        "entry_count": 0,
+        "class_count": 0,
+        "native_entry_count": 0,
+        "native_entries_sample": [],
+        "extract_dir": "",
+        "extract_summary": {},
+        "artifact_findings": [],
+        "error": "",
+    }
+    if not payload_url:
+        out["error"] = "missing payload URL"
+        return out
+    out["attempted"] = True
+    try:
+        base_dir = Path(tempfile.mkdtemp(prefix="java_triage_stage2_")).resolve()
+        jar_path = base_dir / "stage2_payload.jar"
+        req = request.Request(payload_url, headers={"User-Agent": "java-triage/1.0"}, method="GET")
+        with request.urlopen(req, timeout=timeout) as resp, jar_path.open("wb") as f:
+            shutil.copyfileobj(resp, f, length=1024 * 1024)
+        out["downloaded"] = True
+        out["download_path"] = str(jar_path)
+        out["download_size"] = int(jar_path.stat().st_size)
+        out["download_sha256"] = sha256_file(jar_path)
+        out["archive_signature"] = archive_signature_status(jar_path)
+
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            names = [n.replace("\\", "/") for n in zf.namelist()]
+        out["entry_count"] = len(names)
+        out["class_count"] = sum(1 for n in names if n.endswith(".class"))
+        native_exts = (".dll", ".so", ".dylib", ".jnilib", ".dat", ".bin")
+        native_entries = [n for n in names if n.lower().endswith(native_exts)]
+        out["native_entry_count"] = len(native_entries)
+        out["native_entries_sample"] = native_entries[:30]
+
+        extract_dir = base_dir / "unz"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        out["extract_dir"] = str(extract_dir)
+        extract_summary = _safe_extract_jar(jar_path, extract_dir)
+        out["extract_summary"] = extract_summary
+        if extract_summary.get("error"):
+            out["error"] = f"extract failed: {extract_summary.get('error')}"
+            return out
+
+        artifacts = discover_artifacts(extract_dir)
+        out["artifact_findings"] = [a.__dict__ for a in artifacts]
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
 
 
 def scan_file(
@@ -2606,10 +2889,54 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
     }
 
 
+def extract_blockchain_indicators(findings: List[Finding]) -> dict:
+    contracts = sorted(
+        set(
+            f.decoded
+            for f in findings
+            if f.category == "hex_or_contract" and re.fullmatch(r"0x[a-fA-F0-9]{40}", f.decoded or "")
+        )
+    )
+    selectors = sorted(
+        set(
+            f.decoded
+            for f in findings
+            if f.category == "hex_or_contract" and re.fullmatch(r"0x[a-fA-F0-9]{8}", f.decoded or "")
+        )
+    )
+    rpc_urls = sorted(
+        set(
+            f.decoded
+            for f in findings
+            if f.category == "url"
+            and isinstance(f.decoded, str)
+            and ("rpc" in f.decoded.lower() or "/eth" in f.decoded.lower() or "mainnet" in f.decoded.lower())
+        )
+    )
+    rpc_hosts = sorted(
+        set(urlparse(u).netloc.lower() for u in rpc_urls if urlparse(u).netloc)
+    )
+    api_key_urls = [u for u in rpc_urls if "api_key=" in u.lower()]
+    return {
+        "contracts": contracts,
+        "selectors": selectors,
+        "rpc_urls": rpc_urls,
+        "rpc_hosts": rpc_hosts,
+        "api_key_urls": api_key_urls,
+    }
+
+
 def render_text(
-    findings: List[Finding], behaviors: List[BehaviorFinding], artifacts: List[ArtifactFinding], summary: dict, runtime_c2: dict, target_metadata: dict
+    findings: List[Finding],
+    behaviors: List[BehaviorFinding],
+    artifacts: List[ArtifactFinding],
+    summary: dict,
+    runtime_c2: dict,
+    target_metadata: dict,
+    stage2_analysis: dict | None = None,
 ) -> str:
     out = []
+    blockchain = extract_blockchain_indicators(findings)
     basic = target_metadata.get("basic_properties", {})
     jar_info = target_metadata.get("jar_info", {})
     bundle_info = target_metadata.get("bundle_info", {})
@@ -2712,11 +3039,89 @@ def render_text(
             for idx, layer in enumerate(layers, start=1):
                 note = f" [{layer.get('note')}]" if layer.get("note") else ""
                 out.append(f"Layer {idx} ({layer.get('category')}): {layer.get('decoded')}{note}")
+            pa = runtime_c2.get("payload_analysis") or {}
+            if pa:
+                out.append(
+                    f"Payload readability: class={pa.get('classification')} encrypted_likely={pa.get('encryption_likely')} "
+                    f"key_inference={pa.get('key_inference')} signature_detected={pa.get('signature_detected')} "
+                    f"signature_bytes={pa.get('signature_bytes')} abi_bytes={pa.get('abi_bytes')} entropy={pa.get('abi_entropy')}"
+                )
+                if pa.get("signature_detected"):
+                    out.append(f"Signature detail: {pa.get('signature_algorithm_guess')}")
+                for n in pa.get("notes", []) or []:
+                    out.append(f"- {n}")
         else:
             out.append("Resolved: no")
             out.append(f"Error: {runtime_c2.get('error')}")
     else:
         out.append("Skipped")
+
+
+    out.append("")
+    out.append("== Stage2 Analysis ==")
+    s2 = stage2_analysis or {}
+    manual_payload_url = str(runtime_c2.get("payload_endpoint", "") or "")
+    if not s2.get("enabled"):
+        out.append("Skipped")
+        if manual_payload_url:
+            out.append(f"Manual stage2 download URL: {manual_payload_url}")
+            out.append(f"Manual download (PowerShell): Invoke-WebRequest -Uri \"{manual_payload_url}\" -OutFile \"stage2_payload.jar\"")
+        else:
+            out.append("Manual stage2 download URL: <unresolved; run without --no-network to resolve runtime C2>")
+    elif not s2.get("attempted"):
+        out.append("Attempted: no")
+        if manual_payload_url:
+            out.append(f"Manual stage2 download URL: {manual_payload_url}")
+        if s2.get("error"):
+            out.append(f"Reason: {s2.get('error')}")
+    else:
+        out.append(f"Attempted: yes")
+        out.append(f"Static-only mode: {bool(s2.get('static_only_no_execution', True))}")
+        out.append(f"Payload URL: {s2.get('resolved_payload_url', '')}")
+        out.append(f"Downloaded: {bool(s2.get('downloaded', False))}")
+        if s2.get("downloaded"):
+            out.append(f"Downloaded path: {s2.get('download_path', '')}")
+            out.append(f"Downloaded size: {s2.get('download_size', 0)}")
+            out.append(f"Downloaded SHA256: {s2.get('download_sha256', '')}")
+            out.append(f"Archive signature: {s2.get('archive_signature', '')}")
+            out.append(f"Entry count: {s2.get('entry_count', 0)}")
+            out.append(f"Class count: {s2.get('class_count', 0)}")
+            out.append(f"Native entry count: {s2.get('native_entry_count', 0)}")
+            for item in s2.get("native_entries_sample", []) or []:
+                out.append(f"- {item}")
+            ext = s2.get("extract_summary", {}) or {}
+            if ext:
+                out.append(
+                    f"Extract summary: entries={ext.get('extracted_entries', 0)} bytes={ext.get('extracted_bytes', 0)}"
+                )
+            s2_artifacts = s2.get("artifact_findings", []) or []
+            out.append(f"Stage2 artifact findings: {len(s2_artifacts)}")
+            for a in s2_artifacts:
+                out.append(
+                    f"- [{a.get('artifact_type')}] {a.get('path')} filename={a.get('filename')} "
+                    f"size={a.get('size')} sha256={a.get('sha256')} -> {a.get('evidence')}"
+                )
+        if s2.get("error"):
+            out.append(f"Error: {s2.get('error')}")
+
+    out.append("")
+    out.append("== Blockchain Indicators ==")
+    out.append(f"Contracts: {len(blockchain['contracts'])}")
+    for item in blockchain["contracts"]:
+        out.append(f"- {item}")
+    out.append(f"Method selectors: {len(blockchain['selectors'])}")
+    for item in blockchain["selectors"]:
+        out.append(f"- {item}")
+    out.append(f"RPC hosts: {len(blockchain['rpc_hosts'])}")
+    for item in blockchain["rpc_hosts"]:
+        out.append(f"- {item}")
+    out.append(f"RPC URLs: {len(blockchain['rpc_urls'])}")
+    for item in blockchain["rpc_urls"]:
+        out.append(f"- {item}")
+    if blockchain["api_key_urls"]:
+        out.append("RPC URLs with API keys:")
+        for item in blockchain["api_key_urls"]:
+            out.append(f"- {item}")
 
     out.append("")
     out.append("== Summary ==")
@@ -2778,11 +3183,13 @@ def render_rich(
     summary: dict,
     runtime_c2: dict,
     target_metadata: dict,
+    stage2_analysis: dict | None = None,
 ) -> None:
     def short(s: str, n: int = 220) -> str:
         return s if len(s) <= n else s[: n - 1] + "…"
 
     assessment = summarize_assessments(behaviors)
+    blockchain = extract_blockchain_indicators(findings)
     basic = target_metadata.get("basic_properties", {})
     jar_info = target_metadata.get("jar_info", {})
     bundle_info = target_metadata.get("bundle_info", {})
@@ -2927,11 +3334,108 @@ def render_rich(
             for idx, layer in enumerate(layers, start=1):
                 note = f" note={layer.get('note')}" if layer.get("note") else ""
                 console.print(f"Layer {idx} ({layer.get('category')}): {layer.get('decoded')}{note}", markup=False)
+            pa = runtime_c2.get("payload_analysis") or {}
+            if pa:
+                console.print(
+                    f"Payload readability: class={pa.get('classification')} encrypted_likely={pa.get('encryption_likely')} "
+                    f"key_inference={pa.get('key_inference')} signature_detected={pa.get('signature_detected')} "
+                    f"signature_bytes={pa.get('signature_bytes')} abi_bytes={pa.get('abi_bytes')} entropy={pa.get('abi_entropy')}",
+                    markup=False,
+                )
+                if pa.get("signature_detected"):
+                    console.print(f"Signature detail: {pa.get('signature_algorithm_guess')}", markup=False)
+                for n in pa.get("notes", []) or []:
+                    console.print(f"- {n}", markup=False)
         else:
             console.print("[red]Resolved:[/red] no")
             console.print(f"Error: {runtime_c2.get('error')}")
     else:
         console.print("[dim]Skipped[/dim]")
+
+
+    console.print(Rule("[bold blue]Stage2 Analysis"))
+    s2 = stage2_analysis or {}
+    manual_payload_url = str(runtime_c2.get("payload_endpoint", "") or "")
+    if not s2.get("enabled"):
+        console.print("[dim]Skipped[/dim]")
+        if manual_payload_url:
+            console.print(f"Manual stage2 download URL: {manual_payload_url}")
+            console.print(
+                f"Manual download (PowerShell): Invoke-WebRequest -Uri \"{manual_payload_url}\" -OutFile \"stage2_payload.jar\""
+            )
+        else:
+            console.print("Manual stage2 download URL: <unresolved; run without --no-network to resolve runtime C2>")
+    elif not s2.get("attempted"):
+        console.print("Attempted: no")
+        if manual_payload_url:
+            console.print(f"Manual stage2 download URL: {manual_payload_url}")
+        if s2.get("error"):
+            console.print(f"Reason: {s2.get('error')}")
+    else:
+        t2 = Table(show_header=False, box=box.SIMPLE)
+        t2.add_row("Attempted", "yes")
+        t2.add_row("Static-only mode", str(bool(s2.get("static_only_no_execution", True))))
+        t2.add_row("Payload URL", str(s2.get("resolved_payload_url", "")))
+        t2.add_row("Downloaded", str(bool(s2.get("downloaded", False))))
+        if s2.get("downloaded"):
+            t2.add_row("Downloaded path", str(s2.get("download_path", "")))
+            t2.add_row("Downloaded size", str(s2.get("download_size", 0)))
+            t2.add_row("Downloaded SHA256", str(s2.get("download_sha256", "")))
+            t2.add_row("Archive signature", str(s2.get("archive_signature", "")))
+            t2.add_row("Entry count", str(s2.get("entry_count", 0)))
+            t2.add_row("Class count", str(s2.get("class_count", 0)))
+            t2.add_row("Native entry count", str(s2.get("native_entry_count", 0)))
+        if s2.get("error"):
+            t2.add_row("Error", str(s2.get("error")))
+        console.print(t2)
+        if s2.get("native_entries_sample"):
+            nt = Table(title="Stage2 Native Entries (sample)", show_header=True, box=box.SIMPLE)
+            nt.add_column("Entry", style="magenta", overflow="fold")
+            for item in (s2.get("native_entries_sample") or [])[:30]:
+                nt.add_row(str(item))
+            console.print(nt)
+        s2_artifacts = s2.get("artifact_findings", []) or []
+        if s2_artifacts:
+            at = Table(title="Stage2 Artifact Findings", show_header=True, box=box.SIMPLE, expand=True)
+            at.add_column("Type", style="red")
+            at.add_column("Path", style="cyan", overflow="fold")
+            at.add_column("Evidence", style="white", overflow="fold")
+            for a in s2_artifacts:
+                at.add_row(str(a.get("artifact_type")), str(a.get("path")), short(str(a.get("evidence", ""))))
+            console.print(at)
+
+    console.print(Rule("[bold blue]Blockchain Indicators"))
+    bt = Table(show_header=False, box=box.SIMPLE)
+    bt.add_row("Contracts", str(len(blockchain["contracts"])))
+    bt.add_row("Method selectors", str(len(blockchain["selectors"])))
+    bt.add_row("RPC hosts", str(len(blockchain["rpc_hosts"])))
+    bt.add_row("RPC URLs", str(len(blockchain["rpc_urls"])))
+    bt.add_row("RPC URLs with API keys", str(len(blockchain["api_key_urls"])))
+    console.print(bt)
+    if blockchain["contracts"]:
+        t_contract = Table(title="Contract Addresses", show_header=True, box=box.SIMPLE)
+        t_contract.add_column("Address", style="cyan")
+        for item in blockchain["contracts"]:
+            t_contract.add_row(item)
+        console.print(t_contract)
+    if blockchain["selectors"]:
+        t_sel = Table(title="Method Selectors", show_header=True, box=box.SIMPLE)
+        t_sel.add_column("Selector", style="yellow")
+        for item in blockchain["selectors"]:
+            t_sel.add_row(item)
+        console.print(t_sel)
+    if blockchain["rpc_hosts"]:
+        t_hosts = Table(title="RPC Hosts", show_header=True, box=box.SIMPLE)
+        t_hosts.add_column("Host", style="magenta")
+        for item in blockchain["rpc_hosts"]:
+            t_hosts.add_row(item)
+        console.print(t_hosts)
+    if blockchain["api_key_urls"]:
+        t_api = Table(title="RPC URLs With API Keys", show_header=True, box=box.SIMPLE)
+        t_api.add_column("URL", style="white", overflow="fold")
+        for item in blockchain["api_key_urls"]:
+            t_api.add_row(item)
+        console.print(t_api)
 
     console.print(Rule("[bold blue]Summary"))
     s = Table(show_header=False, box=None)
@@ -2971,6 +3475,11 @@ def main() -> int:
     p.add_argument("--out", help="Write output to file")
     p.add_argument("--no-progress", action="store_true", help="Disable progress messages")
     p.add_argument("--no-network", action="store_true", help="Disable runtime C2 resolution over network")
+    p.add_argument(
+        "--analyze-stage2",
+        action="store_true",
+        help="After resolving runtime payload endpoint, download stage-2 JAR and perform static-only analysis (never executes jars/classes)",
+    )
     p.add_argument(
         "--rich-width",
         type=int,
@@ -3181,6 +3690,12 @@ def main() -> int:
     artifact_findings = discover_artifacts(scan_root)
     progress(phase_logs, f"detected {len(artifact_findings)} artifact indicator(s)", progress_console)
     runtime_c2 = {"attempted": False, "resolved": False}
+    stage2_analysis = {
+        "enabled": bool(args.analyze_stage2),
+        "attempted": False,
+        "static_only_no_execution": True,
+        "error": "",
+    }
     if not args.no_network:
         progress(phase_logs, "resolving runtime C2 from on-chain config", progress_console)
         runtime_c2 = resolve_runtime_c2(all_findings)
@@ -3188,6 +3703,26 @@ def main() -> int:
             progress(phase_logs, f"runtime C2 resolved: {runtime_c2.get('c2_base_url')}", progress_console)
         else:
             progress(phase_logs, f"runtime C2 unresolved: {runtime_c2.get('error', 'unknown error')}", progress_console)
+    elif args.analyze_stage2:
+        stage2_analysis["error"] = "stage2 analysis requires network access; rerun without --no-network"
+
+    if args.analyze_stage2 and not stage2_analysis.get("error"):
+        payload_url = runtime_c2.get("payload_endpoint", "")
+        if not payload_url:
+            stage2_analysis["error"] = "payload endpoint not resolved from runtime C2"
+        else:
+            progress(phase_logs, f"stage2 static analysis: downloading {payload_url}", progress_console)
+            stage2_analysis = analyze_stage2_payload(payload_url)
+            if stage2_analysis.get("error"):
+                progress(phase_logs, f"stage2 analysis error: {stage2_analysis.get('error')}", progress_console)
+            else:
+                progress(
+                    phase_logs,
+                    f"stage2 static analysis complete: entries={stage2_analysis.get('entry_count', 0)} "
+                    f"native_entries={stage2_analysis.get('native_entry_count', 0)} "
+                    f"artifacts={len(stage2_analysis.get('artifact_findings', []) or [])}",
+                    progress_console,
+                )
 
     progress(phase_logs, "building summary", progress_console)
 
@@ -3199,6 +3734,7 @@ def main() -> int:
         ) + int(deobf_stats.get("load_replaced", 0))
 
     if args.json:
+        blockchain = extract_blockchain_indicators(all_findings)
         payload = {
             "root": str(scan_root),
             "target_metadata": target_metadata,
@@ -3207,6 +3743,9 @@ def main() -> int:
             "summary": summary,
             "assessment_summary": summarize_assessments(behavior_findings),
             "runtime_c2": runtime_c2,
+            "stage2_analysis": stage2_analysis,
+            "stage2_manual_payload_url": runtime_c2.get("payload_endpoint", ""),
+            "blockchain_indicators": blockchain,
             "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
             "behavior_findings": [
                 {**b.__dict__, "severity": behavior_severity(b.behavior)}
@@ -3218,7 +3757,7 @@ def main() -> int:
     else:
         width = max(40, shutil.get_terminal_size((120, 20)).columns)
         centered_banner = "\n".join(line.center(width) for line in BANNER.splitlines())
-        output = render_text(all_findings, behavior_findings, artifact_findings, summary, runtime_c2, target_metadata)
+        output = render_text(all_findings, behavior_findings, artifact_findings, summary, runtime_c2, target_metadata, stage2_analysis)
         output = f"{centered_banner}\n\n{output}"
 
     if args.out:
@@ -3236,7 +3775,16 @@ def main() -> int:
             print(output)
         else:
             print_banner(report_console, to_stderr=False)
-            render_rich(report_console, all_findings, behavior_findings, artifact_findings, summary, runtime_c2, target_metadata)
+            render_rich(
+                report_console,
+                all_findings,
+                behavior_findings,
+                artifact_findings,
+                summary,
+                runtime_c2,
+                target_metadata,
+                stage2_analysis,
+            )
         progress(show_progress, "done", progress_console)
 
     return 0
