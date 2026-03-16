@@ -44,12 +44,23 @@ LOAD_CALL_RE = re.compile(
 # Match standard Java string literals and avoid crossing line boundaries.
 STRING_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\\r\n]){16,})"')
 STRING_ANY_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\\r\n]){4,})"')
+STRING_SHORT_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\\r\n]){1,64})"')
+SPLIT_STRING_ARRAY_RE = re.compile(
+    r"String\[\]\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*new\s+String\[\]\s*\{(?P<body>.*?)\};",
+    re.DOTALL,
+)
 STRING_DECRYPT_CALL_RE = re.compile(
     r"(?P<call>(?:\b[\w$.]*StringDecrypt\s*\.\s*)?decrypt\s*\(\s*new\s+byte\s*\[\s*\]\s*\{(?P<bytes>.*?)\}\s*\))",
     re.DOTALL,
 )
 NEW_BYTE_ARRAY_LITERAL_RE = re.compile(r"new\s+byte\s*\[\s*\]\s*\{(?P<body>.*?)\}", re.DOTALL)
+NEW_CHAR_ARRAY_LITERAL_RE = re.compile(r"new\s+char\s*\[\s*\]\s*\{(?P<body>.*?)\}", re.DOTALL)
+STRINGBUILDER_REVERSE_RE = re.compile(
+    r'new\s+StringBuilder\(\s*"(?P<lit>(?:\\.|[^"\\\r\n]){4,})"\s*\)\.reverse\(\)\.toString\(\)',
+    re.DOTALL,
+)
 JAVA_BYTE_TOKEN_RE = re.compile(r"(?:\(\s*byte\s*\)\s*)?(-?\d+)")
+JAVA_CHAR_TOKEN_RE = re.compile(r"(?:\(\s*char\s*\)\s*)?(-?\d+)")
 
 METHOD_RE = re.compile(
     r"^\s*(?:public|private|protected|static|final|synchronized|native|abstract|strictfp|default|\s)+"
@@ -73,6 +84,7 @@ WINDOWS_PATH_RE = re.compile(r"^[A-Za-z]:\\")
 SUSPICIOUS_STRING_KEYWORDS = (
     "webhook",
     "discord",
+    "dqw4w9wgxcq",
     "telegram",
     "api.telegram.org",
     "proguard",
@@ -99,6 +111,7 @@ DISCORD_WEBHOOK_RE = re.compile(
 DISCORD_BOT_TOKEN_RE = re.compile(
     r"\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,8}\.[A-Za-z0-9_-]{20,})\b"
 )
+DISCORD_ENCRYPTED_TOKEN_MARKER_RE = re.compile(r"dQw4w9WgXcQ:(?P<payload>[A-Za-z0-9+/=]+)")
 TELEGRAM_BOT_TOKEN_RE = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,60}\b")
 GENERIC_WEBHOOK_URL_RE = re.compile(
     r"^https?://[^\s\"'<>]+/(?:api/)?(?:v\d+/)?(?:webhook|webhooks|hooks?)/[^\s\"'<>]+$",
@@ -116,6 +129,11 @@ BEHAVIOR_SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "inf
 
 BEHAVIOR_SEVERITY_MAP = {
     "assessment_suspicious_possible_credential_exfiltration": "high",
+    "assessment_suspicious_remote_mod_dropper": "high",
+    "assessment_suspicious_embedded_mod_dropper": "high",
+    "assessment_suspicious_discord_token_stealer": "high",
+    "assessment_suspicious_multi_credential_infostealer": "critical",
+    "assessment_needs_review_remote_mod_downloader": "medium",
     "assessment_needs_review_access_token_read_without_destination": "medium",
     "assessment_benign_fake_player_clone": "low",
     "assessment_benign_self_name_filtering": "low",
@@ -134,6 +152,24 @@ BEHAVIOR_SEVERITY_MAP = {
     "remote_urlclassloader_usage": "high",
     "possible_minecraft_session_file_exfiltration": "high",
     "possible_minecraft_identity_exfiltration": "high",
+    "minecraft_mod_folder_remote_dropper": "high",
+    "minecraft_mod_folder_embedded_payload_dropper": "high",
+    "embedded_resource_encoded_archive_dropper": "high",
+    "discord_leveldb_token_theft": "high",
+    "discord_token_validation_api": "high",
+    "discord_token_exfiltration_bundle": "high",
+    "browser_password_database_theft": "high",
+    "browser_cookie_database_theft": "high",
+    "browser_history_database_collection": "medium",
+    "screenshot_capture_collection": "high",
+    "chromium_masterkey_decryption_chain": "high",
+    "runtime_sqlite_driver_download_and_load": "high",
+    "credential_exfiltration_endpoint": "high",
+    "decompiler_failure_or_heavy_obfuscation": "high",
+    "class_constant_pool_only_scan": "medium",
+    "extreme_archive_structure_obfuscation": "high",
+    "http_urlconnection_binary_download": "medium",
+    "obfuscated_url_reconstruction": "medium",
     "dropper_elevation_helper": "high",
     "second_stage_jar_unpack": "high",
     "embedded_native_payload_loader": "high",
@@ -237,6 +273,111 @@ def parse_java_byte_list(raw: str) -> List[int]:
     for m in JAVA_BYTE_TOKEN_RE.finditer(raw):
         vals.append(_to_signed_byte(int(m.group(1))))
     return vals
+
+
+def _decode_java_string_literal_fragment(raw: str) -> str:
+    try:
+        return bytes(raw, "utf-8").decode("unicode_escape")
+    except Exception:
+        return raw
+
+
+def _reconstruct_split_string_arrays(text: str) -> List[tuple[str, str, int, int]]:
+    out: List[tuple[str, str, int, int]] = []
+    for m in SPLIT_STRING_ARRAY_RE.finditer(text):
+        body = m.group("body")
+        parts_raw = STRING_SHORT_LITERAL_RE.findall(body)
+        if len(parts_raw) < 8:
+            continue
+        parts = [_decode_java_string_literal_fragment(p) for p in parts_raw]
+        joined = "".join(parts).strip()
+        if len(joined) < 12:
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        out.append((m.group("name"), joined, line, len(parts)))
+    return out
+
+
+def _extract_printable_byte_array_strings(
+    text: str,
+    max_arrays: int = 120,
+    max_bytes: int = 4096,
+) -> List[tuple[str, int, int]]:
+    out: List[tuple[str, int, int]] = []
+    seen = set()
+    for idx, m in enumerate(NEW_BYTE_ARRAY_LITERAL_RE.finditer(text)):
+        if idx >= max_arrays:
+            break
+        vals = parse_java_byte_list(m.group("body"))
+        if not vals or len(vals) > max_bytes:
+            continue
+        raw = bytes((v + 256) % 256 for v in vals)
+        if not _mostly_printable(raw):
+            continue
+        decoded = _to_printable(raw).replace("\x00", "").strip()
+        if len(decoded) < 4 or decoded in seen:
+            continue
+        seen.add(decoded)
+        line = text.count("\n", 0, m.start()) + 1
+        out.append((decoded, line, len(vals)))
+    return out
+
+
+def _extract_printable_char_array_strings(
+    text: str,
+    max_arrays: int = 120,
+    min_len: int = 4,
+    max_len: int = 4096,
+) -> List[tuple[str, int, int]]:
+    out: List[tuple[str, int, int]] = []
+    seen = set()
+    for idx, m in enumerate(NEW_CHAR_ARRAY_LITERAL_RE.finditer(text)):
+        if idx >= max_arrays:
+            break
+        vals = []
+        for tm in JAVA_CHAR_TOKEN_RE.finditer(m.group("body")):
+            try:
+                vals.append(int(tm.group(1)))
+            except Exception:
+                continue
+        if not vals or len(vals) < min_len or len(vals) > max_len:
+            continue
+        chars = []
+        printable = 0
+        for v in vals:
+            v &= 0xFFFF
+            try:
+                ch = chr(v)
+            except Exception:
+                ch = ""
+            chars.append(ch)
+            if ch and (ch == "\t" or ch == "\n" or ch == "\r" or 32 <= ord(ch) <= 126):
+                printable += 1
+        if printable / max(1, len(chars)) < 0.85:
+            continue
+        decoded = "".join(chars).replace("\x00", "").strip()
+        if len(decoded) < min_len or decoded in seen:
+            continue
+        seen.add(decoded)
+        line = text.count("\n", 0, m.start()) + 1
+        out.append((decoded, line, len(vals)))
+    return out
+
+
+def _extract_reversed_stringbuilder_literals(text: str, max_hits: int = 100) -> List[tuple[str, int, int]]:
+    out: List[tuple[str, int, int]] = []
+    seen = set()
+    for idx, m in enumerate(STRINGBUILDER_REVERSE_RE.finditer(text)):
+        if idx >= max_hits:
+            break
+        raw = _decode_java_string_literal_fragment(m.group("lit"))
+        decoded = raw[::-1].strip()
+        if len(decoded) < 4 or decoded in seen:
+            continue
+        seen.add(decoded)
+        line = text.count("\n", 0, m.start()) + 1
+        out.append((decoded, line, len(raw)))
+    return out
 
 
 def _java_string_escape(s: str) -> str:
@@ -549,6 +690,8 @@ def classify(decoded: str) -> str:
     low = d.lower()
     discord_kind, _ = detect_discord_indicator(d)
     if discord_kind:
+        if discord_kind == "discord_encrypted_token_marker":
+            return "credential_or_identity_field"
         return "discord_indicator"
     endpoint_kind, _ = detect_external_endpoint_indicator(d)
     if endpoint_kind:
@@ -742,9 +885,37 @@ def _unescape_java_literal(raw: str) -> str:
         return raw
 
 
+def decode_discord_encrypted_token_marker(decoded: str) -> tuple[str, str]:
+    text = decoded.strip()
+    m = DISCORD_ENCRYPTED_TOKEN_MARKER_RE.search(text)
+    if not m:
+        if "dQw4w9WgXcQ:" in text:
+            return "discord_encrypted_token_marker", "marker_prefix_present payload_blob_not_in_literal"
+        return "", ""
+    payload = m.group("payload")
+    try:
+        blob = base64.b64decode(payload, validate=True)
+    except Exception:
+        return "discord_encrypted_token_marker", "marker_prefix_present payload_base64=invalid"
+    if not blob:
+        return "discord_encrypted_token_marker", "marker_prefix_present payload_base64=empty"
+    version = blob[:3].decode("ascii", errors="replace") if len(blob) >= 3 else "<short>"
+    nonce = blob[3:15].hex().upper() if len(blob) >= 15 else ""
+    note = (
+        f"marker_prefix_present payload_b64_bytes={len(payload)} decoded_bytes={len(blob)} "
+        f"version={version} nonce={nonce or '<missing>'} "
+        "decryption_requires_local_master_key"
+    )
+    return "discord_encrypted_token_marker", note
+
+
 def detect_discord_indicator(decoded: str) -> tuple[str, str]:
     d = decoded.strip()
     low = d.lower()
+
+    enc_kind, enc_note = decode_discord_encrypted_token_marker(d)
+    if enc_kind:
+        return enc_kind, enc_note
 
     wm = DISCORD_WEBHOOK_RE.match(d)
     if wm:
@@ -826,8 +997,12 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
             continue
 
         if discord_kind:
-            category = "discord_indicator"
-            signal = discord_kind
+            if discord_kind == "discord_encrypted_token_marker":
+                category = "credential_or_identity_field"
+                signal = "discord_token_stealer_marker"
+            else:
+                category = "discord_indicator"
+                signal = discord_kind
         elif endpoint_kind:
             category = "comms_indicator"
             signal = endpoint_kind
@@ -1167,6 +1342,142 @@ def iter_java_files(root: Path) -> Iterable[Path]:
     yield from root.rglob("*.java")
 
 
+def iter_class_files(root: Path) -> Iterable[Path]:
+    yield from root.rglob("*.class")
+
+
+def _extract_class_utf8_constants(class_bytes: bytes, max_items: int = 6000) -> List[str]:
+    out: List[str] = []
+    if len(class_bytes) < 10 or class_bytes[:4] != b"\xCA\xFE\xBA\xBE":
+        return out
+    off = 8
+    try:
+        cp_count = int.from_bytes(class_bytes[off : off + 2], "big")
+    except Exception:
+        return out
+    off += 2
+    idx = 1
+    while idx < cp_count and off < len(class_bytes):
+        if len(out) >= max_items:
+            break
+        tag = class_bytes[off]
+        off += 1
+        if tag == 1:  # CONSTANT_Utf8
+            if off + 2 > len(class_bytes):
+                break
+            ln = int.from_bytes(class_bytes[off : off + 2], "big")
+            off += 2
+            if off + ln > len(class_bytes):
+                break
+            raw = class_bytes[off : off + ln]
+            off += ln
+            try:
+                s = raw.decode("utf-8", errors="replace")
+            except Exception:
+                s = ""
+            if s:
+                out.append(s)
+        elif tag in {3, 4}:  # int/float
+            off += 4
+        elif tag in {5, 6}:  # long/double (take two entries)
+            off += 8
+            idx += 1
+        elif tag in {7, 8, 16, 19, 20}:  # class/string/methodtype/module/package
+            off += 2
+        elif tag in {9, 10, 11, 12, 17, 18}:  # refs/nameandtype/dynamic/invokedynamic
+            off += 4
+        elif tag == 15:  # method handle
+            off += 3
+        else:
+            break
+        idx += 1
+    return out
+
+
+def scan_class_constant_pool(path: Path, root: Path, max_hits: int = 180) -> List[Finding]:
+    out: List[Finding] = []
+    rel = str(path.relative_to(root))
+    seen = set()
+    try:
+        raw = path.read_bytes()
+    except Exception:
+        return out
+    constants = _extract_class_utf8_constants(raw)
+    for decoded in constants:
+        if len(out) >= max_hits:
+            break
+        decoded = decoded.strip()
+        if len(decoded) < 4:
+            continue
+        low = decoded.lower()
+        compact = "".join(decoded.split())
+        signal = ""
+        category = ""
+        discord_kind, discord_note = detect_discord_indicator(decoded)
+        endpoint_kind, endpoint_note = detect_external_endpoint_indicator(decoded)
+
+        if discord_kind:
+            if discord_kind == "discord_encrypted_token_marker":
+                category = "credential_or_identity_field"
+                signal = "discord_token_stealer_marker"
+            else:
+                category = "discord_indicator"
+                signal = discord_kind
+        elif endpoint_kind:
+            category = "comms_indicator"
+            signal = endpoint_kind
+        elif URL_RE.match(decoded):
+            category = "url"
+            signal = "class_const_url"
+        elif ETH_SELECTOR_RE.match(decoded):
+            category = "hex_or_contract"
+            signal = "class_const_eth_method_selector"
+        elif HEX_ADDR_RE.match(decoded) and len(decoded) == 42:
+            category = "hex_or_contract"
+            signal = "class_const_contract_address"
+        elif "jsonrpc" in low or "eth_call" in low:
+            category = "rpc_template"
+            signal = "class_const_eth_rpc_template"
+        elif COMMAND_LITERAL_RE.search(decoded):
+            category = "dynamic_execution"
+            signal = "class_const_command_or_lolbin"
+        elif (
+            decoded.startswith("/")
+            or WINDOWS_PATH_RE.match(decoded)
+            or "\\appdata\\" in low
+            or "/tmp/" in low
+            or decoded.endswith((".dll", ".exe", ".jar", ".dat", ".bin", ".ps1", ".bat", ".cmd"))
+        ):
+            category = "path"
+            signal = "class_const_path_or_payload_name"
+        elif len(compact) >= 80 and BASE64_RE.match(compact):
+            category = "base64_blob"
+            signal = "class_const_base64_blob"
+        elif any(k in low for k in SUSPICIOUS_STRING_KEYWORDS):
+            category = "credential_or_identity_field" if any(k in low for k in ("token", "authorization", "api_key", "bearer ")) else "string"
+            signal = "class_const_keyword_hit"
+        else:
+            continue
+
+        combined_note = " ".join([n for n in [discord_note, endpoint_note] if n]).strip()
+        extra_note = f" {combined_note}" if combined_note else ""
+        key = (decoded, category, signal, combined_note)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            Finding(
+                file=rel,
+                line=1,
+                function="<class_const>",
+                decoded=decoded,
+                category=category,
+                note=f"source=class_constant_pool signal={signal}{extra_note}",
+            )
+        )
+    return out
+
+
 def assess_auto_decrypt_need(root: Path) -> dict:
     files = list(iter_java_files(root))
     java_files = len(files)
@@ -1290,6 +1601,273 @@ def _extract_http_hosts(text: str) -> set[str]:
     return hosts
 
 
+def _try_decode_base32_blob(raw_text: str, min_chars: int = 128) -> bytes:
+    compact = "".join((raw_text or "").split())
+    if len(compact) < min_chars:
+        return b""
+    no_pad = compact.rstrip("=")
+    if not no_pad:
+        return b""
+    if not re.fullmatch(r"[A-Za-z2-7]+", no_pad):
+        return b""
+    pad = "=" * ((8 - (len(no_pad) % 8)) % 8)
+    try:
+        return base64.b32decode((no_pad + pad).upper(), casefold=True)
+    except Exception:
+        return b""
+
+
+def _read_referenced_resource(root: Path, raw_ref: str) -> tuple[str, bytes]:
+    rel = raw_ref.lstrip("/\\")
+    parts = [p for p in re.split(r"[\\/]+", rel) if p and p != "."]
+    if not parts:
+        return "", b""
+    rel_norm = "/".join(parts)
+    try:
+        candidate = (root / Path(*parts)).resolve()
+        root_resolved = root.resolve()
+        if not str(candidate).startswith(str(root_resolved)):
+            return "", b""
+        if not candidate.is_file():
+            return "", b""
+        return rel_norm, candidate.read_bytes()
+    except Exception:
+        return "", b""
+
+
+def _sanitize_label(text: str) -> str:
+    out = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip())
+    return out.strip("._-") or "item"
+
+
+def _resolve_unique_dir(base_dir: Path) -> Path:
+    if not base_dir.exists():
+        return base_dir
+    idx = 2
+    while True:
+        candidate = base_dir.parent / f"{base_dir.name}_{idx}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def _is_generated_droppedjar_path(path: Path) -> bool:
+    return any(part.lower().endswith("_droppedjar") for part in path.parts)
+
+
+def _decompile_and_extract_jar_with_fernflower(
+    jar_path: Path,
+    out_dir: Path,
+    fernflower_path: Path,
+    show_progress: bool,
+    progress_console=None,
+) -> tuple[bool, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    progress(show_progress, f"decompiling nested jar with fernflower: {jar_path}", progress_console)
+    cp = subprocess.run(
+        ["java", "-jar", str(fernflower_path), str(jar_path), str(out_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "").strip()
+        return False, f"fernflower failed for {jar_path.name}: {err}" if err else f"fernflower failed for {jar_path.name}"
+
+    produced_jars = [p for p in out_dir.glob("*.jar") if p.is_file()]
+    if not produced_jars:
+        return False, f"fernflower produced no jar for {jar_path.name}"
+
+    matching_name = [p for p in produced_jars if p.name.lower() == jar_path.name.lower()]
+    decompiled_jar = max((matching_name or produced_jars), key=lambda p: p.stat().st_mtime)
+    progress(show_progress, f"extracting decompiled nested jar: {decompiled_jar.name}", progress_console)
+    extract_summary = _safe_extract_jar(decompiled_jar, out_dir)
+    if extract_summary.get("error"):
+        return False, f"extract failed for {jar_path.name}: {extract_summary.get('error')}"
+    return True, ""
+
+
+def _prefix_rel_path(prefix: str, rel: str) -> str:
+    rel_norm = rel.replace("\\", "/")
+    return f"{prefix}/{rel_norm}" if prefix else rel_norm
+
+
+def _apply_prefix_findings(items: List[Finding], prefix: str) -> List[Finding]:
+    if not prefix:
+        return items
+    return [
+        Finding(
+            file=_prefix_rel_path(prefix, it.file),
+            line=it.line,
+            function=it.function,
+            decoded=it.decoded,
+            category=it.category,
+            note=it.note,
+        )
+        for it in items
+    ]
+
+
+def _apply_prefix_behaviors(items: List[BehaviorFinding], prefix: str) -> List[BehaviorFinding]:
+    if not prefix:
+        return items
+    return [
+        BehaviorFinding(
+            file=_prefix_rel_path(prefix, it.file),
+            line=it.line,
+            behavior=it.behavior,
+            evidence=it.evidence,
+        )
+        for it in items
+    ]
+
+
+def _apply_prefix_artifacts(items: List[ArtifactFinding], prefix: str) -> List[ArtifactFinding]:
+    if not prefix:
+        return items
+    out: List[ArtifactFinding] = []
+    for it in items:
+        p = it.path
+        if p.startswith("<") and p.endswith(">"):
+            p = f"{prefix}/{p}"
+        else:
+            p = _prefix_rel_path(prefix, p)
+        out.append(
+            ArtifactFinding(
+                path=p,
+                filename=it.filename,
+                size=it.size,
+                sha256=it.sha256,
+                artifact_type=it.artifact_type,
+                evidence=it.evidence,
+            )
+        )
+    return out
+
+
+def prepare_nested_dropped_jar_roots(scan_root: Path, show_progress: bool, progress_console=None) -> List[tuple[Path, str]]:
+    fernflower = Path.cwd().resolve() / "fernflower.jar"
+    if not fernflower.is_file():
+        progress(show_progress, "nested dropped-jar scan skipped: fernflower.jar not found in cwd", progress_console)
+        return []
+
+    jar_candidates = sorted(
+        [
+            p
+            for p in scan_root.rglob("*.jar")
+            if p.is_file()
+            and p.name.lower() != "fernflower.jar"
+            and not p.name.lower().endswith("_droppedjar.jar")
+            and not _is_generated_droppedjar_path(p.parent)
+        ],
+        key=lambda p: str(p).lower(),
+    )
+    if not jar_candidates:
+        return []
+
+    out: List[tuple[Path, str]] = []
+    for jar_path in jar_candidates:
+        rel = str(jar_path.relative_to(scan_root))
+        base_name = _sanitize_label(jar_path.stem)
+        preferred = Path.cwd().resolve() / f"{base_name}_droppedjar"
+        marker_name = ".java_triage_nested_jar_source.txt"
+        if preferred.exists() and preferred.is_dir():
+            marker = preferred / marker_name
+            marker_text = marker.read_text(encoding="utf-8", errors="replace").strip() if marker.is_file() else ""
+            if marker_text == str(jar_path.resolve()) and any(preferred.rglob("*.java")):
+                progress(show_progress, f"reusing nested dropped-jar scan directory: {preferred}", progress_console)
+                out.append((preferred, f"dropped/{preferred.name}"))
+                continue
+            preferred = _resolve_unique_dir(preferred)
+
+        ok, err = _decompile_and_extract_jar_with_fernflower(jar_path, preferred, fernflower, show_progress, progress_console)
+        if not ok:
+            progress(show_progress, f"nested dropped-jar preparation failed: {err}", progress_console)
+            continue
+        try:
+            (preferred / marker_name).write_text(str(jar_path.resolve()), encoding="utf-8")
+        except Exception:
+            pass
+        out.append((preferred, f"dropped/{preferred.name}"))
+        progress(show_progress, f"nested dropped-jar ready: {rel} -> {preferred}", progress_console)
+    return out
+
+
+def prepare_embedded_base32_archive_roots(scan_root: Path, show_progress: bool, progress_console=None) -> List[tuple[Path, str]]:
+    fernflower = Path.cwd().resolve() / "fernflower.jar"
+    if not fernflower.is_file():
+        progress(show_progress, "embedded archive scan skipped: fernflower.jar not found in cwd", progress_console)
+        return []
+
+    out: List[tuple[Path, str]] = []
+    seen_sources: set[str] = set()
+    marker_name = ".java_triage_embedded_source.txt"
+
+    for java_path in iter_java_files(scan_root):
+        if _is_generated_droppedjar_path(java_path.parent):
+            continue
+        try:
+            text = java_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        refs = [m.group(1) for m in RESOURCE_STREAM_RE.finditer(text)]
+        if not refs:
+            continue
+
+        for raw_ref in refs:
+            rel_ref, raw = _read_referenced_resource(scan_root, raw_ref)
+            if not raw:
+                continue
+            try:
+                txt = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                txt = ""
+            decoded = _try_decode_base32_blob(txt)
+            if not decoded.startswith(b"PK\x03\x04"):
+                continue
+
+            src_id = f"{java_path.resolve()}::{rel_ref}::{hashlib.sha256(decoded).hexdigest()}"
+            if src_id in seen_sources:
+                continue
+            seen_sources.add(src_id)
+
+            res_stem = _sanitize_label(Path(rel_ref).stem)
+            if not res_stem:
+                res_stem = "embedded_payload"
+            base_name = f"{res_stem}_droppedjar"
+            out_dir = Path.cwd().resolve() / base_name
+            jar_out = Path.cwd().resolve() / f"{base_name}.jar"
+
+            if out_dir.exists() and out_dir.is_dir():
+                marker = out_dir / marker_name
+                marker_text = marker.read_text(encoding="utf-8", errors="replace").strip() if marker.is_file() else ""
+                if marker_text == src_id and any(out_dir.rglob("*.java")):
+                    progress(show_progress, f"reusing embedded dropped-jar directory: {out_dir}", progress_console)
+                    out.append((out_dir, f"dropped/{out_dir.name}"))
+                    continue
+                out_dir = _resolve_unique_dir(out_dir)
+                jar_out = jar_out.with_name(f"{out_dir.name}.jar")
+
+            try:
+                jar_out.write_bytes(decoded)
+            except Exception as exc:
+                progress(show_progress, f"failed writing decoded embedded jar {jar_out}: {exc}", progress_console)
+                continue
+
+            ok, err = _decompile_and_extract_jar_with_fernflower(jar_out, out_dir, fernflower, show_progress, progress_console)
+            if not ok:
+                progress(show_progress, f"embedded dropped-jar preparation failed: {err}", progress_console)
+                continue
+            try:
+                (out_dir / marker_name).write_text(src_id, encoding="utf-8")
+            except Exception:
+                pass
+            progress(show_progress, f"embedded dropped-jar ready: {rel_ref} -> {out_dir}", progress_console)
+            out.append((out_dir, f"dropped/{out_dir.name}"))
+
+    return out
+
+
 def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     text = path.read_text(encoding="utf-8", errors="replace")
     low = text.lower()
@@ -1297,6 +1875,33 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     rel_low = rel.replace("\\", "/").lower()
     is_vendor_lib = rel_low.startswith("com/sun/jna/") or rel_low.startswith("org/json/")
     out: List[BehaviorFinding] = []
+    reconstructed_urls = [item for item in _reconstruct_split_string_arrays(text) if URL_RE.match(item[1])]
+    byte_array_strings = _extract_printable_byte_array_strings(text)
+    char_array_strings = _extract_printable_char_array_strings(text)
+    reversed_literals = _extract_reversed_stringbuilder_literals(text)
+    obfuscated_string_pool = byte_array_strings + char_array_strings + reversed_literals
+    obfuscated_values = [s for s, _, _ in obfuscated_string_pool]
+    http_hosts = set(_extract_http_hosts(text))
+    for _, url, _, _ in reconstructed_urls:
+        host = urlparse(url).netloc.lower()
+        if host:
+            http_hosts.add(host)
+
+    if reconstructed_urls:
+        sample_name, sample_url, sample_line, sample_parts = reconstructed_urls[0]
+        host_sample = sorted(http_hosts)[:3]
+        host_note = f" hosts={','.join(host_sample)}" if host_sample else ""
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=sample_line,
+                behavior="obfuscated_url_reconstruction",
+                evidence=(
+                    f"Reconstructs URL from split string array name={sample_name} parts={sample_parts}"
+                    f"{host_note} sample={sample_url[:120]}"
+                ),
+            )
+        )
 
     if "ProcessBuilder" in text and "javaw.exe" in text and "--jw" in text and "System.exit(0)" in text:
         out.append(
@@ -1372,6 +1977,295 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 line=find_line(text, "BodyHandlers.ofByteArray()"),
                 behavior="binary_payload_download",
                 evidence="Performs HTTP GET and downloads raw bytes",
+            )
+        )
+
+    has_urlconnection_download = (
+        ("HttpURLConnection" in text or "URLConnection" in text)
+        and ("getInputStream(" in text or "openStream(" in text)
+        and ("FileOutputStream(" in text or "transferFrom(" in text or "Files.copy(" in text)
+    )
+    if has_urlconnection_download:
+        host_note = f" hosts={','.join(sorted(http_hosts))}" if http_hosts else ""
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "HttpURLConnection") if "HttpURLConnection" in text else find_line(text, "URLConnection"),
+                behavior="http_urlconnection_binary_download",
+                evidence=f"Uses URLConnection to download remote bytes and write to disk{host_note}",
+            )
+        )
+
+    writes_to_mods_dir = (
+        ('"mods"' in text or "MOD_FOLDER" in text)
+        and ("new File(" in text)
+        and ("Minecraft.func_71410_x().field_71412_D" in text or "Minecraft.getMinecraft().mcDataDir" in text)
+    )
+    auto_update_invocation = ("@EventHandler" in text and "preInit(" in text and "checkForUpdates()" in text)
+    if has_urlconnection_download and writes_to_mods_dir:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "MOD_FOLDER") if "MOD_FOLDER" in text else find_line(text, '"mods"'),
+                behavior="minecraft_mod_folder_remote_dropper",
+                evidence="Downloads remote payload and writes into Minecraft mods directory for staged loading",
+            )
+        )
+        if auto_update_invocation:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "preInit("),
+                    behavior="assessment_suspicious_remote_mod_dropper",
+                    evidence="Auto-runs on mod init and silently downloads remote JAR into mods folder",
+                )
+            )
+        else:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "checkForUpdates()"),
+                    behavior="assessment_needs_review_remote_mod_downloader",
+                    evidence="Remote mod downloader present; verify trust chain and signed update metadata",
+                )
+            )
+
+    resource_refs = [m.group(1) for m in RESOURCE_STREAM_RE.finditer(text)]
+    has_base32_decode_flow = (
+        "base32Decode(" in text
+        or ("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567" in text and "toBinaryString(" in text and "Integer.parseInt(" in text)
+    )
+    writes_payload_file = "FileOutputStream(" in text and ("writeFile(" in text or ".write(" in text)
+    jar_target_literals = [m.group(1) for m in re.finditer(r'"([^"\r\n]*\.jar)"', text, flags=re.IGNORECASE)]
+    drops_to_mods = any("mods/" in s.replace("\\", "/").lower() for s in jar_target_literals)
+    embedded_archive_hits: List[tuple[str, int]] = []
+    for ref in resource_refs[:30]:
+        rel_norm, raw = _read_referenced_resource(root, ref)
+        if not raw:
+            continue
+        try:
+            txt = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            txt = ""
+        decoded = _try_decode_base32_blob(txt)
+        if decoded.startswith(b"PK\x03\x04"):
+            embedded_archive_hits.append((rel_norm, len(decoded)))
+
+    if embedded_archive_hits and has_base32_decode_flow and writes_payload_file:
+        sample_res, sample_len = embedded_archive_hits[0]
+        target_note = f" targets={','.join(sorted(set(jar_target_literals))[:2])}" if jar_target_literals else ""
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "getResourceAsStream("),
+                behavior="embedded_resource_encoded_archive_dropper",
+                evidence=(
+                    f"Decodes embedded Base32 resource to ZIP/JAR payload and writes it to disk "
+                    f"resource={sample_res} decoded_bytes={sample_len}{target_note}"
+                ),
+            )
+        )
+        if drops_to_mods:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "mods/") if "mods/" in text else find_line(text, ".jar"),
+                    behavior="minecraft_mod_folder_embedded_payload_dropper",
+                    evidence="Writes decoded embedded archive payload into Minecraft mods directory for staged loading",
+                )
+            )
+            if "@EventHandler" in text and ("init(" in text or "preInit(" in text):
+                out.append(
+                    BehaviorFinding(
+                        file=rel,
+                        line=find_line(text, "@EventHandler"),
+                        behavior="assessment_suspicious_embedded_mod_dropper",
+                        evidence="Mod init handler triggers embedded payload decode+drop into mods folder",
+                    )
+                )
+
+    has_discord_leveldb_paths = ("Local Storage\\\\leveldb" in text) or ("Local Storage\\leveldb" in text)
+    has_discord_token_regex = (
+        "Pattern.compile(\"[\\\\w-]{24}\\\\.[\\\\w-]{6}\\\\.[\\\\w-]{25,110}\")" in text
+        or "tokenRegex" in text
+    )
+    has_discord_enc_marker = "dQw4w9WgXcQ:" in text
+    if has_discord_leveldb_paths and (has_discord_token_regex or has_discord_enc_marker):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "Local Storage\\leveldb"),
+                behavior="discord_leveldb_token_theft",
+                evidence="Enumerates Discord/browser LevelDB paths and extracts Discord tokens (plain/encrypted marker forms)",
+            )
+        )
+
+    if "discord.com/api/v9/users/@me" in low and "Authorization" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "discord.com/api/v9/users/@me"),
+                behavior="discord_token_validation_api",
+                evidence="Validates harvested Discord tokens by calling Discord /users/@me with Authorization header",
+            )
+        )
+
+    if (
+        ('delivery.add("discord"' in text or 'delivery.addProperty("discord"' in text)
+        and ("setRequestMethod(\"POST\")" in text or "setRequestMethod('POST')" in text)
+        and ("delivery.toString()" in text or "writeBytes(delivery" in text)
+    ):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, 'delivery.add("discord"') if 'delivery.add("discord"' in text else find_line(text, "delivery"),
+                behavior="discord_token_exfiltration_bundle",
+                evidence="Packages Discord token data into outbound JSON delivery payload and posts to remote endpoint",
+            )
+        )
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, 'delivery.add("discord"') if 'delivery.add("discord"' in text else find_line(text, "delivery"),
+                behavior="assessment_suspicious_discord_token_stealer",
+                evidence="Discord token theft and outbound exfiltration workflow is present",
+            )
+        )
+
+    has_password_db_theft = (
+        "Login Data" in text
+        and "password_value" in text
+        and "jdbc:sqlite:" in text
+        and ("Utils.decrypt(" in text or "decrypt(" in text)
+    )
+    if has_password_db_theft:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "Login Data"),
+                behavior="browser_password_database_theft",
+                evidence="Reads Chromium Login Data SQLite DB and decrypts password_value entries",
+            )
+        )
+
+    has_cookie_db_theft = (
+        ("\\Network\\Cookies" in text or "cookies" in low)
+        and "encrypted_value" in text
+        and "jdbc:sqlite:" in text
+        and ("Utils.decrypt(" in text or "decrypt(" in text)
+    )
+    if has_cookie_db_theft:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "encrypted_value"),
+                behavior="browser_cookie_database_theft",
+                evidence="Reads Chromium Cookies SQLite DB and decrypts encrypted_value cookie data",
+            )
+        )
+
+    has_history_collection = (
+        "History" in text
+        and "jdbc:sqlite:" in text
+        and "SELECT url, title" in text
+    )
+    if has_history_collection:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "SELECT url, title"),
+                behavior="browser_history_database_collection",
+                evidence="Reads browser History SQLite DB and extracts visited URL/title records",
+            )
+        )
+
+    has_screenshot_capture = (
+        "new Robot()" in text
+        and "createScreenCapture(" in text
+        and "Base64.getEncoder().encodeToString(" in text
+    )
+    if has_screenshot_capture:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "createScreenCapture("),
+                behavior="screenshot_capture_collection",
+                evidence="Captures full screen via AWT Robot and base64-encodes image for collection/exfiltration",
+            )
+        )
+
+    has_chromium_masterkey_chain = (
+        "Crypt32Util.cryptUnprotectData" in text
+        and "AES/GCM/NoPadding" in text
+        and ("Local State" in text or "encrypted_key" in text)
+    )
+    if has_chromium_masterkey_chain:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "Crypt32Util.cryptUnprotectData"),
+                behavior="chromium_masterkey_decryption_chain",
+                evidence="Uses DPAPI + AES/GCM flow to decrypt Chromium-protected credential/token material",
+            )
+        )
+
+    has_runtime_sqlite_loader = (
+        "sqlite-jdbc" in low
+        and "repo1.maven.org/maven2/org/xerial/sqlite-jdbc" in low
+        and "URLClassLoader" in text
+        and "Class.forName(\"org.sqlite.JDBC\"" in text
+    )
+    if has_runtime_sqlite_loader:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "sqlite-jdbc"),
+                behavior="runtime_sqlite_driver_download_and_load",
+                evidence="Downloads sqlite-jdbc JAR from Maven and loads it dynamically with URLClassLoader",
+            )
+        )
+
+    exfil_base_urls = sorted(set(re.findall(r'https?://[^\s"\'<>]+', text)))
+    has_delivery_post = (
+        "setRequestMethod(\"POST\")" in text
+        and ("delivery.toString()" in text or 'delivery.add("minecraft"' in text)
+    )
+    if has_delivery_post and exfil_base_urls:
+        base = exfil_base_urls[0]
+        endpoint_notes: List[str] = []
+        if "/delivery" in text:
+            endpoint_notes.append(f"{base.rstrip('/')}/delivery")
+        if "/ssid" in text:
+            endpoint_notes.append(f"{base.rstrip('/')}/ssid")
+        if not endpoint_notes:
+            endpoint_notes.append(base)
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "setRequestMethod(\"POST\")"),
+                behavior="credential_exfiltration_endpoint",
+                evidence="Credential exfil POST endpoint(s): " + ", ".join(endpoint_notes),
+            )
+        )
+
+    multi_stealer_markers = 0
+    for flag in [
+        ('delivery.add("discord"' in text or 'delivery.addProperty("discord"' in text),
+        ('delivery.add("passwords"' in text or "grabPassword()" in text),
+        ('delivery.addProperty("cookies"' in text or "grabCookies()" in text),
+        ('delivery.add("history"' in text or "grabBrowserHistory()" in text),
+        ('delivery.addProperty("screenshot"' in text or "takeScreenshot()" in text),
+        ('delivery.add("minecraft"' in text or 'mcJson.addProperty("ssid"' in text),
+    ]:
+        if flag:
+            multi_stealer_markers += 1
+    if multi_stealer_markers >= 4 and has_delivery_post:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "delivery"),
+                behavior="assessment_suspicious_multi_credential_infostealer",
+                evidence="Bundles multiple credential/data theft modules (minecraft/discord/passwords/cookies/history/screenshot) for outbound POST exfiltration",
             )
         )
 
@@ -1685,7 +2579,7 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 evidence="References local Minecraft session/account storage paths (session.json/launcher_accounts.json/.minecraft)",
             )
         )
-        if _extract_http_hosts(text) or ("HttpClient" in text and "send(" in text):
+        if http_hosts or ("HttpClient" in text and "send(" in text):
             out.append(
                 BehaviorFinding(
                     file=rel,
@@ -1696,7 +2590,7 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
 
     # Identity exfiltration: username/UUID present with outbound HTTP usage in same file.
-    outbound_http_present = bool(_extract_http_hosts(text) or ("HttpClient" in text and "send(" in text) or ("OkHttpClient" in text and ".newCall(" in text) or ("HttpURLConnection" in text))
+    outbound_http_present = bool(http_hosts or ("HttpClient" in text and "send(" in text) or ("OkHttpClient" in text and ".newCall(" in text) or ("HttpURLConnection" in text))
     if outbound_http_present and (has_username_access_signal or has_uuid_access_signal):
         out.append(
             BehaviorFinding(
@@ -1865,6 +2759,54 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 line=find_line(text, "Telemetry"),
                 behavior="telemetry_or_beaconing",
                 evidence="Contains telemetry initialization or transport routines",
+            )
+        )
+
+    if not is_vendor_lib and obfuscated_values:
+        runtime_tokens = [s.lower() for s in obfuscated_values]
+        has_runtime_reflect_chain = (
+            "Class.forName(" in text
+            and ".getMethod(" in text
+            and ".invoke(" in text
+            and any("java.lang.runtime" in s for s in runtime_tokens)
+            and any(("getruntime" in s or "exec" in s) for s in runtime_tokens)
+        )
+        cmd_samples = [
+            s for s in obfuscated_values if COMMAND_LITERAL_RE.search(s) or "http://" in s.lower() or "https://" in s.lower()
+        ]
+        if has_runtime_reflect_chain and cmd_samples:
+            sample = cmd_samples[0][:120]
+            sample_line = next((line for s, line, _ in obfuscated_string_pool if s == cmd_samples[0]), find_line(text, "Class.forName("))
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=sample_line,
+                    behavior="command_execution_capability",
+                    evidence=f"Reflective Runtime.exec chain assembled from obfuscated literals; sample={sample}",
+                )
+            )
+
+    if (
+        not is_vendor_lib
+        and ("defineClass(" in text or "MethodHandles.lookup().defineClass(" in text or "Unsafe" in text)
+        and ("Base64.getDecoder().decode(" in text or "Cipher.getInstance(" in text or "GZIPInputStream" in text or "InflaterInputStream" in text)
+    ):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "defineClass("),
+                behavior="dynamic_class_execution",
+                evidence="Defines classes at runtime from decoded/decrypted/compressed byte streams",
+            )
+        )
+
+    if (not is_vendor_lib) and "ScriptEngineManager" in text and ".eval(" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "ScriptEngineManager"),
+                behavior="dynamic_class_execution",
+                evidence="Uses ScriptEngine eval for dynamic code execution",
             )
         )
 
@@ -2374,6 +3316,10 @@ def discover_artifacts(root: Path) -> List[ArtifactFinding]:
     candidates.extend(root.rglob("*.jar.*"))
     candidates.extend(root.rglob("*.dat"))
     candidates.extend(root.rglob("*.bin"))
+    for rr in sorted(referenced_resources):
+        p = root / Path(*rr.split("/"))
+        if p.is_file():
+            candidates.append(p)
 
     seen = set()
     for p in candidates:
@@ -2390,8 +3336,25 @@ def discover_artifacts(root: Path) -> List[ArtifactFinding]:
         low = rel.lower()
         low_norm = low.replace("\\", "/")
         referenced = low_norm in referenced_resources
+        decoded_embedded_archive = False
+        decoded_embedded_size = 0
+        if referenced and p.suffix.lower() in {".txt", ".dat", ".bin", ".cfg", ".json", ""}:
+            try:
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                txt = ""
+            decoded = _try_decode_base32_blob(txt)
+            if decoded.startswith(b"PK\x03\x04"):
+                decoded_embedded_archive = True
+                decoded_embedded_size = len(decoded)
 
-        if ".jar." in low:
+        if decoded_embedded_archive:
+            artifact_type = "embedded_encoded_archive_payload"
+            evidence = (
+                f"Referenced resource appears Base32-encoded and decodes to ZIP/JAR payload "
+                f"(decoded_bytes={decoded_embedded_size}; header_hex=504B0304)"
+            )
+        elif ".jar." in low:
             artifact_type = "renamed_archive_or_payload"
             sig = archive_signature_status(p)
             evidence = (
@@ -2788,6 +3751,42 @@ def scan_file(
         )
 
     if not is_vendor_lib:
+        obf_literal_entries: List[tuple[str, int, int, str]] = []
+        obf_literal_entries.extend((s, line, n, "byte_array") for s, line, n in _extract_printable_byte_array_strings(text))
+        obf_literal_entries.extend((s, line, n, "char_array") for s, line, n in _extract_printable_char_array_strings(text))
+        obf_literal_entries.extend((s, line, n, "reverse_stringbuilder") for s, line, n in _extract_reversed_stringbuilder_literals(text))
+        seen_obf = set()
+        for decoded, line, item_count, source_kind in obf_literal_entries:
+            key = (decoded, line, source_kind)
+            if key in seen_obf:
+                continue
+            seen_obf.add(key)
+            function = nearest_method(decls, line)
+            low = decoded.lower()
+            if URL_RE.match(decoded):
+                category = "url"
+                signal = f"{source_kind}_url"
+            elif COMMAND_LITERAL_RE.search(decoded):
+                category = "dynamic_execution"
+                signal = f"{source_kind}_command_or_lolbin"
+            elif any(tok in low for tok in ("java.lang.runtime", "getruntime", "exec")):
+                category = "dynamic_execution"
+                signal = f"{source_kind}_runtime_reflection_token"
+            elif any(k in low for k in SUSPICIOUS_STRING_KEYWORDS):
+                category = "credential_or_identity_field" if any(k in low for k in ("token", "authorization", "api_key", "bearer ")) else "string"
+                signal = f"{source_kind}_keyword_hit"
+            else:
+                continue
+            findings.append(
+                Finding(
+                    file=rel,
+                    line=line,
+                    function=function,
+                    decoded=decoded,
+                    category=category,
+                    note=f"source={source_kind}_scanner signal={signal} item_count={item_count}",
+                )
+            )
         if include_all_literals:
             findings.extend(scan_all_string_literals(text, rel, starts, decls))
         seen = set()
@@ -2818,6 +3817,24 @@ def scan_file(
                     break
         findings.extend(scan_stringdecrypt_calls(text, rel, starts, decls, decrypt_profile))
         findings.extend(scan_string_literals(text, rel, starts, decls))
+        seen_reconstructed = set()
+        for name, rebuilt, line, parts in _reconstruct_split_string_arrays(text):
+            if not URL_RE.match(rebuilt):
+                continue
+            if rebuilt in seen_reconstructed:
+                continue
+            seen_reconstructed.add(rebuilt)
+            function = nearest_method(decls, line)
+            findings.append(
+                Finding(
+                    file=rel,
+                    line=line,
+                    function=function,
+                    decoded=rebuilt,
+                    category="url",
+                    note=f"source=split_string_array name={name} parts={parts}",
+                )
+            )
     return findings
 
 
@@ -2865,7 +3882,15 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
     high_risk = [
         f
         for f in findings
-        if f.category in {"url", "credential_or_identity_field", "dynamic_execution", "rpc_template", "path"}
+        if f.category in {
+            "url",
+            "credential_or_identity_field",
+            "dynamic_execution",
+            "rpc_template",
+            "path",
+            "discord_indicator",
+            "comms_indicator",
+        }
     ]
     behavior_severity_counts = {k: 0 for k in ["critical", "high", "medium", "low", "info"]}
     for b in behaviors:
@@ -2992,43 +4017,42 @@ def render_text(
     for k, v in bundle_info.get("contained_files_by_extension", {}).items():
         out.append(f"- {k}: {v}")
 
-    out.append("")
-    out.append("== Decode + String Findings ==")
-    for f in sorted(findings, key=lambda x: (x.file, x.line, x.decoded)):
-        note = f" [{f.note}]" if f.note else ""
-        out.append(f"[{f.category}] {f.file}:{f.line} ({f.function}) -> {f.decoded}{note}")
-
-    out.append("")
-    out.append("== Assessment Findings ==")
     assessment = summarize_assessments(behaviors)
-    for label in ["benign", "needs_review", "suspicious"]:
-        entries = assessment["findings"][label]
-        out.append(f"{label}: {len(entries)}")
-        for item in entries:
-            out.append(f"- [{item['behavior']}] {item['file']}:{item['line']} -> {item['evidence']}")
+    if findings:
+        out.append("")
+        out.append("== Decode + String Findings ==")
+        for f in sorted(findings, key=lambda x: (x.file, x.line, x.decoded)):
+            note = f" [{f.note}]" if f.note else ""
+            out.append(f"[{f.category}] {f.file}:{f.line} ({f.function}) -> {f.decoded}{note}")
 
-    out.append("")
-    out.append("== Behavioral Findings ==")
+    has_assessment_rows = any(assessment["findings"][label] for label in ["benign", "needs_review", "suspicious"])
+    if has_assessment_rows:
+        out.append("")
+        out.append("== Assessment Findings ==")
+        for label in ["benign", "needs_review", "suspicious"]:
+            entries = assessment["findings"][label]
+            out.append(f"{label}: {len(entries)}")
+            for item in entries:
+                out.append(f"- [{item['behavior']}] {item['file']}:{item['line']} -> {item['evidence']}")
+
     if behaviors:
+        out.append("")
+        out.append("== Behavioral Findings ==")
         for b in sorted(behaviors, key=lambda x: (x.file, x.line, x.behavior)):
             sev = behavior_severity(b.behavior)
             out.append(f"[{sev}] [{b.behavior}] {b.file}:{b.line} -> {b.evidence}")
-    else:
-        out.append("None detected")
 
-    out.append("")
-    out.append("== Artifact Findings ==")
     if artifacts:
+        out.append("")
+        out.append("== Artifact Findings ==")
         for a in artifacts:
             size_text = str(a.size) if a.size >= 0 else "unknown"
             hash_text = a.sha256 if a.sha256 else "<unknown>"
             out.append(f"[{a.artifact_type}] {a.path} filename={a.filename} size={size_text} sha256={hash_text} -> {a.evidence}")
-    else:
-        out.append("None detected")
 
-    out.append("")
-    out.append("== Runtime C2 Resolution ==")
     if runtime_c2.get("attempted"):
+        out.append("")
+        out.append("== Runtime C2 Resolution ==")
         if runtime_c2.get("resolved"):
             out.append(f"Resolved: yes via {runtime_c2.get('rpc_used')}")
             out.append(f"C2 base URL: {runtime_c2.get('c2_base_url')}")
@@ -3053,28 +4077,21 @@ def render_text(
         else:
             out.append("Resolved: no")
             out.append(f"Error: {runtime_c2.get('error')}")
-    else:
-        out.append("Skipped")
 
 
-    out.append("")
-    out.append("== Stage2 Analysis ==")
     s2 = stage2_analysis or {}
     manual_payload_url = str(runtime_c2.get("payload_endpoint", "") or "")
-    if not s2.get("enabled"):
-        out.append("Skipped")
-        if manual_payload_url:
-            out.append(f"Manual stage2 download URL: {manual_payload_url}")
-            out.append(f"Manual download (PowerShell): Invoke-WebRequest -Uri \"{manual_payload_url}\" -OutFile \"stage2_payload.jar\"")
-        else:
-            out.append("Manual stage2 download URL: <unresolved; run without --no-network to resolve runtime C2>")
-    elif not s2.get("attempted"):
+    if s2.get("enabled") and not s2.get("attempted"):
+        out.append("")
+        out.append("== Stage2 Analysis ==")
         out.append("Attempted: no")
         if manual_payload_url:
             out.append(f"Manual stage2 download URL: {manual_payload_url}")
         if s2.get("error"):
             out.append(f"Reason: {s2.get('error')}")
-    else:
+    elif s2.get("enabled"):
+        out.append("")
+        out.append("== Stage2 Analysis ==")
         out.append(f"Attempted: yes")
         out.append(f"Static-only mode: {bool(s2.get('static_only_no_execution', True))}")
         out.append(f"Payload URL: {s2.get('resolved_payload_url', '')}")
@@ -3104,24 +4121,25 @@ def render_text(
         if s2.get("error"):
             out.append(f"Error: {s2.get('error')}")
 
-    out.append("")
-    out.append("== Blockchain Indicators ==")
-    out.append(f"Contracts: {len(blockchain['contracts'])}")
-    for item in blockchain["contracts"]:
-        out.append(f"- {item}")
-    out.append(f"Method selectors: {len(blockchain['selectors'])}")
-    for item in blockchain["selectors"]:
-        out.append(f"- {item}")
-    out.append(f"RPC hosts: {len(blockchain['rpc_hosts'])}")
-    for item in blockchain["rpc_hosts"]:
-        out.append(f"- {item}")
-    out.append(f"RPC URLs: {len(blockchain['rpc_urls'])}")
-    for item in blockchain["rpc_urls"]:
-        out.append(f"- {item}")
-    if blockchain["api_key_urls"]:
-        out.append("RPC URLs with API keys:")
-        for item in blockchain["api_key_urls"]:
+    if any([blockchain["contracts"], blockchain["selectors"], blockchain["rpc_hosts"], blockchain["rpc_urls"], blockchain["api_key_urls"]]):
+        out.append("")
+        out.append("== Blockchain Indicators ==")
+        out.append(f"Contracts: {len(blockchain['contracts'])}")
+        for item in blockchain["contracts"]:
             out.append(f"- {item}")
+        out.append(f"Method selectors: {len(blockchain['selectors'])}")
+        for item in blockchain["selectors"]:
+            out.append(f"- {item}")
+        out.append(f"RPC hosts: {len(blockchain['rpc_hosts'])}")
+        for item in blockchain["rpc_hosts"]:
+            out.append(f"- {item}")
+        out.append(f"RPC URLs: {len(blockchain['rpc_urls'])}")
+        for item in blockchain["rpc_urls"]:
+            out.append(f"- {item}")
+        if blockchain["api_key_urls"]:
+            out.append("RPC URLs with API keys:")
+            for item in blockchain["api_key_urls"]:
+                out.append(f"- {item}")
 
     out.append("")
     out.append("== Summary ==")
@@ -3151,6 +4169,118 @@ def resolve_target(raw_target: str) -> Path:
     if raw_target in {"/", "\\", "cwd"}:
         return Path.cwd().resolve()
     return Path(raw_target).resolve()
+
+
+def _prompt_select_jar(candidates: List[Path]) -> Path | None:
+    print("Multiple JAR files found. Pick one to scan:", file=sys.stderr)
+    for idx, jar in enumerate(candidates, start=1):
+        print(f"  {idx}. {jar.name}", file=sys.stderr)
+    print("  0. Cancel", file=sys.stderr)
+    while True:
+        print("Select JAR number to decompile and scan: ", end="", file=sys.stderr, flush=True)
+        try:
+            raw = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print("", file=sys.stderr)
+            return None
+        if not raw:
+            print("Selection required. Enter a number.", file=sys.stderr)
+            continue
+        if not raw.isdigit():
+            print("Invalid selection. Enter a numeric choice.", file=sys.stderr)
+            continue
+        choice = int(raw)
+        if choice == 0:
+            return None
+        if 1 <= choice <= len(candidates):
+            return candidates[choice - 1]
+        print(f"Invalid selection. Enter 0-{len(candidates)}.", file=sys.stderr)
+
+
+def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, progress_console=None) -> Path:
+    cwd = Path.cwd().resolve()
+    if initial_root != cwd:
+        return initial_root
+
+    fernflower = cwd / "fernflower.jar"
+    if not fernflower.is_file():
+        return initial_root
+
+    jar_candidates = sorted(
+        [
+            p
+            for p in cwd.glob("*.jar")
+            if p.is_file()
+            and p.name.lower() != "fernflower.jar"
+            and not p.name.lower().endswith("_droppedjar.jar")
+        ],
+        key=lambda p: p.name.lower(),
+    )
+    if not jar_candidates:
+        return initial_root
+
+    selected: Path | None
+    if len(jar_candidates) == 1:
+        selected = jar_candidates[0]
+    else:
+        if not sys.stdin.isatty():
+            progress(
+                show_progress,
+                "multiple JAR files found but stdin is not interactive; skipping JAR selection",
+                progress_console,
+            )
+            return initial_root
+        selected = _prompt_select_jar(jar_candidates)
+        if selected is None:
+            print("JAR selection cancelled. Continuing with current target.", file=sys.stderr)
+            return initial_root
+
+    out_dir = (cwd / selected.stem).resolve()
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            print(f"error: output path exists and is not a directory: {out_dir}", file=sys.stderr)
+            return initial_root
+        progress(
+            show_progress,
+            f"reusing existing extracted directory for {selected.name}: {out_dir}",
+            progress_console,
+        )
+        return out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    progress(show_progress, f"decompiling {selected.name} with fernflower", progress_console)
+    cp = subprocess.run(
+        ["java", "-jar", str(fernflower), str(selected), str(out_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "").strip()
+        print(f"error: fernflower decompilation failed for {selected.name}", file=sys.stderr)
+        if err:
+            print(err, file=sys.stderr)
+        return initial_root
+
+    produced_jars = [p for p in out_dir.glob("*.jar") if p.is_file()]
+    if not produced_jars:
+        print(f"error: fernflower did not produce a decompiled JAR in {out_dir}", file=sys.stderr)
+        return initial_root
+
+    matching_name = [p for p in produced_jars if p.name.lower() == selected.name.lower()]
+    decompiled_jar = max((matching_name or produced_jars), key=lambda p: p.stat().st_mtime)
+    progress(show_progress, f"extracting decompiled JAR: {decompiled_jar.name}", progress_console)
+    extract_summary = _safe_extract_jar(decompiled_jar, out_dir)
+    if extract_summary.get("error"):
+        print(f"error: failed to extract decompiled JAR: {extract_summary.get('error')}", file=sys.stderr)
+        return initial_root
+
+    progress(
+        show_progress,
+        f"jar workflow complete; scanning extracted directory: {out_dir}",
+        progress_console,
+    )
+    return out_dir
 
 
 def progress(enabled: bool, message: str, console=None) -> None:
@@ -3262,8 +4392,8 @@ def render_rich(
             bet.add_row(str(k), str(v))
         console.print(bet)
 
-    console.print(Rule("[bold blue]Decode + String Findings"))
     if findings:
+        console.print(Rule("[bold blue]Decode + String Findings"))
         t = Table(show_lines=False, expand=True)
         t.add_column("Category", style="magenta", max_width=22, no_wrap=True, overflow="ellipsis")
         t.add_column("Location", style="cyan", overflow="fold")
@@ -3273,10 +4403,7 @@ def render_rich(
             decoded = f.decoded if not f.note else f"{f.decoded} [{f.note}]"
             t.add_row(f.category, f"{f.file}:{f.line}", f.function, decoded)
         console.print(t)
-    else:
-        console.print("[dim]None detected[/dim]")
 
-    console.print(Rule("[bold blue]Assessment Findings"))
     at = Table(show_lines=False, box=box.SIMPLE, expand=True)
     at.add_column("Category", style="green")
     at.add_column("Location", style="cyan", overflow="fold")
@@ -3288,12 +4415,11 @@ def render_rich(
             has_assessment_rows = True
             at.add_row(label, f"{item['file']}:{item['line']}", item["behavior"], short(item["evidence"]))
     if has_assessment_rows:
+        console.print(Rule("[bold blue]Assessment Findings"))
         console.print(at)
-    else:
-        console.print("[dim]None detected[/dim]")
 
-    console.print(Rule("[bold blue]Behavioral Findings"))
     if behaviors:
+        console.print(Rule("[bold blue]Behavioral Findings"))
         t = Table(show_lines=False, box=box.SIMPLE, expand=True)
         t.add_column("Risk", style="red")
         t.add_column("Behavior", style="yellow")
@@ -3302,11 +4428,9 @@ def render_rich(
         for b in sorted(behaviors, key=lambda x: (x.file, x.line, x.behavior)):
             t.add_row(behavior_severity(b.behavior), b.behavior, f"{b.file}:{b.line}", short(b.evidence))
         console.print(t)
-    else:
-        console.print("[dim]None detected[/dim]")
 
-    console.print(Rule("[bold blue]Artifact Findings"))
     if artifacts:
+        console.print(Rule("[bold blue]Artifact Findings"))
         t = Table(show_lines=False, box=box.SIMPLE, expand=True)
         t.add_column("Type", style="red")
         t.add_column("Path", style="cyan")
@@ -3319,11 +4443,9 @@ def render_rich(
             hash_text = a.sha256 if a.sha256 else "<unknown>"
             t.add_row(a.artifact_type, a.path, a.filename, size_text, short(hash_text, 18), short(a.evidence))
         console.print(t)
-    else:
-        console.print("[dim]None detected[/dim]")
 
-    console.print(Rule("[bold blue]Runtime C2 Resolution"))
     if runtime_c2.get("attempted"):
+        console.print(Rule("[bold blue]Runtime C2 Resolution"))
         if runtime_c2.get("resolved"):
             console.print(f"[green]Resolved:[/green] yes via {runtime_c2.get('rpc_used')}")
             console.print(f"C2 base URL: {runtime_c2.get('c2_base_url')}")
@@ -3349,29 +4471,19 @@ def render_rich(
         else:
             console.print("[red]Resolved:[/red] no")
             console.print(f"Error: {runtime_c2.get('error')}")
-    else:
-        console.print("[dim]Skipped[/dim]")
 
 
-    console.print(Rule("[bold blue]Stage2 Analysis"))
     s2 = stage2_analysis or {}
     manual_payload_url = str(runtime_c2.get("payload_endpoint", "") or "")
-    if not s2.get("enabled"):
-        console.print("[dim]Skipped[/dim]")
-        if manual_payload_url:
-            console.print(f"Manual stage2 download URL: {manual_payload_url}")
-            console.print(
-                f"Manual download (PowerShell): Invoke-WebRequest -Uri \"{manual_payload_url}\" -OutFile \"stage2_payload.jar\""
-            )
-        else:
-            console.print("Manual stage2 download URL: <unresolved; run without --no-network to resolve runtime C2>")
-    elif not s2.get("attempted"):
+    if s2.get("enabled") and not s2.get("attempted"):
+        console.print(Rule("[bold blue]Stage2 Analysis"))
         console.print("Attempted: no")
         if manual_payload_url:
             console.print(f"Manual stage2 download URL: {manual_payload_url}")
         if s2.get("error"):
             console.print(f"Reason: {s2.get('error')}")
-    else:
+    elif s2.get("enabled"):
+        console.print(Rule("[bold blue]Stage2 Analysis"))
         t2 = Table(show_header=False, box=box.SIMPLE)
         t2.add_row("Attempted", "yes")
         t2.add_row("Static-only mode", str(bool(s2.get("static_only_no_execution", True))))
@@ -3404,38 +4516,39 @@ def render_rich(
                 at.add_row(str(a.get("artifact_type")), str(a.get("path")), short(str(a.get("evidence", ""))))
             console.print(at)
 
-    console.print(Rule("[bold blue]Blockchain Indicators"))
-    bt = Table(show_header=False, box=box.SIMPLE)
-    bt.add_row("Contracts", str(len(blockchain["contracts"])))
-    bt.add_row("Method selectors", str(len(blockchain["selectors"])))
-    bt.add_row("RPC hosts", str(len(blockchain["rpc_hosts"])))
-    bt.add_row("RPC URLs", str(len(blockchain["rpc_urls"])))
-    bt.add_row("RPC URLs with API keys", str(len(blockchain["api_key_urls"])))
-    console.print(bt)
-    if blockchain["contracts"]:
-        t_contract = Table(title="Contract Addresses", show_header=True, box=box.SIMPLE)
-        t_contract.add_column("Address", style="cyan")
-        for item in blockchain["contracts"]:
-            t_contract.add_row(item)
-        console.print(t_contract)
-    if blockchain["selectors"]:
-        t_sel = Table(title="Method Selectors", show_header=True, box=box.SIMPLE)
-        t_sel.add_column("Selector", style="yellow")
-        for item in blockchain["selectors"]:
-            t_sel.add_row(item)
-        console.print(t_sel)
-    if blockchain["rpc_hosts"]:
-        t_hosts = Table(title="RPC Hosts", show_header=True, box=box.SIMPLE)
-        t_hosts.add_column("Host", style="magenta")
-        for item in blockchain["rpc_hosts"]:
-            t_hosts.add_row(item)
-        console.print(t_hosts)
-    if blockchain["api_key_urls"]:
-        t_api = Table(title="RPC URLs With API Keys", show_header=True, box=box.SIMPLE)
-        t_api.add_column("URL", style="white", overflow="fold")
-        for item in blockchain["api_key_urls"]:
-            t_api.add_row(item)
-        console.print(t_api)
+    if any([blockchain["contracts"], blockchain["selectors"], blockchain["rpc_hosts"], blockchain["rpc_urls"], blockchain["api_key_urls"]]):
+        console.print(Rule("[bold blue]Blockchain Indicators"))
+        bt = Table(show_header=False, box=box.SIMPLE)
+        bt.add_row("Contracts", str(len(blockchain["contracts"])))
+        bt.add_row("Method selectors", str(len(blockchain["selectors"])))
+        bt.add_row("RPC hosts", str(len(blockchain["rpc_hosts"])))
+        bt.add_row("RPC URLs", str(len(blockchain["rpc_urls"])))
+        bt.add_row("RPC URLs with API keys", str(len(blockchain["api_key_urls"])))
+        console.print(bt)
+        if blockchain["contracts"]:
+            t_contract = Table(title="Contract Addresses", show_header=True, box=box.SIMPLE)
+            t_contract.add_column("Address", style="cyan")
+            for item in blockchain["contracts"]:
+                t_contract.add_row(item)
+            console.print(t_contract)
+        if blockchain["selectors"]:
+            t_sel = Table(title="Method Selectors", show_header=True, box=box.SIMPLE)
+            t_sel.add_column("Selector", style="yellow")
+            for item in blockchain["selectors"]:
+                t_sel.add_row(item)
+            console.print(t_sel)
+        if blockchain["rpc_hosts"]:
+            t_hosts = Table(title="RPC Hosts", show_header=True, box=box.SIMPLE)
+            t_hosts.add_column("Host", style="magenta")
+            for item in blockchain["rpc_hosts"]:
+                t_hosts.add_row(item)
+            console.print(t_hosts)
+        if blockchain["api_key_urls"]:
+            t_api = Table(title="RPC URLs With API Keys", show_header=True, box=box.SIMPLE)
+            t_api.add_column("URL", style="white", overflow="fold")
+            for item in blockchain["api_key_urls"]:
+                t_api.add_row(item)
+            console.print(t_api)
 
     console.print(Rule("[bold blue]Summary"))
     s = Table(show_header=False, box=None)
@@ -3522,6 +4635,11 @@ def main() -> int:
     if not root.is_dir():
         print(f"error: target is not a directory: {root}", file=sys.stderr)
         return 2
+
+    prepared_root = maybe_prepare_cwd_jar_scan_root(root, phase_logs, progress_console)
+    if prepared_root != root:
+        root = prepared_root
+        progress(phase_logs, f"target updated to extracted/decompiled directory: {root}", progress_console)
 
     if not args.json:
         if rich_progress_mode:
@@ -3648,37 +4766,164 @@ def main() -> int:
     if decrypt_profile is None:
         decrypt_profile = build_decrypt_profile(scan_root)
 
+    extra_scan_roots: List[tuple[Path, str]] = []
+    extra_scan_roots.extend(prepare_nested_dropped_jar_roots(scan_root, phase_logs, progress_console))
+    extra_scan_roots.extend(prepare_embedded_base32_archive_roots(scan_root, phase_logs, progress_console))
+    scan_targets: List[tuple[Path, str]] = [(scan_root, "")]
+    seen_target_roots = {str(scan_root.resolve())}
+    for target_root, prefix in extra_scan_roots:
+        key = str(target_root.resolve())
+        if key in seen_target_roots:
+            continue
+        seen_target_roots.add(key)
+        scan_targets.append((target_root, prefix))
+
     progress(phase_logs, "collecting target metadata", progress_console)
     target_metadata = collect_target_metadata(scan_root)
     progress(phase_logs, "discovering Java files", progress_console)
-    files = list(iter_java_files(scan_root))
-    progress(phase_logs, f"found {len(files)} Java file(s)", progress_console)
+    file_jobs: List[tuple[Path, Path, str]] = []
+    class_jobs: List[tuple[Path, Path, str]] = []
+    target_java_counts: dict[str, int] = {}
+    target_class_counts: dict[str, int] = {}
+    target_finding_counts: dict[str, int] = {}
+    target_scan_mode: dict[str, str] = {}
+    for target_root, prefix in scan_targets:
+        java_list = list(iter_java_files(target_root))
+        class_list = list(iter_class_files(target_root))
+        root_key = str(target_root.resolve())
+        target_java_counts[root_key] = len(java_list)
+        target_class_counts[root_key] = len(class_list)
+        target_finding_counts[root_key] = 0
+        target_scan_mode[root_key] = "java" if java_list else ("class_constant_pool_fallback" if class_list else "none")
+        for file_path in java_list:
+            file_jobs.append((file_path, target_root, prefix))
+        if not java_list and class_list:
+            for class_path in class_list:
+                class_jobs.append((class_path, target_root, prefix))
+    progress(
+        phase_logs,
+        f"found {len(file_jobs)} Java file(s) and {len(class_jobs)} fallback class file(s) across {len(scan_targets)} scan target(s)",
+        progress_console,
+    )
 
     all_findings: List[Finding] = []
     behavior_findings: List[BehaviorFinding] = []
+    scan_total = len(file_jobs) + len(class_jobs)
     if rich_progress_mode:
         with Progress(
             SpinnerColumn(style="cyan"),
-            TextColumn("[bold cyan]Scanning Java files"),
+            TextColumn("[bold cyan]Scanning sources"),
             BarColumn(bar_width=30),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             console=progress_console,
             transient=False,
         ) as prog:
-            task = prog.add_task("scan", total=len(files))
-            for file_path in files:
-                all_findings.extend(scan_file(file_path, scan_root, decrypt_profile, include_all_literals=decrypt_mode))
-                behavior_findings.extend(scan_behavior(file_path, scan_root))
+            task = prog.add_task("scan", total=scan_total)
+            for file_path, target_root, prefix in file_jobs:
+                f_items = scan_file(file_path, target_root, decrypt_profile, include_all_literals=decrypt_mode)
+                b_items = scan_behavior(file_path, target_root)
+                all_findings.extend(_apply_prefix_findings(f_items, prefix))
+                behavior_findings.extend(_apply_prefix_behaviors(b_items, prefix))
+                target_finding_counts[str(target_root.resolve())] = target_finding_counts.get(str(target_root.resolve()), 0) + len(f_items)
+                prog.advance(task)
+            for class_path, target_root, prefix in class_jobs:
+                c_items = scan_class_constant_pool(class_path, target_root)
+                all_findings.extend(_apply_prefix_findings(c_items, prefix))
+                target_finding_counts[str(target_root.resolve())] = target_finding_counts.get(str(target_root.resolve()), 0) + len(c_items)
                 prog.advance(task)
     else:
-        for idx, file_path in enumerate(files, start=1):
-            if show_progress and (idx == 1 or idx % 50 == 0 or idx == len(files)):
-                progress(show_progress, f"scanning file {idx}/{len(files)}", progress_console)
-            all_findings.extend(scan_file(file_path, scan_root, decrypt_profile, include_all_literals=decrypt_mode))
-            behavior_findings.extend(scan_behavior(file_path, scan_root))
+        for idx, (file_path, target_root, prefix) in enumerate(file_jobs, start=1):
+            if show_progress and (idx == 1 or idx % 50 == 0 or idx == scan_total):
+                progress(show_progress, f"scanning source {idx}/{scan_total}", progress_console)
+            f_items = scan_file(file_path, target_root, decrypt_profile, include_all_literals=decrypt_mode)
+            b_items = scan_behavior(file_path, target_root)
+            all_findings.extend(_apply_prefix_findings(f_items, prefix))
+            behavior_findings.extend(_apply_prefix_behaviors(b_items, prefix))
+            target_finding_counts[str(target_root.resolve())] = target_finding_counts.get(str(target_root.resolve()), 0) + len(f_items)
+        for class_idx, (class_path, target_root, prefix) in enumerate(class_jobs, start=len(file_jobs) + 1):
+            if show_progress and (class_idx == 1 or class_idx % 50 == 0 or class_idx == scan_total):
+                progress(show_progress, f"scanning source {class_idx}/{scan_total}", progress_console)
+            c_items = scan_class_constant_pool(class_path, target_root)
+            all_findings.extend(_apply_prefix_findings(c_items, prefix))
+            target_finding_counts[str(target_root.resolve())] = target_finding_counts.get(str(target_root.resolve()), 0) + len(c_items)
 
-    behavior_findings.extend(discover_structural_behaviors(scan_root))
+    for target_root, prefix in scan_targets:
+        behavior_findings.extend(_apply_prefix_behaviors(discover_structural_behaviors(target_root), prefix))
+        root_key = str(target_root.resolve())
+        java_count = target_java_counts.get(root_key, 0)
+        class_count = target_class_counts.get(root_key, 0)
+        find_count = target_finding_counts.get(root_key, 0)
+        mode = target_scan_mode.get(root_key, "unknown")
+        if java_count == 0 and class_count > 0:
+            behavior_findings.extend(
+                _apply_prefix_behaviors(
+                    [
+                        BehaviorFinding(
+                            file=".",
+                            line=1,
+                            behavior="class_constant_pool_only_scan",
+                            evidence=f"No Java source files recovered; scanned {class_count} class file(s) via constant-pool fallback",
+                        ),
+                        BehaviorFinding(
+                            file=".",
+                            line=1,
+                            behavior="decompiler_failure_or_heavy_obfuscation",
+                            evidence=(
+                                "Decompiler did not recover Java source files; used class constant-pool fallback scan "
+                                f"(class_files={class_count})"
+                            ),
+                        ),
+                    ],
+                    prefix,
+                )
+            )
+        elif java_count == 0 and class_count == 0:
+            behavior_findings.extend(
+                _apply_prefix_behaviors(
+                    [
+                        BehaviorFinding(
+                            file=".",
+                            line=1,
+                            behavior="decompiler_failure_or_heavy_obfuscation",
+                            evidence="Decompiler output appears unavailable/garbled; no Java or class files recovered for static scan",
+                        )
+                    ],
+                    prefix,
+                )
+            )
+        elif java_count > 0 and find_count == 0:
+            behavior_findings.extend(
+                _apply_prefix_behaviors(
+                    [
+                        BehaviorFinding(
+                            file=".",
+                            line=1,
+                            behavior="decompiler_failure_or_heavy_obfuscation",
+                            evidence=(
+                                "Decompiled output yielded zero string/decode findings despite recovered Java files; "
+                                f"likely heavy string/control-flow obfuscation or low-quality decompiler output "
+                                f"(java_files={java_count}, class_files={class_count}, scan_mode={mode})"
+                            ),
+                        )
+                    ],
+                    prefix,
+                )
+            )
+    am = target_metadata.get("jar_info", {}).get("archive_metadata", {}) or {}
+    if int(am.get("contained_directories", 0)) >= 1000 or int(am.get("max_directory_depth", 0)) >= 1000:
+        behavior_findings.append(
+            BehaviorFinding(
+                file=".",
+                line=1,
+                behavior="extreme_archive_structure_obfuscation",
+                evidence=(
+                    "Archive metadata shows extreme directory topology "
+                    f"(contained_directories={am.get('contained_directories', 0)} "
+                    f"max_directory_depth={am.get('max_directory_depth', 0)})"
+                ),
+            )
+        )
     behavior_findings = sorted(
         {(b.file, b.line, b.behavior, b.evidence): b for b in behavior_findings}.values(),
         key=lambda x: (x.file, x.line, x.behavior),
@@ -3687,7 +4932,13 @@ def main() -> int:
     progress(phase_logs, f"collected {len(all_findings)} decode/string finding(s)", progress_console)
     progress(phase_logs, f"detected {len(behavior_findings)} behavior indicator(s)", progress_console)
     progress(phase_logs, "discovering suspicious artifacts", progress_console)
-    artifact_findings = discover_artifacts(scan_root)
+    artifact_findings: List[ArtifactFinding] = []
+    for target_root, prefix in scan_targets:
+        artifact_findings.extend(_apply_prefix_artifacts(discover_artifacts(target_root), prefix))
+    artifact_findings = sorted(
+        {(a.path, a.filename, a.size, a.sha256, a.artifact_type, a.evidence): a for a in artifact_findings}.values(),
+        key=lambda x: x.path,
+    )
     progress(phase_logs, f"detected {len(artifact_findings)} artifact indicator(s)", progress_console)
     runtime_c2 = {"attempted": False, "resolved": False}
     stage2_analysis = {
@@ -3737,6 +4988,16 @@ def main() -> int:
         blockchain = extract_blockchain_indicators(all_findings)
         payload = {
             "root": str(scan_root),
+            "scan_roots": [str(x[0]) for x in scan_targets],
+            "scan_diagnostics": {
+                str(tr): {
+                    "java_files": target_java_counts.get(str(tr), 0),
+                    "class_files": target_class_counts.get(str(tr), 0),
+                    "finding_count": target_finding_counts.get(str(tr), 0),
+                    "scan_mode": target_scan_mode.get(str(tr), "unknown"),
+                }
+                for tr, _prefix in scan_targets
+            },
             "target_metadata": target_metadata,
             "scan_mode": "post_decryption_only" if decrypt_mode else "standard",
             "deobfuscation": deobf_stats if deobf_stats else {},
@@ -3792,3 +5053,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
