@@ -16,16 +16,21 @@ It recursively scans `.java` files, deobfuscates known string call patterns, sca
 - Includes deterministic length-seeded XOR-stream candidate support used by common Java obfuscators.
 - Tracks deobfuscation stats (seen/replaced/unresolved, per-family counts, pass count).
 - Scans plain Java string literals for suspicious indicators (URLs, command execution strings, payload paths, encoded blobs, and keyword signals).
+- Reconstructs additional obfuscation patterns from source, including split `String[]` fragments, printable `byte[]`/`char[]` literals, and reversed `StringBuilder(...).reverse().toString()` forms.
 - Detects Discord indicators, including bot tokens, webhook URLs, and snowflake IDs (guiQld/channel/user/role/application).
+- Detects Discord Chromium encrypted-token marker payloads (`dQw4w9WgXcQ:<base64>`) and classifies them as credential-theft context.
 - Detects additional comms indicators, including Telegram bot tokens/API patterns and generic non-Discord webhook patterns.
 - Detects additional encoded literals (Base64/Base32/hex/XOR-recovered text where possible).
 - Classifies decoded strings (URL, RPC templates, credential fields, paths, crypto-related values, etc.).
+- Falls back to `.class` constant-pool scanning when decompiled `.java` sources are unavailable.
+- Expands scan roots by unpacking nested dropped JARs and embedded Base32 archive resources for recursive triage.
 - Flags behavior indicators such as:
   - dynamic class loading/invocation
   - HTTP payload download and exfiltration patterns
   - native payload extraction/loading
   - command execution and dropper/elevation helpers
   - CMSTP/UAC bypass and Defender tampering indicators
+- Adds explicit heavy-obfuscation/decompiler-failure and class-fallback diagnostic behaviors.
 - Splits assessment behavior findings into:
   - `benign`
   - `needs_review`
@@ -85,6 +90,7 @@ Discord-focused detection includes:
 - webhook URLs (`discord.com/api/webhooks/...`)
 - snowflake IDs (`17-20` digit IDs)
 - contextual IDs in literals containing labels like `guild_id`, `channel_id`, `user_id`, `role_id`, `application_id`
+- encrypted Chromium token marker blobs (`dQw4w9WgXcQ:<base64>`) commonly used in Discord token-stealer chains
 
 ## Minecraft Session File Access Detection
 
@@ -226,6 +232,7 @@ Text output includes:
 - Stage2 Analysis status (including manual payload URL guidance and static-only stage-2 metadata/findings when enabled)
 - Blockchain Indicators summary (contracts, method selectors, RPC hosts/URLs)
 - Summary counts (including high-risk findings, high-risk behaviors, assessment counts, category totals, behavior severity totals)
+- Scan diagnostics for multi-root/fallback scans (root-level Java/class counts and scan mode in JSON output)
 - Decryption-aware summary counters:
   - `XOR decrypted strings`
   - `Other decrypted strings`
@@ -246,6 +253,17 @@ JSON output structure:
 ```json
 {
   "root": "scanned/path",
+  "scan_roots": [
+    "scanned/path"
+  ],
+  "scan_diagnostics": {
+    "scanned/path": {
+      "java_files": 0,
+      "class_files": 0,
+      "finding_count": 0,
+      "scan_mode": "java"
+    }
+  },
   "scan_mode": "post_decryption_only",
   "deobfuscation": {
     "calls_seen": 0,
@@ -321,7 +339,9 @@ JSON output structure:
 
 - This is a triage helper, not a full malware sandbox or decompiler.
 - The deobfuscation stage is deterministic and heuristic-based; unsupported custom routines may still remain unresolved.
+- Class-constant fallback mode (used when no `.java` files are recovered) provides useful indicators but less semantic context than full source scanning.
 - Behavioral detections are signature/heuristic based and may produce false positives or miss novel techniques.
 - Network-based runtime C2 resolution (`eth_call`) is best-effort and may fail due to missing indicators, RPC issues, or decoding variance.
 - Metadata enrichments (`SSDEEP`/`TLSH`/`TrID`/`Magika`/`Vhash`) are best-effort and only appear when dependencies are present.
+- Nested archive/payload extraction is heuristic and best-effort; highly custom packers may still evade static expansion.
 - Do NOT rely on this as a means to ensure your safety with any java application.
