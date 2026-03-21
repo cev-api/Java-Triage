@@ -11,11 +11,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 from urllib import error, request
 from urllib.parse import urlparse
 try:
@@ -203,6 +204,9 @@ BEHAVIOR_SEVERITY_MAP = {
     "token_use_profile_key_or_user_api_setup": "low",
     "remote_config_rpc_with_signature": "medium",
     "obfuscated_short_classname_cluster": "low",
+    "proof_token_source_to_network_sink": "high",
+    "proof_raw_token_logging": "high",
+    "capability_token_access": "medium",
 }
 
 MINECRAFT_AUTH_HOSTS = {
@@ -212,6 +216,50 @@ MINECRAFT_AUTH_HOSTS = {
     "xsts.auth.xboxlive.com",
     "api.minecraftservices.com",
 }
+VENDOR_HOST_ALLOWLIST = {
+    "login.live.com",
+    "login.microsoftonline.com",
+    "device.auth.xboxlive.com",
+    "user.auth.xboxlive.com",
+    "xsts.auth.xboxlive.com",
+    "api.minecraftservices.com",
+    "pc.realms.minecraft.net",
+    "pocket.realms.minecraft.net",
+    "minecraft.playfabapi.com",
+    "api.keygen.sh",
+    "discord.com",
+    "discordapp.com",
+    "github.com",
+    "api.github.com",
+}
+KNOWN_LIBRARY_PREFIXES = {
+    "raphimc_minecraftauth": ["net/raphimc/minecraftauth/"],
+    "discord_rpc": ["net/arikia/dev/drpc/"],
+    "lenni_httpclient": ["net/lenni0451/commons/httpclient/"],
+    "lenni_gson": ["net/lenni0451/commons/gson/"],
+    "gson": ["com/google/gson/"],
+    "fabric": ["net/fabricmc/", "fabric/"],
+    "org_json": ["org/json/"],
+    "jna": ["com/sun/jna/"],
+}
+RAW_STRING_PATTERNS = [
+    ("erawaggin", "Reversed 'niggaware' string", 50),
+    ("erawoobmab", "Reversed 'bambooware' string", 50),
+    ("DirectPlayerDetector", "Niggaware thread name", 25),
+    ("performance-tweaks", "Niggaware mod ID", 25),
+    ("Add-MpPreference", "Defender exclusion command", 30),
+    ("dev.github.Main", "Silentnet stage2 entry", 30),
+    ("Mod init state: M", "Weedhack debug string", 30),
+    ("Resource state: S", "Weedhack debug string", 30),
+    ("method_1674", "MC accessToken accessor", 20),
+    ("method_1676", "MC username accessor", 20),
+    ("method_44717", "MC UUID accessor", 20),
+    ("eth_call", "Ethereum RPC call", 15),
+    ("0x70a08231", "Ethereum balanceOf selector", 15),
+    ("Wscript.Shell", "Windows Script Host", 20),
+    ("powershell", "PowerShell execution", 15),
+    ("RuntimeBroker", "Process masquerading as RuntimeBroker", 20),
+]
 
 AUTO_DECRYPT_TRIGGER_MIN_CALLS = 1
 AUTO_DECRYPT_TRIGGER_MIN_FILE_RATIO = 0.0
@@ -219,6 +267,79 @@ AUTO_DECRYPT_TRIGGER_MIN_FILES_WITH_CALLS = 1
 MAJOR_ENCRYPTED_MIN_CALLS = 200
 MAJOR_ENCRYPTED_MIN_FILE_RATIO = 0.20
 MAJOR_ENCRYPTED_MIN_FILES_WITH_CALLS = 5
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+RATTERSCANNER_HASH_URL = "https://api.ratterscanner.com/hash/"
+OPENAI_EXEC_SUMMARY_INSTRUCTION = (
+    "Parse the JSON and create an executive summary of the result detailing the flow of the malware "
+    "or application (if clean) and its capabilities, risks, goal. Keep it technical but understandable "
+    "for both layman and professional. Max 500 words."
+)
+
+
+def _is_sha256_hex(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-fA-F0-9]{64}", (value or "").strip()))
+
+
+def collect_ratterscanner_hashes(
+    target_metadata: dict,
+    artifacts: List[Any],
+    stage2_analysis: dict | None = None,
+    scan_root: Path | None = None,
+) -> List[str]:
+    out: List[str] = []
+    basic = (target_metadata or {}).get("basic_properties", {}) or {}
+    s = str(basic.get("sha256", "") or "").strip().lower()
+    if _is_sha256_hex(s):
+        out.append(s)
+    for a in artifacts or []:
+        h = str(getattr(a, "sha256", "") or "").strip().lower()
+        if _is_sha256_hex(h):
+            out.append(h)
+    s2 = stage2_analysis or {}
+    h2 = str(s2.get("download_sha256", "") or "").strip().lower()
+    if _is_sha256_hex(h2):
+        out.append(h2)
+    if scan_root is not None:
+        marker = scan_root / ".java_triage_source_jar_sha256.txt"
+        if marker.is_file():
+            try:
+                m = marker.read_text(encoding="utf-8", errors="replace").strip().lower()
+                if _is_sha256_hex(m):
+                    out.append(m)
+            except Exception:
+                pass
+    dedup: List[str] = []
+    seen: set[str] = set()
+    for h in out:
+        if h in seen:
+            continue
+        seen.add(h)
+        dedup.append(h)
+    return dedup[:50]
+
+
+def lookup_ratterscanner(hashes: List[str], timeout: int = 20) -> dict:
+    valid = [h.strip().lower() for h in hashes if _is_sha256_hex(h)]
+    out = {"attempted": False, "error": "", "results": []}
+    if not valid:
+        return out
+    out["attempted"] = True
+    try:
+        url = RATTERSCANNER_HASH_URL + ",".join(valid)
+        req = request.Request(url, method="GET", headers={"User-Agent": "java-triage/1.0"})
+        with request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if isinstance(data, dict) and isinstance(data.get("results"), list):
+            out["results"] = data.get("results") or []
+            return out
+        if isinstance(data, dict) and data.get("error"):
+            out["error"] = str(data.get("error"))
+            return out
+        out["error"] = "invalid response format"
+        return out
+    except Exception as exc:
+        out["error"] = _friendly_network_error(exc)
+        return out
 
 
 @dataclass
@@ -1655,36 +1776,130 @@ def _is_generated_droppedjar_path(path: Path) -> bool:
     return any(part.lower().endswith("_droppedjar") for part in path.parts)
 
 
-def _decompile_and_extract_jar_with_fernflower(
+def _is_tool_jar_name(name: str) -> bool:
+    low = name.lower()
+    return (
+        low.startswith("cfr-")
+        or low == "cfr.jar"
+        or low == "fernflower.jar"
+        or low.startswith("vineflower-")
+    )
+
+
+def _write_source_jar_metadata(scan_dir: Path, source_jar: Path) -> None:
+    try:
+        st = source_jar.stat()
+        meta = {
+            "name": source_jar.name,
+            "size_bytes": int(st.st_size),
+            "size_text": _human_size(int(st.st_size)),
+            "md5": _hash_file(source_jar, "md5"),
+            "sha1": _hash_file(source_jar, "sha1"),
+            "sha256": _hash_file(source_jar, "sha256"),
+        }
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        (scan_dir / ".java_triage_source_jar_metadata.json").write_text(
+            json.dumps(meta, indent=2),
+            encoding="utf-8",
+        )
+        (scan_dir / ".java_triage_source_jar_sha256.txt").write_text(meta["sha256"], encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _find_cfr_jar(cwd: Path) -> Path | None:
+    direct = cwd / "cfr-0.152.jar"
+    if direct.is_file():
+        return direct
+    candidates = sorted(
+        [p for p in cwd.glob("cfr*.jar") if p.is_file()],
+        key=lambda p: p.name.lower(),
+    )
+    return candidates[0] if candidates else None
+
+
+def _decompile_jar_with_cfr(
     jar_path: Path,
     out_dir: Path,
-    fernflower_path: Path,
+    cfr_path: Path,
     show_progress: bool,
     progress_console=None,
 ) -> tuple[bool, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    progress(show_progress, f"decompiling nested jar with fernflower: {jar_path}", progress_console)
-    cp = subprocess.run(
-        ["java", "-jar", str(fernflower_path), str(jar_path), str(out_dir)],
-        capture_output=True,
-        text=True,
-        check=False,
+    cp = _run_subprocess_with_progress(
+        ["java", "-jar", str(cfr_path), str(jar_path), "--outputdir", str(out_dir)],
+        f"CFR decompiling {jar_path.name}",
+        show_progress,
+        progress_console,
     )
     if cp.returncode != 0:
         err = (cp.stderr or cp.stdout or "").strip()
-        return False, f"fernflower failed for {jar_path.name}: {err}" if err else f"fernflower failed for {jar_path.name}"
-
-    produced_jars = [p for p in out_dir.glob("*.jar") if p.is_file()]
-    if not produced_jars:
-        return False, f"fernflower produced no jar for {jar_path.name}"
-
-    matching_name = [p for p in produced_jars if p.name.lower() == jar_path.name.lower()]
-    decompiled_jar = max((matching_name or produced_jars), key=lambda p: p.stat().st_mtime)
-    progress(show_progress, f"extracting decompiled nested jar: {decompiled_jar.name}", progress_console)
-    extract_summary = _safe_extract_jar(decompiled_jar, out_dir)
-    if extract_summary.get("error"):
-        return False, f"extract failed for {jar_path.name}: {extract_summary.get('error')}"
+        return False, f"CFR failed for {jar_path.name}: {err}" if err else f"CFR failed for {jar_path.name}"
+    if not any(out_dir.rglob("*.java")):
+        return False, f"CFR produced no Java sources for {jar_path.name}"
+    _write_source_jar_metadata(out_dir, jar_path)
     return True, ""
+
+
+def _run_subprocess_with_progress(
+    args: List[str],
+    label: str,
+    show_progress: bool,
+    progress_console=None,
+) -> subprocess.CompletedProcess:
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8", errors="replace", delete=False) as out_f:
+        out_name = out_f.name
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8", errors="replace", delete=False) as err_f:
+        err_name = err_f.name
+
+    try:
+        with open(out_name, "w", encoding="utf-8", errors="replace") as out_h, open(
+            err_name, "w", encoding="utf-8", errors="replace"
+        ) as err_h:
+            proc = subprocess.Popen(
+                args,
+                stdout=out_h,
+                stderr=err_h,
+                text=True,
+            )
+            start = time.time()
+            if show_progress and RICH_AVAILABLE and progress_console is not None:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]{task.description}"),
+                    BarColumn(bar_width=32),
+                    TimeElapsedColumn(),
+                    console=progress_console,
+                    transient=False,
+                    refresh_per_second=8,
+                ) as prog:
+                    task_id = prog.add_task(label, total=None)
+                    while proc.poll() is None:
+                        time.sleep(0.12)
+                        prog.update(task_id, description=f"{label} ({int(time.time() - start)}s)")
+            else:
+                last = -1
+                while proc.poll() is None:
+                    if show_progress:
+                        elapsed = int(time.time() - start)
+                        if elapsed != last and elapsed % 2 == 0:
+                            progress(True, f"{label} ({elapsed}s)", progress_console)
+                            last = elapsed
+                    time.sleep(0.15)
+            rc = proc.wait()
+
+        out = Path(out_name).read_text(encoding="utf-8", errors="replace")
+        err = Path(err_name).read_text(encoding="utf-8", errors="replace")
+        return subprocess.CompletedProcess(args, rc, out, err)
+    finally:
+        try:
+            Path(out_name).unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            Path(err_name).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _prefix_rel_path(prefix: str, rel: str) -> str:
@@ -1746,9 +1961,9 @@ def _apply_prefix_artifacts(items: List[ArtifactFinding], prefix: str) -> List[A
 
 
 def prepare_nested_dropped_jar_roots(scan_root: Path, show_progress: bool, progress_console=None) -> List[tuple[Path, str]]:
-    fernflower = Path.cwd().resolve() / "fernflower.jar"
-    if not fernflower.is_file():
-        progress(show_progress, "nested dropped-jar scan skipped: fernflower.jar not found in cwd", progress_console)
+    cfr = _find_cfr_jar(Path.cwd().resolve())
+    if cfr is None:
+        progress(show_progress, "nested dropped-jar scan skipped: CFR jar not found in cwd", progress_console)
         return []
 
     jar_candidates = sorted(
@@ -1756,7 +1971,7 @@ def prepare_nested_dropped_jar_roots(scan_root: Path, show_progress: bool, progr
             p
             for p in scan_root.rglob("*.jar")
             if p.is_file()
-            and p.name.lower() != "fernflower.jar"
+            and not _is_tool_jar_name(p.name)
             and not p.name.lower().endswith("_droppedjar.jar")
             and not _is_generated_droppedjar_path(p.parent)
         ],
@@ -1780,7 +1995,7 @@ def prepare_nested_dropped_jar_roots(scan_root: Path, show_progress: bool, progr
                 continue
             preferred = _resolve_unique_dir(preferred)
 
-        ok, err = _decompile_and_extract_jar_with_fernflower(jar_path, preferred, fernflower, show_progress, progress_console)
+        ok, err = _decompile_jar_with_cfr(jar_path, preferred, cfr, show_progress, progress_console)
         if not ok:
             progress(show_progress, f"nested dropped-jar preparation failed: {err}", progress_console)
             continue
@@ -1794,9 +2009,9 @@ def prepare_nested_dropped_jar_roots(scan_root: Path, show_progress: bool, progr
 
 
 def prepare_embedded_base32_archive_roots(scan_root: Path, show_progress: bool, progress_console=None) -> List[tuple[Path, str]]:
-    fernflower = Path.cwd().resolve() / "fernflower.jar"
-    if not fernflower.is_file():
-        progress(show_progress, "embedded archive scan skipped: fernflower.jar not found in cwd", progress_console)
+    cfr = _find_cfr_jar(Path.cwd().resolve())
+    if cfr is None:
+        progress(show_progress, "embedded archive scan skipped: CFR jar not found in cwd", progress_console)
         return []
 
     out: List[tuple[Path, str]] = []
@@ -1854,7 +2069,7 @@ def prepare_embedded_base32_archive_roots(scan_root: Path, show_progress: bool, 
                 progress(show_progress, f"failed writing decoded embedded jar {jar_out}: {exc}", progress_console)
                 continue
 
-            ok, err = _decompile_and_extract_jar_with_fernflower(jar_out, out_dir, fernflower, show_progress, progress_console)
+            ok, err = _decompile_jar_with_cfr(jar_out, out_dir, cfr, show_progress, progress_console)
             if not ok:
                 progress(show_progress, f"embedded dropped-jar preparation failed: {err}", progress_console)
                 continue
@@ -3075,7 +3290,7 @@ def _compute_vhash(path: Path) -> str:
 
 
 def _find_primary_jar(root: Path) -> Path | None:
-    jars = [p for p in root.rglob("*.jar") if p.is_file()]
+    jars = [p for p in root.rglob("*.jar") if p.is_file() and not _is_tool_jar_name(p.name)]
     if not jars:
         return None
     return max(jars, key=lambda p: p.stat().st_size)
@@ -3147,7 +3362,9 @@ def _archive_metadata_from_jar(jar_path: Path) -> dict:
 
 
 def collect_target_metadata(root: Path) -> dict:
-    primary_jar = _find_primary_jar(root)
+    # For directory scans, report the directory as the primary subject.
+    # JAR-level metadata is only used when explicitly scanning a JAR workflow directory.
+    primary_jar = None
     total_size = 0
     earliest_ts = None
     latest_ts = None
@@ -3176,9 +3393,22 @@ def collect_target_metadata(root: Path) -> dict:
     by_type["DIRECTORY"] = dir_count
     by_type = dict(sorted(by_type.items(), key=lambda x: (-x[1], x[0])))
     by_ext = dict(sorted(by_ext.items(), key=lambda x: (-x[1], x[0])))
+    source_jar_meta = {}
+    marker = root / ".java_triage_source_jar_metadata.json"
+    if marker.is_file():
+        try:
+            raw = json.loads(marker.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(raw, dict):
+                source_jar_meta = raw
+        except Exception:
+            source_jar_meta = {}
 
     basic = {
-        "subject": str(primary_jar.relative_to(root)) if primary_jar else str(root),
+        "subject": (
+            str(primary_jar.relative_to(root))
+            if primary_jar
+            else ("cwd" if root.resolve() == Path.cwd().resolve() else (root.name or "scan"))
+        ),
         "md5": "",
         "sha1": "",
         "sha256": "",
@@ -3214,6 +3444,22 @@ def collect_target_metadata(root: Path) -> dict:
     else:
         basic["file_size_text"] = _human_size(total_size)
         basic["file_size_bytes"] = total_size
+        # If this directory originated from CFR decompile of a JAR, surface its identity metadata.
+        if source_jar_meta:
+            basic["subject"] = str(source_jar_meta.get("name", basic["subject"]) or basic["subject"])
+            basic["md5"] = str(source_jar_meta.get("md5", "") or "")
+            basic["sha1"] = str(source_jar_meta.get("sha1", "") or "")
+            basic["sha256"] = str(source_jar_meta.get("sha256", "") or "")
+            basic["file_type"] = "JAR"
+            basic["compressed"] = "jar"
+            basic["magic"] = "Zip archive data (JAR)"
+            try:
+                sb = int(source_jar_meta.get("size_bytes", 0) or 0)
+                if sb > 0:
+                    basic["file_size_bytes"] = sb
+                    basic["file_size_text"] = _human_size(sb)
+            except Exception:
+                pass
 
     manifest = _read_manifest_from_jar(primary_jar) if primary_jar else _read_manifest_from_dir(root)
     if primary_jar:
@@ -3245,11 +3491,68 @@ def collect_target_metadata(root: Path) -> dict:
         "contained_files_by_type": by_type,
         "contained_files_by_extension": by_ext,
     }
+    artifact_identity = build_artifact_identity(root, source_jar_meta)
+    library_fingerprints = fingerprint_known_libraries(root)
 
     return {
         "basic_properties": basic,
+        "source_jar_metadata": source_jar_meta,
+        "artifact_identity": artifact_identity,
+        "library_fingerprints": library_fingerprints,
         "jar_info": jar_info,
         "bundle_info": bundle_info,
+    }
+
+
+def build_artifact_identity(root: Path, source_jar_meta: dict) -> dict:
+    root_hash = hashlib.sha256()
+    file_count = 0
+    try:
+        files = sorted([p for p in root.rglob("*") if p.is_file()], key=lambda p: str(p).lower())
+        for p in files:
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            if rel.startswith(".java_triage_source_jar_"):
+                continue
+            file_count += 1
+            root_hash.update(rel.encode("utf-8", errors="replace"))
+            root_hash.update(b"\x00")
+            root_hash.update(str(int(p.stat().st_size)).encode("ascii"))
+            root_hash.update(b"\x00")
+            with p.open("rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    root_hash.update(chunk)
+    except Exception:
+        return {"error": "failed to compute tree identity"}
+    return {
+        "scan_root_name": root.name or "scan",
+        "scan_root_tree_sha256": root_hash.hexdigest(),
+        "scan_root_file_count": file_count,
+        "source_jar": source_jar_meta or {},
+    }
+
+
+def fingerprint_known_libraries(root: Path) -> dict:
+    counts = {k: 0 for k in KNOWN_LIBRARY_PREFIXES.keys()}
+    samples = {k: [] for k in KNOWN_LIBRARY_PREFIXES.keys()}
+    for p in iter_java_files(root):
+        rel = str(p.relative_to(root)).replace("\\", "/").lower()
+        for lib, prefixes in KNOWN_LIBRARY_PREFIXES.items():
+            if any(rel.startswith(prefix) for prefix in prefixes):
+                counts[lib] += 1
+                if len(samples[lib]) < 5:
+                    samples[lib].append(rel)
+                break
+    present = {
+        lib: {"java_files": counts[lib], "sample_paths": samples[lib]}
+        for lib in counts
+        if counts[lib] > 0
+    }
+    return {
+        "detected": sorted(present.keys()),
+        "libraries": present,
     }
 
 
@@ -3599,11 +3902,556 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
                 out["payload_endpoint"] = f"{c2_url}/files/jar/module"
             return out
         except Exception as exc:
-            out["error"] = str(exc)
+            out["error"] = _friendly_network_error(exc)
             continue
     if not out["resolved"] and not out["error"]:
         out["error"] = "unable to decode runtime c2 response"
     return out
+
+
+def assess_network_endpoints(findings: List[Finding]) -> dict:
+    urls = sorted({f.decoded for f in findings if f.category == "url" and URL_RE.match(str(f.decoded))})
+    vendor: List[str] = []
+    unknown: List[str] = []
+    suspicious: List[str] = []
+    for u in urls:
+        host = urlparse(u).netloc.lower()
+        if not host:
+            continue
+        is_ip = bool(re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", host))
+        if host in VENDOR_HOST_ALLOWLIST or any(host.endswith("." + d) for d in VENDOR_HOST_ALLOWLIST):
+            vendor.append(u)
+        elif is_ip or any(k in host for k in ["ngrok", "pastebin", "telegram", "webhook", "duckdns", "no-ip"]):
+            suspicious.append(u)
+        else:
+            unknown.append(u)
+    return {
+        "total_urls": len(urls),
+        "vendor_urls": vendor,
+        "unknown_urls": unknown,
+        "suspicious_urls": suspicious,
+        "vendor_count": len(vendor),
+        "unknown_count": len(unknown),
+        "suspicious_count": len(suspicious),
+    }
+
+
+def detect_token_source_sink_behaviors(root: Path) -> List[BehaviorFinding]:
+    out: List[BehaviorFinding] = []
+    token_markers = [
+        "accesstoken",
+        "refresh_token",
+        "xbl",
+        "session.json",
+        "launcher_accounts.json",
+        "authorization",
+        "bearer ",
+    ]
+    sink_markers = [
+        "httpurlconnection",
+        "setrequestmethod(\"post\")",
+        "getoutputstream(",
+        ".execute(",
+        "new url(",
+    ]
+    for p in iter_java_files(root):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        low = text.lower()
+        rel = str(p.relative_to(root))
+        has_source = any(m in low for m in token_markers)
+        has_sink = any(m in low for m in sink_markers)
+        if has_source:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=1,
+                    behavior="capability_token_access",
+                    evidence="File references session/token identity material",
+                )
+            )
+        if has_source and has_sink:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=1,
+                    behavior="proof_token_source_to_network_sink",
+                    evidence="Token/session source markers appear in same file as concrete HTTP send primitives",
+                )
+            )
+        if "raw token" in low and ("log." in low or "logger." in low or "print" in low):
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=1,
+                    behavior="proof_raw_token_logging",
+                    evidence="Raw token string appears in logging/print context",
+                )
+            )
+    return out
+
+
+def _read_text_safe(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _build_source_index(root: Path) -> dict:
+    java_files = list(iter_java_files(root))
+    rel_paths = [str(p.relative_to(root)).replace("\\", "/") for p in java_files]
+    texts = {rel: _read_text_safe(root / rel) for rel in rel_paths}
+    simple_to_rel: dict[str, List[str]] = {}
+    for rel in rel_paths:
+        simple_to_rel.setdefault(Path(rel).stem, []).append(rel)
+    return {"rel_paths": rel_paths, "texts": texts, "simple_to_rel": simple_to_rel}
+
+
+def detect_variant_signatures(root: Path) -> dict:
+    idx = _build_source_index(root)
+    rel_paths: List[str] = idx["rel_paths"]
+    texts: dict[str, str] = idx["texts"]
+    simple_to_rel: dict[str, List[str]] = idx["simple_to_rel"]
+
+    def has_class(name: str) -> bool:
+        return name in simple_to_rel
+
+    def any_text_contains(needle: str) -> tuple[bool, str]:
+        low_n = needle.lower()
+        for rel, text in texts.items():
+            if low_n in text.lower():
+                return True, rel
+        return False, ""
+
+    def count_package(prefix: str) -> int:
+        p = prefix.lower().replace("\\", "/")
+        return sum(1 for rel in rel_paths if rel.lower().startswith(p))
+
+    def add_match(matches: list, category: str, description: str, weight: int, file_path: str = "") -> None:
+        matches.append(
+            {"category": category, "description": description, "weight": int(weight), "file_path": file_path}
+        )
+
+    variants: List[dict] = []
+
+    # Weedhack-v3
+    wm: List[dict] = []
+    we_mal: set[str] = set()
+    combo = ["ExampleMod", "Helper", "FabricAdapter", "Entrypoint", "ExampleMixin"]
+    present = [c for c in combo if has_class(c)]
+    if len(present) >= 3:
+        add_match(wm, "signature", f"Weedhack class combination ({len(present)}/5): {', '.join(present)}", 40)
+        for c in ["Helper", "FabricAdapter", "Entrypoint"]:
+            for rel in simple_to_rel.get(c, []):
+                we_mal.add(rel)
+    if (root / "fabric.api.json").is_file() and "api_version" in _read_text_safe(root / "fabric.api.json").lower():
+        add_match(wm, "signature", "fabric.api.json with 'api_version' (buyer tracking config)", 40, "fabric.api.json")
+        we_mal.add("fabric.api.json")
+    ok, rel = any_text_contains("Mod init state: M")
+    if ok:
+        add_match(wm, "string", "Debug string 'Mod init state: M'", 35, rel)
+    ok, rel = any_text_contains("Resource state: S")
+    if ok:
+        add_match(wm, "string", "Debug string 'Resource state: S'", 35, rel)
+    ok, rel = any_text_contains("SHA256withRSA")
+    if ok:
+        add_match(wm, "string", "RSA signature verification 'SHA256withRSA'", 30, rel)
+    if wm:
+        variants.append(
+            {
+                "variant": "Weedhack-v3",
+                "confidence_score": int(sum(m["weight"] for m in wm)),
+                "matches": wm,
+                "malicious_entries": sorted(we_mal),
+            }
+        )
+
+    # AdamRAT
+    am: List[dict] = []
+    ad_mal: set[str] = set()
+    ok, rel = any_text_contains("vindduaptdqxujr")
+    if ok:
+        add_match(am, "signature", "AdamRAT string pool builder method 'vindduaptdqxujr'", 50, rel)
+    ok, rel = any_text_contains("daleoxrvhs")
+    if ok:
+        add_match(am, "signature", "AdamRAT XOR decrypt method 'daleoxrvhs'", 50, rel)
+    ok, rel = any_text_contains("ptbjqryxcd")
+    if ok:
+        add_match(am, "signature", "AdamRAT string pool field 'ptbjqryxcd'", 50, rel)
+    if (root / "lk1gs64i84.txt").is_file():
+        add_match(am, "signature", "AdamRAT buyer tracking file 'lk1gs64i84.txt'", 50, "lk1gs64i84.txt")
+        ad_mal.add("lk1gs64i84.txt")
+    if (root / "META-INF" / "a1b2c3d4").is_file():
+        add_match(am, "signature", "AdamRAT metadata artifact 'META-INF/a1b2c3d4'", 40, "META-INF/a1b2c3d4")
+        ad_mal.add("META-INF/a1b2c3d4")
+    ok, rel = any_text_contains("klavs-mazins.workers.dev")
+    if ok:
+        add_match(am, "string", "AdamRAT C2 endpoint 'ez.klavs-mazins.workers.dev'", 50, rel)
+        ad_mal.add(rel)
+    if am:
+        variants.append(
+            {
+                "variant": "AdamRAT",
+                "confidence_score": int(sum(m["weight"] for m in am)),
+                "matches": am,
+                "malicious_entries": sorted(ad_mal),
+            }
+        )
+
+    # Bambooware
+    bm: List[dict] = []
+    bb_mal: set[str] = set()
+    enh = [r for r in rel_paths if "com/example/enhancer/" in r.lower()]
+    if enh:
+        add_match(bm, "signature", f"Package com/example/enhancer/ found ({len(enh)} classes)", 50, enh[0])
+        bb_mal.update(enh)
+    for s, w, d in [
+        ("bambooware", 30, "String 'bambooware' found"),
+        ("Add-MpPreference", 35, "Defender exclusion string 'Add-MpPreference'"),
+        ("cmstp", 25, "UAC bypass string 'cmstp'"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(bm, "string", d, w, rel)
+    if (root / "config.json").is_file() and "userid" in _read_text_safe(root / "config.json").lower():
+        add_match(bm, "signature", "config.json with 'userid' field (buyer tracking)", 30, "config.json")
+        bb_mal.add("config.json")
+    if bm:
+        variants.append(
+            {
+                "variant": "Bambooware",
+                "confidence_score": int(sum(m["weight"] for m in bm)),
+                "matches": bm,
+                "malicious_entries": sorted(bb_mal),
+            }
+        )
+
+    # Curium
+    cm: List[dict] = []
+    cu_mal: set[str] = set()
+    futils = [r for r in rel_paths if "io/github/fabricutils/" in r.lower()]
+    curium_pkg = [r for r in rel_paths if "com/curium/" in r.lower()]
+    if futils:
+        add_match(cm, "signature", f"Curium dropper package io/github/fabricutils/ ({len(futils)} classes)", 50, futils[0])
+        cu_mal.update(futils)
+    if curium_pkg:
+        add_match(cm, "signature", f"Curium RAT package com/curium/ ({len(curium_pkg)} classes)", 50, curium_pkg[0])
+        cu_mal.update(curium_pkg)
+    for s, w, d in [
+        ("2f1c103b39044c312a0e", 50, "Encrypted 'curium.cfg' hex constant"),
+        ("curium.su", 50, "C2 domain 'curium.su'"),
+        ("[Curium]", 30, "Curium log prefix '[Curium]'"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(cm, "string", d, w, rel)
+    for res, w in [("curium.cfg", 40), ("curium.key", 30), ("A.txt", 15), ("cfg.json", 15)]:
+        if (root / res).is_file():
+            add_match(cm, "signature", f"Malicious resource file: {res}", w, res)
+            cu_mal.add(res)
+    if cm:
+        variants.append(
+            {
+                "variant": "Curium",
+                "confidence_score": int(sum(m["weight"] for m in cm)),
+                "matches": cm,
+                "malicious_entries": sorted(cu_mal),
+            }
+        )
+
+    # DonutSMP Session Stealer
+    dm: List[dict] = []
+    do_mal: set[str] = set()
+    donut_pkg = [r for r in rel_paths if "donut/utility/" in r.lower()]
+    if donut_pkg:
+        add_match(dm, "signature", f"Package donut/utility/ found ({len(donut_pkg)} classes)", 20, donut_pkg[0])
+    for s, w, d in [
+        ("api.donutsmp.dev", 50, "Typosquatted exfiltration domain: api.donutsmp.dev"),
+        ("X-Request-Id", 30, "Suspicious exfil header X-Request-Id"),
+        ("X-Forwarded-For", 30, "Suspicious exfil header X-Forwarded-For"),
+        ("initializeCacheRef", 20, "Session theft trigger method: initializeCacheRef"),
+        ("sendRetryRequest", 30, "Exfiltration method: sendRetryRequest"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(dm, "signature", d, w, rel)
+            if w >= 30:
+                do_mal.add(rel)
+    if dm:
+        variants.append(
+            {
+                "variant": "DonutSMP Session Stealer",
+                "confidence_score": int(sum(m["weight"] for m in dm)),
+                "matches": dm,
+                "malicious_entries": sorted(do_mal),
+            }
+        )
+
+    # Microstealer
+    mm: List[dict] = []
+    mi_mal: set[str] = set()
+    myth = [r for r in rel_paths if "qw/chudvvick/" in r.lower()]
+    if myth:
+        add_match(mm, "signature", f"Package qw/chudvvick/ found ({len(myth)} classes)", 60, myth[0])
+        mi_mal.update(myth)
+    for s, w, d in [
+        ("myth-private", 50, "Maven artifact: qw.chudvvick:myth-private"),
+        ("Main-Class: x", 25, "Suspicious Main-Class: x"),
+        ("sun/misc/Unsafe", 15, "sun.misc.Unsafe usage"),
+        ("AES/GCM/NoPadding", 15, "AES/GCM/NoPadding (Chrome credential decryption)"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(mm, "signature", d, w, rel)
+    if mm:
+        variants.append(
+            {
+                "variant": "Microstealer",
+                "confidence_score": int(sum(m["weight"] for m in mm)),
+                "matches": mm,
+                "malicious_entries": sorted(mi_mal),
+            }
+        )
+
+    # Niggaware
+    nm: List[dict] = []
+    ni_mal: set[str] = set()
+    loader_pkg = [r for r in rel_paths if "com/example/loader/" in r.lower()]
+    if loader_pkg:
+        add_match(nm, "signature", f"Package com/example/loader/ found ({len(loader_pkg)} classes)", 50, loader_pkg[0])
+        ni_mal.update(loader_pkg)
+    for s, w, d in [
+        ("erawaggin", 50, "Reversed niggaware URL string"),
+        ("DirectPlayerDetector", 20, "Thread name 'DirectPlayerDetector'"),
+        ("performance-tweaks", 25, "Logger string 'performance-tweaks'"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(nm, "signature", d, w, rel)
+    for res in ["A.txt", "accid.txt"]:
+        if (root / res).is_file():
+            add_match(nm, "signature", f"Malicious resource file: {res}", 20, res)
+            ni_mal.add(res)
+    if nm:
+        variants.append(
+            {
+                "variant": "Niggaware",
+                "confidence_score": int(sum(m["weight"] for m in nm)),
+                "matches": nm,
+                "malicious_entries": sorted(ni_mal),
+            }
+        )
+
+    # STRRAT
+    sm: List[dict] = []
+    st_mal: set[str] = set()
+    kd = [r for r in rel_paths if "kingdavid/" in r.lower()]
+    if kd:
+        add_match(sm, "signature", f"Package kingDavid/ found ({len(kd)} classes)", 50, kd[0])
+        st_mal.update(kd)
+    for s, w, d in [
+        ("kingDavid.FirstRun", 40, "Main-Class: kingDavid.FirstRun"),
+        ("ALLATORIxDEMO", 35, "Allatori obfuscator signature"),
+        ("api.ipify.org", 15, "External IP check: api.ipify.org"),
+        ("rw-encrypt", 25, "Ransomware command rw-encrypt"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(sm, "signature", d, w, rel)
+    if sm:
+        variants.append(
+            {
+                "variant": "STRRAT",
+                "confidence_score": int(sum(m["weight"] for m in sm)),
+                "matches": sm,
+                "malicious_entries": sorted(st_mal),
+            }
+        )
+
+    # SilentRaven
+    rvm: List[dict] = []
+    sr_mal: set[str] = set()
+    rav = [r for r in rel_paths if "com/silentraven/" in r.lower()]
+    if rav:
+        add_match(rvm, "signature", f"Package com/silentraven/ found ({len(rav)} classes)", 50, rav[0])
+        sr_mal.update(rav)
+    for s, w, d in [
+        ("api.telegram.org/bot", 35, "Telegram Bot API URL (exfil endpoint)"),
+        ("[SilentRaven]", 30, "Log prefix [SilentRaven]"),
+        ("Session Capture", 25, "Exfiltration format string 'Session Capture'"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(rvm, "signature", d, w, rel)
+            sr_mal.add(rel)
+    if (root / "META-INF" / "Mixins Handler").is_file():
+        add_match(rvm, "signature", "Encrypted payload: META-INF/Mixins Handler", 35, "META-INF/Mixins Handler")
+        sr_mal.add("META-INF/Mixins Handler")
+    if rvm:
+        variants.append(
+            {
+                "variant": "SilentRaven",
+                "confidence_score": int(sum(m["weight"] for m in rvm)),
+                "matches": rvm,
+                "malicious_entries": sorted(sr_mal),
+            }
+        )
+
+    # Silentnet
+    snm: List[dict] = []
+    si_mal: set[str] = set()
+    libmod = [r for r in rel_paths if "com/libmod/" in r.lower()]
+    if libmod:
+        add_match(snm, "signature", f"Package com/libmod/ found ({len(libmod)} classes)", 50, libmod[0])
+        si_mal.update(libmod)
+    for s, w, d in [
+        ("dev.github.Main", 40, "Stage2 class reference 'dev.github.Main'"),
+        ("eth_call", 25, "Ethereum RPC 'eth_call'"),
+        ("jsonrpc", 20, "JSON-RPC protocol string"),
+    ]:
+        ok, rel = any_text_contains(s)
+        if ok:
+            add_match(snm, "signature", d, w, rel)
+    if (root / "assets" / "libmod" / "rpchelper.dat").is_file():
+        add_match(snm, "signature", "Malicious resource: assets/libmod/rpchelper.dat", 50, "assets/libmod/rpchelper.dat")
+        si_mal.add("assets/libmod/rpchelper.dat")
+    if (root / "lang.dat").is_file():
+        add_match(snm, "signature", "Malicious resource: lang.dat", 20, "lang.dat")
+        si_mal.add("lang.dat")
+    if snm:
+        variants.append(
+            {
+                "variant": "Silentnet",
+                "confidence_score": int(sum(m["weight"] for m in snm)),
+                "matches": snm,
+                "malicious_entries": sorted(si_mal),
+            }
+        )
+
+    variants = [v for v in variants if v.get("confidence_score", 0) >= 30]
+    variants.sort(key=lambda x: (-int(x.get("confidence_score", 0)), x.get("variant", "")))
+    return {
+        "detected_count": len(variants),
+        "detected": variants,
+    }
+
+
+def run_raw_string_scanner(root: Path) -> List[dict]:
+    out: List[dict] = []
+    class_files = list(root.rglob("*.class"))
+    for cf in class_files:
+        try:
+            raw = cf.read_bytes()
+            text = raw.decode("latin-1", errors="ignore")
+        except Exception:
+            continue
+        rel = str(cf.relative_to(root)).replace("\\", "/")
+        low = text.lower()
+        for pattern, desc, weight in RAW_STRING_PATTERNS:
+            if pattern.lower() in low:
+                out.append(
+                    {
+                        "category": "string",
+                        "description": f"[RawScan] {desc}",
+                        "file_path": rel,
+                        "weight": int(weight),
+                        "pattern": pattern,
+                    }
+                )
+    dedup = {(x["file_path"], x["description"]): x for x in out}
+    return sorted(dedup.values(), key=lambda x: (-int(x.get("weight", 0)), x.get("file_path", "")))
+
+
+def run_cross_variant_heuristics(root: Path) -> List[dict]:
+    out: List[dict] = []
+    for p in iter_java_files(root):
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        t = _read_text_safe(p)
+        low = t.lower()
+
+        def add(desc: str, weight: int) -> None:
+            out.append({"category": "heuristic", "description": desc, "file_path": rel, "weight": int(weight)})
+
+        if "extends classloader" in low:
+            add("Custom ClassLoader extension", 25)
+        if "defineclass(" in low:
+            add("Calls defineClass (in-memory class loading)", 20)
+        if "jarinputstream" in low and "bytearrayinputstream" in low:
+            add("In-memory JAR loading (JarInputStream + ByteArrayInputStream)", 20)
+        if any(x in low for x in ["method_1674", "method_1676", "method_44717"]):
+            add("MC session theft indicators (accessToken/username/uuid refs)", 25)
+        if ("getmethod(" in low or "getdeclaredmethod(" in low) and ".invoke(" in low and any(
+            x in low for x in ["method_1548", "method_1674", "method_1676"]
+        ):
+            add("MC session theft via reflection", 30)
+        if "processbuilder" in low:
+            add("ProcessBuilder usage (command execution)", 10)
+        if ("httpurlconnection" in low or "httpclient" in low or "urlconnection" in low) and (
+            "readallbytes(" in low or "tobytearray(" in low
+        ):
+            add("HTTP download to byte array", 10)
+        if "base64" in low:
+            add("Base64 encoding/decoding", 10)
+        if any(x in low for x in ["hkey_", "software\\microsoft", "reg add"]):
+            add("Windows registry access", 15)
+        if "powershell" in low or "pwsh" in low:
+            add("PowerShell execution", 20)
+        if any(x in low for x in [".vbs", ".bat", "wscript"]):
+            add("Script file creation (VBS/BAT)", 15)
+        if "system.load(" in low or "system.loadlibrary(" in low:
+            add("Native library loading (System.load/loadLibrary)", 10)
+        if "api.telegram.org/bot" in low:
+            add("Telegram Bot API URL (common exfiltration channel)", 25)
+        if "discord.com/api/webhooks/" in low:
+            add("Discord webhook URL (common exfiltration channel)", 25)
+        if any(x in low for x in ["login data", "chrome", "user data", "logins.json", "key4.db", "signons.sqlite"]):
+            add("Browser credential database access", 20)
+        if "select" in low and any(x in low for x in ["from logins", "from cookies", "from moz_logins"]):
+            add("SQL query targeting credential/cookie tables", 20)
+        if any(x in low for x in ["sun/misc/unsafe", "jdk/internal/misc/unsafe"]):
+            add("sun.misc.Unsafe usage (low-level JVM memory access)", 10)
+        if "allatorixdemo" in low:
+            add("Allatori obfuscator signature (ALLATORIxDEMO)", 15)
+        if "getdeclaredfields(" in low and "setaccessible(" in low and any(
+            x in low for x in ["accesstoken", "sessiontoken", "authtoken"]
+        ):
+            add("Field brute-force targeting token fields", 20)
+        if "wmic" in low and ("csproduct" in low or "os get" in low):
+            add("WMI system information extraction", 15)
+        if "com/sun/jna/" in low:
+            add("JNA usage for native API calls", 10)
+        if any(x in low for x in ["ncrypt", "cryptunprotectdata", "ncryptopenstorageprovider"]):
+            add("Windows crypto API usage (NCrypt/DPAPI)", 20)
+        if "java/net/socket" in low and "getinputstream" in low and "getoutputstream" in low:
+            add("Raw socket communication (potential C2 channel)", 10)
+        if "java/net/http/websocket" in low:
+            add("WebSocket communication (potential C2 channel)", 10)
+        if ".workers.dev" in low:
+            add("Cloudflare Workers endpoint (common malware C2 platform)", 15)
+        if any(x in low for x in ["prismlauncher", "atlauncher", "gdlauncher", "modrinth.theseus"]) and (
+            "fileoutputstream" in low or "fileinputstream" in low
+        ):
+            add("Self-propagation to MC launcher directories", 25)
+        if any(x in low for x in ["discord.exe", "discordcanary.exe"]) and any(
+            x in low for x in ["discord_desktop_core", "index.js"]
+        ):
+            add("Discord token injection behavior", 25)
+        if any(x in low for x in ["metamask", "phantom", "trust wallet"]):
+            add("Cryptocurrency wallet data targeting", 20)
+        launcher_targets = sum(
+            int(x in low)
+            for x in ["launcher_accounts.json", ".lunarclient", "feather", "badlion"]
+        )
+        if launcher_targets >= 2:
+            add(f"Multi-launcher MC account theft ({launcher_targets} launchers targeted)", 20)
+        if ("setwindowshookex" in low or "wh_keyboard_ll" in low) and ("user32" in low or "com/sun/jna/" in low):
+            add("Native keyboard hook (keylogger via JNA/User32)", 20)
+
+    dedup = {(x["file_path"], x["description"]): x for x in out}
+    return sorted(dedup.values(), key=lambda x: (-int(x.get("weight", 0)), x.get("file_path", "")))
 
 
 def _safe_extract_jar(jar_path: Path, dest: Path, max_entries: int = 20000, max_bytes: int = 300 * 1024 * 1024) -> dict:
@@ -3696,7 +4544,7 @@ def analyze_stage2_payload(payload_url: str, timeout: int = 20) -> dict:
         out["artifact_findings"] = [a.__dict__ for a in artifacts]
         return out
     except Exception as exc:
-        out["error"] = str(exc)
+        out["error"] = _friendly_network_error(exc)
         return out
 
 
@@ -3897,6 +4745,11 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         behavior_severity_counts[behavior_severity(b.behavior)] += 1
 
     assessment_summary = summarize_assessments(behaviors)
+    proof_count = sum(1 for b in behaviors if b.behavior.startswith("proof_"))
+    capability_count = sum(1 for b in behaviors if b.behavior.startswith("capability_"))
+    suspicion_count = int(assessment_summary["counts"].get("suspicious", 0)) + sum(
+        1 for b in behaviors if behavior_severity(b.behavior) in {"critical", "high"} and not b.behavior.startswith("proof_")
+    )
     xor_decrypted_count = by_category.get("xor_decrypted_string", 0)
     decrypted_string_count = by_category.get("decrypted_string", 0)
     return {
@@ -3909,6 +4762,11 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         "behavior_findings": len(behaviors),
         "high_risk_behavior_count": behavior_severity_counts["critical"] + behavior_severity_counts["high"],
         "behavior_severity_counts": behavior_severity_counts,
+        "verdict_layers": {
+            "proof": proof_count,
+            "suspicion": suspicion_count,
+            "capability": capability_count,
+        },
         "artifact_findings": len(artifacts),
         "assessment_counts": assessment_summary["counts"],
     }
@@ -3959,12 +4817,21 @@ def render_text(
     runtime_c2: dict,
     target_metadata: dict,
     stage2_analysis: dict | None = None,
+    ratter_scanner: dict | None = None,
+    network_endpoint_assessment: dict | None = None,
+    variant_detections: dict | None = None,
+    raw_string_detections: List[dict] | None = None,
+    heuristic_detections: List[dict] | None = None,
 ) -> str:
     out = []
     blockchain = extract_blockchain_indicators(findings)
     basic = target_metadata.get("basic_properties", {})
     jar_info = target_metadata.get("jar_info", {})
     bundle_info = target_metadata.get("bundle_info", {})
+    artifact_identity = target_metadata.get("artifact_identity", {}) or {}
+    library_fingerprints = target_metadata.get("library_fingerprints", {}) or {}
+    artifact_identity = target_metadata.get("artifact_identity", {}) or {}
+    library_fingerprints = target_metadata.get("library_fingerprints", {}) or {}
 
     out.append("== Basic Properties ==")
     out.append(f"Subject: {basic.get('subject', '')}")
@@ -4016,6 +4883,20 @@ def render_text(
     out.append("Contained Files By Extension:")
     for k, v in bundle_info.get("contained_files_by_extension", {}).items():
         out.append(f"- {k}: {v}")
+    if artifact_identity:
+        out.append("")
+        out.append("== Artifact Identity ==")
+        out.append(f"Scan root name: {artifact_identity.get('scan_root_name', '')}")
+        out.append(f"Scan root tree SHA256: {artifact_identity.get('scan_root_tree_sha256', '')}")
+        out.append(f"Scan root file count: {artifact_identity.get('scan_root_file_count', 0)}")
+    out.append("")
+    out.append("== Library Fingerprints ==")
+    if library_fingerprints.get("detected"):
+        for lib in library_fingerprints.get("detected", []):
+            info = (library_fingerprints.get("libraries", {}) or {}).get(lib, {})
+            out.append(f"- {lib}: java_files={info.get('java_files', 0)}")
+    else:
+        out.append("- none detected")
 
     assessment = summarize_assessments(behaviors)
     if findings:
@@ -4050,6 +4931,22 @@ def render_text(
             hash_text = a.sha256 if a.sha256 else "<unknown>"
             out.append(f"[{a.artifact_type}] {a.path} filename={a.filename} size={size_text} sha256={hash_text} -> {a.evidence}")
 
+    net = network_endpoint_assessment or {}
+    out.append("")
+    out.append("== Network Endpoint Assessment ==")
+    out.append(
+        f"Total={net.get('total_urls', 0)} vendor={net.get('vendor_count', 0)} "
+        f"unknown={net.get('unknown_count', 0)} suspicious={net.get('suspicious_count', 0)}"
+    )
+    if net.get("suspicious_urls"):
+        out.append("Suspicious URLs:")
+        for u in net.get("suspicious_urls", [])[:20]:
+            out.append(f"- {u}")
+    if net.get("unknown_urls"):
+        out.append("Unknown URLs:")
+        for u in net.get("unknown_urls", [])[:20]:
+            out.append(f"- {u}")
+
     if runtime_c2.get("attempted"):
         out.append("")
         out.append("== Runtime C2 Resolution ==")
@@ -4077,6 +4974,42 @@ def render_text(
         else:
             out.append("Resolved: no")
             out.append(f"Error: {runtime_c2.get('error')}")
+
+    vd = variant_detections or {}
+    out.append("")
+    out.append("== Variant Detections ==")
+    out.append(f"Detected variants: {vd.get('detected_count', 0)}")
+    for item in vd.get("detected", []) or []:
+        out.append(f"- {item.get('variant')}: score={item.get('confidence_score', 0)} matches={len(item.get('matches', []))}")
+    out.append("")
+    out.append("== Raw String Detections ==")
+    rsd = raw_string_detections or []
+    out.append(f"Matches: {len(rsd)}")
+    for item in rsd[:30]:
+        out.append(f"- {item.get('file_path','')}: {item.get('description','')} (w={item.get('weight',0)})")
+    out.append("")
+    out.append("== Heuristic Detections ==")
+    hd = heuristic_detections or []
+    out.append(f"Matches: {len(hd)}")
+    for item in hd[:30]:
+        out.append(f"- {item.get('file_path','')}: {item.get('description','')} (w={item.get('weight',0)})")
+
+    rs = ratter_scanner or {}
+    if rs.get("attempted"):
+        out.append("")
+        out.append("== RatterScanner ==")
+        if rs.get("error"):
+            out.append(f"Error: {rs.get('error')}")
+        else:
+            rows = rs.get("results", []) or []
+            out.append(f"Results: {len(rows)}")
+            for item in rows:
+                h = item.get("hash", "")
+                safe = bool(item.get("safe", False))
+                mal = bool(item.get("malicious", False))
+                auto_safe = item.get("automated_safe", None)
+                auto_text = f" automated_safe={auto_safe}" if auto_safe is not None else ""
+                out.append(f"- {h}: safe={safe} malicious={mal}{auto_text}")
 
 
     s2 = stage2_analysis or {}
@@ -4163,6 +5096,380 @@ def render_text(
     return "\n".join(out)
 
 
+def _h(text: Any) -> str:
+    s = str(text if text is not None else "")
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _render_json_node_html(
+    node: Any,
+    title: str = "Root",
+    open_all: bool = False,
+    open_root: bool = True,
+    expanded_titles: set[str] | None = None,
+) -> str:
+    if not isinstance(node, (dict, list)):
+        return f"<div class='json-value'>{_h(node)}</div>"
+    expanded = {str(x).strip().lower() for x in (expanded_titles or set()) if str(x).strip()}
+    title_key = str(title).strip().lower()
+    should_open = open_all or open_root or (title_key in expanded)
+    open_attr = " open" if should_open else ""
+    html = [f"<details class='json-block'{open_attr}><summary>{_h(title)}</summary><div class='json-content'>"]
+    if isinstance(node, dict):
+        if not node:
+            html.append("<div class='json-empty'>empty</div>")
+        else:
+            for k, v in node.items():
+                if isinstance(v, (dict, list)):
+                    html.append(
+                        _render_json_node_html(
+                            v,
+                            str(k),
+                            open_all=open_all,
+                            open_root=False,
+                            expanded_titles=expanded_titles,
+                        )
+                    )
+                else:
+                    html.append(
+                        "<div class='json-row'>"
+                        f"<span class='json-key'>{_h(k)}</span>"
+                        f"<span class='json-val'>{_h(v)}</span>"
+                        "</div>"
+                    )
+    else:
+        if not node:
+            html.append("<div class='json-empty'>empty</div>")
+        else:
+            for i, v in enumerate(node):
+                key = f"[{i}]"
+                if isinstance(v, (dict, list)):
+                    html.append(
+                        _render_json_node_html(
+                            v,
+                            key,
+                            open_all=open_all,
+                            open_root=False,
+                            expanded_titles=expanded_titles,
+                        )
+                    )
+                else:
+                    html.append(
+                        "<div class='json-row'>"
+                        f"<span class='json-key'>{_h(key)}</span>"
+                        f"<span class='json-val'>{_h(v)}</span>"
+                        "</div>"
+                    )
+    html.append("</div></details>")
+    return "".join(html)
+
+
+def _has_nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 0
+    if isinstance(value, dict):
+        for v in value.values():
+            if _has_nonempty(v):
+                return True
+        return False
+    return True
+
+
+def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> str:
+    summary = payload.get("summary", {}) or {}
+    target_meta = payload.get("target_metadata", {}) or {}
+    target_meta_view = dict(target_meta)
+    artifact_identity = target_meta_view.get("artifact_identity", {}) or {}
+    source_jar_metadata = target_meta_view.get("source_jar_metadata", {}) or {}
+    source_jar_from_identity = artifact_identity.get("source_jar", {}) or {}
+    if source_jar_metadata and source_jar_from_identity and source_jar_metadata == source_jar_from_identity:
+        target_meta_view.pop("source_jar_metadata", None)
+    if artifact_identity.get("source_jar") and source_jar_metadata and artifact_identity.get("source_jar") == source_jar_metadata:
+        artifact_identity = dict(artifact_identity)
+        artifact_identity.pop("source_jar", None)
+        target_meta_view["artifact_identity"] = artifact_identity
+    basic = target_meta.get("basic_properties", {}) or {}
+    findings = payload.get("findings", []) or []
+    behaviors = payload.get("behavior_findings", []) or []
+    artifacts = payload.get("artifact_findings", []) or []
+    runtime = payload.get("runtime_c2", {}) or {}
+    stage2 = payload.get("stage2_analysis", {}) or {}
+    blockchain = payload.get("blockchain_indicators", {}) or {}
+    ratter = payload.get("ratter_scanner", {}) or {}
+    net_assess = payload.get("network_endpoint_assessment", {}) or {}
+    variant_detections = payload.get("variant_detections", {}) or {}
+    raw_string_detections = payload.get("raw_string_detections", []) or []
+    heuristic_detections = payload.get("heuristic_detections", []) or []
+    verdict_layers = summary.get("verdict_layers", {}) or {}
+    stage2_error = 1 if str((stage2 or {}).get("error", "")).strip() else 0
+    blockchain_count = sum(
+        len((blockchain or {}).get(k, []) or [])
+        for k in ["contracts", "selectors", "rpc_urls", "rpc_hosts", "api_key_urls"]
+    )
+    network_bad = int((net_assess or {}).get("unknown_count", 0) or 0) + int((net_assess or {}).get("suspicious_count", 0) or 0)
+    variant_count = int((variant_detections or {}).get("detected_count", 0) or 0)
+    raw_count = len(raw_string_detections)
+    heuristic_count = len(heuristic_detections)
+    ratter_bad = sum(1 for x in (ratter.get("results", []) or []) if bool(x.get("malicious", False)))
+    behavior_bad = int(summary.get("high_risk_behavior_count", 0) or 0)
+    finding_bad = int(summary.get("high_risk_count", 0) or 0)
+    artifact_bad = int(summary.get("artifact_findings", 0) or 0)
+    total_bad = (
+        finding_bad
+        + behavior_bad
+        + artifact_bad
+        + network_bad
+        + blockchain_count
+        + variant_count
+        + raw_count
+        + heuristic_count
+        + ratter_bad
+        + stage2_error
+    )
+    proof_count = int(verdict_layers.get("proof", 0) or 0)
+    if proof_count >= 1 or total_bad >= 80:
+        overall_label, overall_tone = "Critical", "critical"
+    elif total_bad >= 40:
+        overall_label, overall_tone = "High", "high"
+    elif total_bad >= 15:
+        overall_label, overall_tone = "Medium", "medium"
+    else:
+        overall_label, overall_tone = "Low", "low"
+
+    def cat_class(cat: str) -> str:
+        danger = {"url", "credential_or_identity_field", "dynamic_execution", "rpc_template", "path"}
+        warn = {"discord_indicator", "comms_indicator", "crypto_primitive", "base64_blob", "hex_or_contract"}
+        if cat in danger:
+            return "cat-danger"
+        if cat in warn:
+            return "cat-warn"
+        return "cat-neutral"
+
+    findings_limit = 200
+    behavior_limit = 200
+    artifact_limit = 200
+
+    rows_find = []
+    for r in findings[:1000]:
+        idx = len(rows_find)
+        cat = str(r.get("category", ""))
+        row_class = "row-high" if cat_class(cat) == "cat-danger" else ""
+        decoded_class = "decoded-high" if cat_class(cat) == "cat-danger" else ""
+        hidden_attr = " style='display:none' data-findings-extra='1'" if idx >= findings_limit else ""
+        rows_find.append(
+            f"<tr class='{row_class}'{hidden_attr}>"
+            f"<td class='tight'>{_h(r.get('file', ''))}</td>"
+            f"<td class='tight'>{_h(r.get('line', ''))}</td>"
+            f"<td class='func-col'>{_h(r.get('function', ''))}</td>"
+            f"<td class='cat-col'><span class='cat-pill {cat_class(cat)}'>{_h(cat)}</span></td>"
+            f"<td class='{decoded_class}'>{_h(r.get('decoded', ''))}</td>"
+            "</tr>"
+        )
+    rows_beh = []
+    for r in behaviors[:1000]:
+        idx = len(rows_beh)
+        hidden_attr = " style='display:none' data-behavior-extra='1'" if idx >= behavior_limit else ""
+        rows_beh.append(
+            f"<tr{hidden_attr}>"
+            f"<td class='tight'><span class='sev sev-{_h(r.get('severity', 'info'))}'>{_h(r.get('severity', 'info'))}</span></td>"
+            f"<td class='tight'>{_h(r.get('file', ''))}</td>"
+            f"<td class='tight'>{_h(r.get('line', ''))}</td>"
+            f"<td>{_h(r.get('behavior', ''))}</td>"
+            f"<td>{_h(r.get('evidence', ''))}</td>"
+            "</tr>"
+        )
+    rows_art = []
+    for r in artifacts[:1000]:
+        idx = len(rows_art)
+        hidden_attr = " style='display:none' data-artifact-extra='1'" if idx >= artifact_limit else ""
+        rows_art.append(
+            f"<tr{hidden_attr}>"
+            f"<td>{_h(r.get('filename', ''))}</td>"
+            f"<td>{_h(r.get('artifact_type', ''))}</td>"
+            f"<td>{_h(r.get('size', ''))}</td>"
+            f"<td>{_h(r.get('sha256', ''))}</td>"
+            f"<td>{_h(r.get('evidence', ''))}</td>"
+            "</tr>"
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Java Triage Report</title>
+  <style>
+    :root {{ --bg:#0a1622; --panel:#122235; --panel-soft:#193149; --text:#ebf2f8; --muted:#9eb2c5; --good:#6fd89b; --warn:#ffd166; --bad:#ff6b6b; --accent:#2ad0ff; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:"Segoe UI",Tahoma,Geneva,Verdana,sans-serif; background:radial-gradient(circle at top right,#1f3955,var(--bg) 55%); color:var(--text); min-height:100vh; }}
+    .wrap {{ width:min(1300px,96vw); margin:2rem auto; }}
+    .card {{ background:linear-gradient(160deg,var(--panel),var(--panel-soft)); border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:1.1rem; margin-bottom:1rem; box-shadow:0 16px 35px rgba(0,0,0,.28); }}
+    h1,h2,h3 {{ margin:.2rem 0 .6rem; }}
+    .triage-title {{ color:var(--accent); }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:.6rem; }}
+    .metric {{ background:rgba(10,24,38,.7); border:1px solid rgba(255,255,255,.08); border-radius:10px; padding:.6rem; }}
+    .label {{ color:var(--muted); font-size:.82rem; }}
+    .value {{ font-size:1.15rem; font-weight:700; margin-top:.2rem; }}
+    .hero {{ display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; align-items:flex-start; }}
+    .subject-card {{ margin-top:.75rem; border:1px solid rgba(255,255,255,.1); border-radius:12px; padding:.85rem 1rem; background:rgba(7,19,30,.45); }}
+    .subject-name {{ font-size:1.45rem; font-weight:800; margin-top:.12rem; }}
+    .subject-hash {{ margin-top:.5rem; font-family:Consolas,Monaco,monospace; color:#b9d4e7; font-size:.86rem; word-break:break-all; }}
+    .risk-chip {{ padding:.32rem .7rem; border-radius:999px; font-weight:700; border:1px solid transparent; display:inline-block; }}
+    .risk-critical {{ background:rgba(255,48,48,.28); border-color:rgba(255,93,93,.6); color:#ffd9d9; }}
+    .risk-high {{ background:rgba(255,106,54,.24); border-color:rgba(255,140,91,.55); color:#ffe5da; }}
+    .risk-medium {{ background:rgba(255,196,55,.22); border-color:rgba(255,210,102,.5); color:#fff2c9; }}
+    .risk-low {{ background:rgba(63,185,120,.2); border-color:rgba(109,217,158,.45); color:#d7f4e1; }}
+    .subgrid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:.5rem; margin-top:.6rem; }}
+    .kpi {{ border:1px solid rgba(255,255,255,.08); border-radius:8px; padding:.5rem; background:rgba(6,16,27,.5); }}
+    .kpi .k {{ color:var(--muted); font-size:.78rem; }}
+    .kpi .v {{ font-weight:800; font-size:1.02rem; margin-top:.15rem; }}
+    pre {{ overflow:auto; margin:0; white-space:pre-wrap; word-break:break-word; background:#0b1c2b; border-radius:10px; padding:.85rem; border:1px solid rgba(255,255,255,.06); font-size:.85rem; line-height:1.4; }}
+    .table-wrap {{ overflow:auto; border:1px solid rgba(255,255,255,.08); border-radius:10px; background:rgba(8,22,35,.72); }}
+    table {{ width:100%; border-collapse:collapse; font-size:.86rem; table-layout:auto; }}
+    th,td {{ text-align:left; padding:.55rem; border-bottom:1px dashed rgba(255,255,255,.08); vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }}
+    th {{ color:#9dd5ff; font-weight:700; background:rgba(0,0,0,.18); position:sticky; top:0; }}
+    th.tight,td.tight {{ white-space:nowrap; overflow-wrap:normal; word-break:normal; }}
+    .smart-table tbody tr:hover td {{ background:rgba(90,160,220,.08); }}
+    .smart-table tbody tr.row-high td:first-child {{ box-shadow:inset 3px 0 0 rgba(255,116,116,.85); }}
+    .decoded-high {{ color:#ffd1d1; font-weight:600; }}
+    .cat-pill {{ display:inline-block; padding:.15rem .5rem; border-radius:999px; font-size:.74rem; line-height:1.15; font-weight:700; border:1px solid transparent; max-width:100%; }}
+    .cat-pill {{ white-space:nowrap; }}
+    .cat-neutral {{ color:#d8e9f6; background:rgba(141,181,208,.14); border-color:rgba(149,194,224,.35); }}
+    .cat-warn {{ color:#ffecc3; background:rgba(255,196,77,.16); border-color:rgba(255,210,120,.4); }}
+    .cat-danger {{ color:#ffd4d4; background:rgba(255,91,91,.16); border-color:rgba(255,131,131,.42); }}
+    .sev {{ display:inline-block; padding:.12rem .45rem; border-radius:999px; font-size:.74rem; font-weight:700; text-transform:uppercase; letter-spacing:.02em; border:1px solid transparent; }}
+    .sev-critical {{ color:#ffd9d9; background:rgba(255,48,48,.28); border-color:rgba(255,93,93,.6); }}
+    .sev-high {{ color:#ffe5da; background:rgba(255,106,54,.24); border-color:rgba(255,140,91,.55); }}
+    .sev-medium {{ color:#fff2c9; background:rgba(255,196,55,.22); border-color:rgba(255,210,102,.5); }}
+    .sev-low {{ color:#d7f4e1; background:rgba(63,185,120,.2); border-color:rgba(109,217,158,.45); }}
+    .sev-info {{ color:#d9ecff; background:rgba(68,152,255,.18); border-color:rgba(120,184,255,.45); }}
+    .json-block {{ background:rgba(8,22,35,.72); border:1px solid rgba(255,255,255,.08); border-radius:10px; padding:.55rem .7rem; margin-bottom:.55rem; }}
+    .json-block summary {{ cursor:pointer; font-weight:700; color:var(--accent); margin-bottom:.35rem; }}
+    .json-content {{ padding-left:.2rem; }}
+    .json-row {{ display:grid; grid-template-columns:minmax(180px,280px) 1fr; gap:.8rem; padding:.28rem 0; border-bottom:1px dashed rgba(255,255,255,.08); }}
+    .json-row:last-child {{ border-bottom:0; }}
+    .json-key {{ color:#9dd5ff; font-family:Consolas,Monaco,monospace; word-break:break-word; }}
+    .json-val {{ color:#e9f2fa; font-family:Consolas,Monaco,monospace; word-break:break-word; }}
+    .json-empty {{ color:var(--muted); font-style:italic; padding:.2rem 0 .35rem; }}
+    .findings-controls {{ margin-top:.55rem; display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }}
+    .btn-link {{ display:inline-block; text-decoration:none; background:linear-gradient(120deg,#1ca4db,#58d5ff); color:#062134; border:none; border-radius:9px; padding:.45rem .75rem; font-weight:700; cursor:pointer; }}
+    .table-empty {{ color:var(--muted); }}
+    .findings-table col.file-col {{ width:30ch; }}
+    .findings-table col.line-col {{ width:6ch; }}
+    .findings-table col.func-col {{ width:18ch; }}
+    .findings-table col.cat-col {{ width:16ch; }}
+    .findings-table td.func-col, .findings-table th.func-col {{ white-space:nowrap; overflow-wrap:normal; word-break:normal; }}
+    .findings-table td.cat-col, .findings-table th.cat-col {{ white-space:nowrap; overflow-wrap:normal; word-break:normal; }}
+    .behavior-table col.sev-col {{ width:10ch; }}
+    .behavior-table col.file-col {{ width:28ch; }}
+    .behavior-table col.line-col {{ width:6ch; }}
+    .behavior-table col.beh-col {{ width:30ch; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="hero">
+        <div>
+          <h1>Java Triage Report</h1>
+          <div class="label">Total adverse indicators across all categories</div>
+          <div class="value">{_h(total_bad)}</div>
+        </div>
+        <div>
+          <div class="label">Overall Assessment</div>
+          <div class="risk-chip risk-{_h(overall_tone)}">{_h(overall_label)}</div>
+        </div>
+      </div>
+      <div class="subject-card">
+        <div class="label">Subject</div>
+        <div class="subject-name">{_h(basic.get("subject", ""))}</div>
+        {"<div class='subject-hash'>SHA256: " + _h(basic.get("sha256","")) + "</div>" if str(basic.get("sha256","")).strip() else ""}
+      </div>
+      <div class="grid" style="margin-top:.8rem;">
+        <div class="metric"><div class="label">Total Findings</div><div class="value">{_h(summary.get("total_findings", 0))}</div></div>
+        <div class="metric"><div class="label">High Risk Findings</div><div class="value">{_h(finding_bad)}</div></div>
+        <div class="metric"><div class="label">High Risk Behaviors</div><div class="value">{_h(behavior_bad)}</div></div>
+        <div class="metric"><div class="label">Artifact Flags</div><div class="value">{_h(artifact_bad)}</div></div>
+        <div class="metric"><div class="label">Proof Layer</div><div class="value">{_h(proof_count)}</div></div>
+        <div class="metric"><div class="label">Suspicion Layer</div><div class="value">{_h(verdict_layers.get("suspicion", 0))}</div></div>
+        <div class="metric"><div class="label">Capability Layer</div><div class="value">{_h(verdict_layers.get("capability", 0))}</div></div>
+      </div>
+      <div class="subgrid">
+        <div class="kpi"><div class="k">Stage2 Errors</div><div class="v">{_h(stage2_error)}</div></div>
+        <div class="kpi"><div class="k">Blockchain Indicators</div><div class="v">{_h(blockchain_count)}</div></div>
+        <div class="kpi"><div class="k">Network Unknown/Suspicious</div><div class="v">{_h(network_bad)}</div></div>
+        <div class="kpi"><div class="k">Variant Detections</div><div class="v">{_h(variant_count)}</div></div>
+        <div class="kpi"><div class="k">Raw String Detections</div><div class="v">{_h(raw_count)}</div></div>
+        <div class="kpi"><div class="k">Heuristic Detections</div><div class="v">{_h(heuristic_count)}</div></div>
+        <div class="kpi"><div class="k">RatterScanner Malicious</div><div class="v">{_h(ratter_bad)}</div></div>
+      </div>
+    </div>
+    {"<div class='card'><h2>Executive Summary</h2><pre>" + _h(executive_summary) + "</pre></div>" if executive_summary else ""}
+    {("<div class='card'><h2 class='triage-title'>Target Metadata</h2>" + _render_json_node_html(target_meta_view, "Target Metadata", open_all=False, open_root=True, expanded_titles={'target metadata', 'basic_properties'}) + "</div>") if _has_nonempty((target_meta_view or {}).get("basic_properties", {})) else ""}
+    {("<div class='card'><h2 class='triage-title'>Runtime C2</h2>" + _render_json_node_html(runtime, "Runtime C2", open_all=True, open_root=True) + "</div>") if _has_nonempty(runtime) else ""}
+    {("<div class='card'><h2 class='triage-title'>RatterScanner</h2>" + _render_json_node_html(ratter, "RatterScanner", open_all=True, open_root=True) + "</div>") if _has_nonempty(ratter) else ""}
+    {("<div class='card'><h2 class='triage-title'>Stage2 Analysis</h2>" + _render_json_node_html(stage2, "Stage2 Analysis", open_all=True, open_root=True) + "</div>") if _has_nonempty(stage2) else ""}
+    {("<div class='card'><h2 class='triage-title'>Blockchain Indicators</h2>" + _render_json_node_html(blockchain, "Blockchain Indicators", open_all=True, open_root=True) + "</div>") if _has_nonempty(blockchain) else ""}
+    {("<div class='card'><h2 class='triage-title'>Network Endpoint Assessment</h2>" + _render_json_node_html(net_assess, "Network Endpoint Assessment", open_all=True, open_root=True) + "</div>") if _has_nonempty(net_assess) else ""}
+    {("<div class='card'><h2 class='triage-title'>Variant Detections</h2>" + _render_json_node_html(variant_detections, "Variant Detections", open_all=True, open_root=True) + "</div>") if _has_nonempty((variant_detections or {}).get("detected", [])) else ""}
+    {("<div class='card'><h2 class='triage-title'>Raw String Detections</h2>" + _render_json_node_html(raw_string_detections, "Raw String Detections", open_all=True, open_root=True) + "</div>") if _has_nonempty(raw_string_detections) else ""}
+    {("<div class='card'><h2 class='triage-title'>Heuristic Detections</h2>" + _render_json_node_html(heuristic_detections, "Heuristic Detections", open_all=True, open_root=True) + "</div>") if _has_nonempty(heuristic_detections) else ""}
+    {("<div class='card'><h2 class='triage-title'>Decoded Findings</h2>"
+      "<div class='table-wrap'><table class='smart-table findings-table'><colgroup><col class='file-col'><col class='line-col'><col class='func-col'><col class='cat-col'><col></colgroup><thead><tr><th class='tight'>File</th><th class='tight'>Line</th><th class='func-col'>Function</th><th class='cat-col'>Category</th><th>Decoded</th></tr></thead><tbody>"
+      + "".join(rows_find) + "</tbody></table></div>"
+      + ("<div class='findings-controls' data-findings-controls='1' data-kind='findings' data-limit='200' data-step='200'><button type='button' class='btn-link findings-more-btn'>Show 200 more</button><button type='button' class='btn-link findings-all-btn'>Show all</button><div class='table-empty findings-toggle-status'>Showing first 200 of " + _h(len(rows_find)) + " rows.</div></div>" if len(rows_find) > findings_limit else "")
+      + "</div>") if rows_find else ""}
+    {("<div class='card'><h2 class='triage-title'>Behavior Indicators</h2>"
+      "<div class='table-wrap'><table class='smart-table behavior-table'><colgroup><col class='sev-col'><col class='file-col'><col class='line-col'><col class='beh-col'><col></colgroup><thead><tr><th class='tight'>Severity</th><th class='tight'>File</th><th class='tight'>Line</th><th>Behavior</th><th>Evidence</th></tr></thead><tbody>"
+      + "".join(rows_beh) + "</tbody></table></div>"
+      + ("<div class='findings-controls' data-findings-controls='1' data-kind='behavior' data-limit='200' data-step='200'><button type='button' class='btn-link findings-more-btn'>Show 200 more</button><button type='button' class='btn-link findings-all-btn'>Show all</button><div class='table-empty findings-toggle-status'>Showing first 200 of " + _h(len(rows_beh)) + " rows.</div></div>" if len(rows_beh) > behavior_limit else "")
+      + "</div>") if rows_beh else ""}
+    {("<div class='card'><h2 class='triage-title'>Artifact Indicators</h2>"
+      "<div class='table-wrap'><table class='smart-table'><thead><tr><th>Name</th><th>Type</th><th class='tight'>Size</th><th>SHA256</th><th>Evidence</th></tr></thead><tbody>"
+      + "".join(rows_art) + "</tbody></table></div>"
+      + ("<div class='findings-controls' data-findings-controls='1' data-kind='artifact' data-limit='200' data-step='200'><button type='button' class='btn-link findings-more-btn'>Show 200 more</button><button type='button' class='btn-link findings-all-btn'>Show all</button><div class='table-empty findings-toggle-status'>Showing first 200 of " + _h(len(rows_art)) + " rows.</div></div>" if len(rows_art) > artifact_limit else "")
+      + "</div>") if rows_art else ""}
+  </div>
+  <script>
+  (function () {{
+    var selectors = {{ findings: "tr[data-findings-extra='1']", behavior: "tr[data-behavior-extra='1']", artifact: "tr[data-artifact-extra='1']" }};
+    document.querySelectorAll("[data-findings-controls='1']").forEach(function (ctrl) {{
+      var kind = ctrl.getAttribute("data-kind") || "findings";
+      var limit = parseInt(ctrl.getAttribute("data-limit") || "200", 10);
+      var step = parseInt(ctrl.getAttribute("data-step") || "200", 10);
+      var rows = Array.prototype.slice.call(document.querySelectorAll(selectors[kind] || selectors.findings));
+      var shown = limit;
+      var moreBtn = ctrl.querySelector(".findings-more-btn");
+      var allBtn = ctrl.querySelector(".findings-all-btn");
+      var status = ctrl.querySelector(".findings-toggle-status");
+      function apply(count) {{
+        shown = count;
+        rows.forEach(function (row, idx) {{ row.style.display = idx < Math.max(0, shown - limit) ? "" : "none"; }});
+        var visible = Math.min(rows.length + limit, shown);
+        if (status) status.textContent = "Showing first " + Math.min(visible, rows.length + limit) + " of " + (rows.length + limit) + " rows.";
+        if (moreBtn) moreBtn.style.display = visible >= (rows.length + limit) ? "none" : "";
+        if (allBtn) allBtn.style.display = visible >= (rows.length + limit) ? "none" : "";
+      }}
+      if (moreBtn) moreBtn.addEventListener("click", function () {{ apply(shown + step); }});
+      if (allBtn) allBtn.addEventListener("click", function () {{ apply(rows.length + limit); }});
+      apply(limit);
+    }});
+  }})();
+  </script>
+</body>
+</html>"""
+
+
 def resolve_target(raw_target: str) -> Path:
     # On Windows shells users often pass "/" expecting "current folder".
     # Keep that behavior explicit to avoid scanning an entire drive root.
@@ -4202,8 +5509,8 @@ def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, pro
     if initial_root != cwd:
         return initial_root
 
-    fernflower = cwd / "fernflower.jar"
-    if not fernflower.is_file():
+    cfr = _find_cfr_jar(cwd)
+    if cfr is None:
         return initial_root
 
     jar_candidates = sorted(
@@ -4211,7 +5518,7 @@ def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, pro
             p
             for p in cwd.glob("*.jar")
             if p.is_file()
-            and p.name.lower() != "fernflower.jar"
+            and not _is_tool_jar_name(p.name)
             and not p.name.lower().endswith("_droppedjar.jar")
         ],
         key=lambda p: p.name.lower(),
@@ -4242,53 +5549,40 @@ def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, pro
             return initial_root
         progress(
             show_progress,
-            f"reusing existing extracted directory for {selected.name}: {out_dir}",
+            f"reusing existing extracted directory for {selected.name}: {_display_report_path(out_dir, cwd)}",
             progress_console,
         )
         return out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    progress(show_progress, f"decompiling {selected.name} with fernflower", progress_console)
-    cp = subprocess.run(
-        ["java", "-jar", str(fernflower), str(selected), str(out_dir)],
-        capture_output=True,
-        text=True,
-        check=False,
+    cp = _run_subprocess_with_progress(
+        ["java", "-jar", str(cfr), str(selected), "--outputdir", str(out_dir)],
+        f"CFR decompiling {selected.name}",
+        show_progress,
+        progress_console,
     )
     if cp.returncode != 0:
         err = (cp.stderr or cp.stdout or "").strip()
-        print(f"error: fernflower decompilation failed for {selected.name}", file=sys.stderr)
+        print(f"error: CFR decompilation failed for {selected.name}", file=sys.stderr)
         if err:
             print(err, file=sys.stderr)
         return initial_root
 
-    produced_jars = [p for p in out_dir.glob("*.jar") if p.is_file()]
-    if not produced_jars:
-        print(f"error: fernflower did not produce a decompiled JAR in {out_dir}", file=sys.stderr)
+    if not any(out_dir.rglob("*.java")):
+        print(f"error: CFR did not produce Java source in {out_dir}", file=sys.stderr)
         return initial_root
+    _write_source_jar_metadata(out_dir, selected)
 
-    matching_name = [p for p in produced_jars if p.name.lower() == selected.name.lower()]
-    decompiled_jar = max((matching_name or produced_jars), key=lambda p: p.stat().st_mtime)
-    progress(show_progress, f"extracting decompiled JAR: {decompiled_jar.name}", progress_console)
-    extract_summary = _safe_extract_jar(decompiled_jar, out_dir)
-    if extract_summary.get("error"):
-        print(f"error: failed to extract decompiled JAR: {extract_summary.get('error')}", file=sys.stderr)
-        return initial_root
-
-    progress(
-        show_progress,
-        f"jar workflow complete; scanning extracted directory: {out_dir}",
-        progress_console,
-    )
     return out_dir
 
 
 def progress(enabled: bool, message: str, console=None) -> None:
     if enabled:
+        msg = f"• {message}"
         if RICH_AVAILABLE and console is not None:
-            console.print(f"[progress] {message}", style="bold cyan", highlight=False)
+            console.print(msg, style="bold cyan", highlight=False)
         else:
-            print(f"[progress] {message}", file=sys.stderr, flush=True)
+            print(msg, file=sys.stderr, flush=True)
 
 
 def print_banner(console=None, to_stderr: bool = False) -> None:
@@ -4314,6 +5608,12 @@ def render_rich(
     runtime_c2: dict,
     target_metadata: dict,
     stage2_analysis: dict | None = None,
+    ratter_scanner: dict | None = None,
+    network_endpoint_assessment: dict | None = None,
+    variant_detections: dict | None = None,
+    raw_string_detections: List[dict] | None = None,
+    heuristic_detections: List[dict] | None = None,
+    executive_summary: str = "",
 ) -> None:
     def short(s: str, n: int = 220) -> str:
         return s if len(s) <= n else s[: n - 1] + "…"
@@ -4323,6 +5623,8 @@ def render_rich(
     basic = target_metadata.get("basic_properties", {})
     jar_info = target_metadata.get("jar_info", {})
     bundle_info = target_metadata.get("bundle_info", {})
+    artifact_identity = target_metadata.get("artifact_identity", {}) or {}
+    library_fingerprints = target_metadata.get("library_fingerprints", {}) or {}
 
     console.print(Rule("[bold blue]Basic Properties"))
     bt = Table(show_header=False, box=box.SIMPLE)
@@ -4391,6 +5693,24 @@ def render_rich(
         for k, v in b_ext.items():
             bet.add_row(str(k), str(v))
         console.print(bet)
+    console.print(Rule("[bold blue]Artifact Identity"))
+    ai = Table(show_header=False, box=box.SIMPLE)
+    ai.add_row("Scan Root Name", str(artifact_identity.get("scan_root_name", "")))
+    ai.add_row("Scan Root Tree SHA256", str(artifact_identity.get("scan_root_tree_sha256", "")))
+    ai.add_row("Scan Root File Count", str(artifact_identity.get("scan_root_file_count", 0)))
+    console.print(ai)
+    console.print(Rule("[bold blue]Library Fingerprints"))
+    lt = Table(show_header=True, box=box.SIMPLE)
+    lt.add_column("Library")
+    lt.add_column("Java Files", justify="right")
+    detected_libs = library_fingerprints.get("detected", []) or []
+    if detected_libs:
+        for lib in detected_libs:
+            info = (library_fingerprints.get("libraries", {}) or {}).get(lib, {})
+            lt.add_row(str(lib), str(info.get("java_files", 0)))
+    else:
+        lt.add_row("none", "0")
+    console.print(lt)
 
     if findings:
         console.print(Rule("[bold blue]Decode + String Findings"))
@@ -4444,6 +5764,21 @@ def render_rich(
             t.add_row(a.artifact_type, a.path, a.filename, size_text, short(hash_text, 18), short(a.evidence))
         console.print(t)
 
+    net = network_endpoint_assessment or {}
+    console.print(Rule("[bold blue]Network Endpoint Assessment"))
+    nt = Table(show_header=False, box=box.SIMPLE)
+    nt.add_row("Total URLs", str(net.get("total_urls", 0)))
+    nt.add_row("Vendor URLs", str(net.get("vendor_count", 0)))
+    nt.add_row("Unknown URLs", str(net.get("unknown_count", 0)))
+    nt.add_row("Suspicious URLs", str(net.get("suspicious_count", 0)))
+    console.print(nt)
+    if net.get("suspicious_urls"):
+        st = Table(title="Suspicious URLs", show_header=True, box=box.SIMPLE)
+        st.add_column("URL")
+        for u in net.get("suspicious_urls", [])[:20]:
+            st.add_row(str(u))
+        console.print(st)
+
     if runtime_c2.get("attempted"):
         console.print(Rule("[bold blue]Runtime C2 Resolution"))
         if runtime_c2.get("resolved"):
@@ -4471,6 +5806,92 @@ def render_rich(
         else:
             console.print("[red]Resolved:[/red] no")
             console.print(f"Error: {runtime_c2.get('error')}")
+
+    vd = variant_detections or {}
+    console.print(Rule("[bold blue]Variant Detections"))
+    vdt = Table(show_header=True, box=box.SIMPLE)
+    vdt.add_column("Variant")
+    vdt.add_column("Score", justify="right")
+    vdt.add_column("Matches", justify="right")
+    detected = vd.get("detected", []) or []
+    if detected:
+        for item in detected:
+            vdt.add_row(str(item.get("variant", "")), str(item.get("confidence_score", 0)), str(len(item.get("matches", []) or [])))
+    else:
+        vdt.add_row("none", "0", "0")
+    console.print(vdt)
+    console.print(Rule("[bold blue]Raw String Detections"))
+    rsd = raw_string_detections or []
+    rst = Table(show_header=True, box=box.SIMPLE)
+    rst.add_column("Weight", justify="right")
+    rst.add_column("File")
+    rst.add_column("Description")
+    if rsd:
+        for item in rsd[:60]:
+            rst.add_row(str(item.get("weight", 0)), str(item.get("file_path", "")), str(item.get("description", "")))
+    else:
+        rst.add_row("0", "-", "none")
+    console.print(rst)
+    console.print(Rule("[bold blue]Heuristic Detections"))
+    hd = heuristic_detections or []
+    hdt = Table(show_header=True, box=box.SIMPLE)
+    hdt.add_column("Weight", justify="right")
+    hdt.add_column("File")
+    hdt.add_column("Description")
+    if hd:
+        for item in hd[:60]:
+            hdt.add_row(str(item.get("weight", 0)), str(item.get("file_path", "")), str(item.get("description", "")))
+    else:
+        hdt.add_row("0", "-", "none")
+    console.print(hdt)
+
+    rs = ratter_scanner or {}
+    if rs.get("attempted"):
+        console.print(Rule("[bold blue]RatterScanner"))
+        if rs.get("error"):
+            console.print(f"[red]Error:[/red] {rs.get('error')}")
+        else:
+            tr = Table(show_lines=False, box=box.SIMPLE, expand=True)
+            tr.add_column("Hash", style="white")
+            tr.add_column("Safe", style="green")
+            tr.add_column("Automated Safe", style="cyan")
+            tr.add_column("Malicious", style="red")
+            tr.add_column("File", style="yellow")
+            for item in rs.get("results", []) or []:
+                safe_val = bool(item.get("safe", False))
+                malicious_val = bool(item.get("malicious", False))
+                automated_safe_raw = item.get("automated_safe", None)
+                unknown_triplet = (
+                    safe_val is False
+                    and malicious_val is False
+                    and automated_safe_raw is False
+                )
+
+                if unknown_triplet:
+                    safe_text = "[blue]false[/blue]"
+                    automated_safe_text = "[blue]false[/blue]"
+                    malicious_text = "[blue]false[/blue]"
+                else:
+                    if malicious_val:
+                        malicious_text = "[red]true[/red]"
+                        safe_text = f"[red]{str(safe_val).lower()}[/red]"
+                    else:
+                        malicious_text = "false"
+                        safe_text = "[green]true[/green]" if safe_val else "false"
+                    if automated_safe_raw is None:
+                        automated_safe_text = ""
+                    elif bool(automated_safe_raw):
+                        automated_safe_text = "[green]true[/green]"
+                    else:
+                        automated_safe_text = "false"
+                tr.add_row(
+                    str(item.get("hash", "")),
+                    safe_text,
+                    automated_safe_text,
+                    malicious_text,
+                    str(item.get("fileName", "")),
+                )
+            console.print(tr)
 
 
     s2 = stage2_analysis or {}
@@ -4577,6 +5998,133 @@ def render_rich(
         for sev, count in summary["behavior_severity_counts"].items():
             b.add_row(sev, str(count))
         console.print(b)
+    if executive_summary:
+        console.print(Rule("[bold blue]Executive Summary"))
+        console.print(executive_summary)
+
+
+def _infer_default_output_stem(scan_root: Path, cwd: Path) -> str:
+    if scan_root.resolve() != cwd.resolve():
+        return _sanitize_label(scan_root.name or "scan") or "scan"
+    best_name = ""
+    best_count = 0
+    try:
+        for d in cwd.iterdir():
+            if not d.is_dir():
+                continue
+            if d.name.startswith(".") or d.name.lower() in {"__pycache__"}:
+                continue
+            cnt = sum(1 for _ in d.rglob("*.java"))
+            if cnt > best_count:
+                best_count = cnt
+                best_name = d.name
+    except Exception:
+        pass
+    if best_name:
+        return _sanitize_label(best_name) or "scan"
+    return _sanitize_label(scan_root.name or "scan") or "scan"
+
+
+def _json_output_name_for_scan_root(scan_root: Path, cwd: Path) -> str:
+    name = _infer_default_output_stem(scan_root, cwd)
+    safe = _sanitize_label(name) or "scan"
+    return f"{safe}.json"
+
+
+def _html_output_name_for_scan_root(scan_root: Path, cwd: Path) -> str:
+    name = _infer_default_output_stem(scan_root, cwd)
+    safe = _sanitize_label(name) or "scan"
+    return f"{safe}.html"
+
+
+def _display_report_path(path: Path, cwd: Path) -> str:
+    try:
+        p = path.resolve()
+        c = cwd.resolve()
+    except Exception:
+        return "cwd"
+    if p == c:
+        return "cwd"
+    try:
+        rel = p.relative_to(c)
+        rel_s = str(rel).replace("\\", "/")
+        return f"cwd/{rel_s}" if rel_s else "cwd"
+    except Exception:
+        return p.name or "cwd"
+
+
+def _extract_responses_output_text(payload: dict[str, Any]) -> str:
+    text = payload.get("output_text", "")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    chunks: List[str] = []
+    for item in payload.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") in {"output_text", "text"}:
+                val = content.get("text", "")
+                if isinstance(val, str) and val.strip():
+                    chunks.append(val.strip())
+    return "\n\n".join(chunks).strip()
+
+
+def _friendly_network_error(exc: Exception) -> str:
+    msg = str(exc or "").strip()
+    low = msg.lower()
+    if "getaddrinfo failed" in low or "name or service not known" in low:
+        return "Connection failed: could not resolve host"
+    if "timed out" in low or "timeout" in low:
+        return "Connection failed: request timed out"
+    if "connection refused" in low:
+        return "Connection failed: remote host refused connection"
+    if "forbidden" in low or "http error 403" in low:
+        return "Connection failed: remote server denied request (HTTP 403)"
+    if "http error" in low:
+        return f"Connection failed: {msg}"
+    return f"Connection failed: {msg or exc.__class__.__name__}"
+
+
+def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return ""
+    compact_json = json.dumps(triage_payload, ensure_ascii=False, separators=(",", ":"))
+    max_chars = 120000
+    if len(compact_json) > max_chars:
+        compact_json = compact_json[:max_chars] + "...<truncated>"
+    user_text = (
+        OPENAI_EXEC_SUMMARY_INSTRUCTION
+        + "\n\nTriage JSON (truncated where necessary):\n"
+        + compact_json
+    )
+    req_body = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": "You are a senior malware analyst. Be concise, structured, and objective."}],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+        ],
+    }
+    try:
+        req = request.Request(
+            OPENAI_RESPONSES_URL,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(req_body).encode("utf-8"),
+        )
+        with request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    return _extract_responses_output_text(data)
 
 
 def main() -> int:
@@ -4584,14 +6132,25 @@ def main() -> int:
         description="Java Triage: recursively parse Java files, decode load(new int[]{...}) obfuscation, scan suspicious strings, and summarize findings."
     )
     p.add_argument("target", nargs="?", default=".", help="Folder to scan (default: current directory)")
-    p.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    p.add_argument("--json", action="store_true", default=True, help="Emit JSON output (default: enabled)")
+    p.add_argument("--no-json", dest="json", action="store_false", help="Emit text output instead of JSON")
     p.add_argument("--out", help="Write output to file")
+    p.add_argument("--html", action="store_true", default=True, help="Also emit HTML report (default: enabled)")
+    p.add_argument("--no-html", dest="html", action="store_false", help="Disable HTML report output")
+    p.add_argument("--html-out", help="Write HTML report to file (implies --html)")
     p.add_argument("--no-progress", action="store_true", help="Disable progress messages")
     p.add_argument("--no-network", action="store_true", help="Disable runtime C2 resolution over network")
     p.add_argument(
         "--analyze-stage2",
         action="store_true",
-        help="After resolving runtime payload endpoint, download stage-2 JAR and perform static-only analysis (never executes jars/classes)",
+        default=True,
+        help="After resolving runtime payload endpoint, download stage-2 JAR and perform static-only analysis (never executes jars/classes) (default: enabled)",
+    )
+    p.add_argument(
+        "--no-analyze-stage2",
+        dest="analyze_stage2",
+        action="store_false",
+        help="Disable stage-2 static analysis",
     )
     p.add_argument(
         "--rich-width",
@@ -4627,7 +6186,14 @@ def main() -> int:
     report_console = Console(width=pref_width) if RICH_AVAILABLE else None
     rich_progress_mode = bool(RICH_AVAILABLE and progress_console is not None and show_progress)
     phase_logs = show_progress and not rich_progress_mode
-    progress(phase_logs, f"target resolved to: {root}", progress_console)
+
+    # Show banner immediately so users always see identity/header first.
+    if rich_progress_mode:
+        print_banner(progress_console, to_stderr=False)
+    else:
+        print_banner(None, to_stderr=True)
+
+    progress(phase_logs, f"target resolved to: {_display_report_path(root, Path.cwd().resolve())}", progress_console)
 
     if not root.exists():
         print(f"error: target does not exist: {root}", file=sys.stderr)
@@ -4636,16 +6202,16 @@ def main() -> int:
         print(f"error: target is not a directory: {root}", file=sys.stderr)
         return 2
 
-    prepared_root = maybe_prepare_cwd_jar_scan_root(root, phase_logs, progress_console)
+    prepared_root = maybe_prepare_cwd_jar_scan_root(root, show_progress, progress_console)
     if prepared_root != root:
         root = prepared_root
-        progress(phase_logs, f"target updated to extracted/decompiled directory: {root}", progress_console)
+        progress(
+            phase_logs,
+            f"target updated to extracted/decompiled directory: {_display_report_path(root, Path.cwd().resolve())}",
+            progress_console,
+        )
 
-    if not args.json:
-        if rich_progress_mode:
-            print_banner(progress_console, to_stderr=False)
-        else:
-            print_banner(None, to_stderr=True)
+    html_out_path: Path | None = None
 
     if args.decrypt_codebase_in_place and args.decrypt_codebase_out:
         print("error: use only one of --decrypt-codebase-in-place or --decrypt-codebase-out", file=sys.stderr)
@@ -4707,6 +6273,26 @@ def main() -> int:
         shutil.copytree(root, out_root)
         scan_root = out_root
 
+    if args.json and not args.out:
+        default_json_out = Path.cwd().resolve() / _json_output_name_for_scan_root(scan_root, Path.cwd().resolve())
+        if default_json_out.exists():
+            progress(
+                phase_logs,
+                f"existing JSON result found; skipping scan: {_display_report_path(default_json_out, Path.cwd().resolve())}",
+                progress_console,
+            )
+            return 0
+        args.out = str(default_json_out)
+
+    if args.html_out:
+        args.html = True
+    if args.html:
+        html_out_path = (
+            Path(args.html_out).resolve()
+            if args.html_out
+            else (Path.cwd().resolve() / _html_output_name_for_scan_root(scan_root, Path.cwd().resolve()))
+        )
+
     decrypt_profile = None
     if decrypt_mode:
         progress(phase_logs, "building StringDecrypt profile", progress_console)
@@ -4767,8 +6353,8 @@ def main() -> int:
         decrypt_profile = build_decrypt_profile(scan_root)
 
     extra_scan_roots: List[tuple[Path, str]] = []
-    extra_scan_roots.extend(prepare_nested_dropped_jar_roots(scan_root, phase_logs, progress_console))
-    extra_scan_roots.extend(prepare_embedded_base32_archive_roots(scan_root, phase_logs, progress_console))
+    extra_scan_roots.extend(prepare_nested_dropped_jar_roots(scan_root, show_progress, progress_console))
+    extra_scan_roots.extend(prepare_embedded_base32_archive_roots(scan_root, show_progress, progress_console))
     scan_targets: List[tuple[Path, str]] = [(scan_root, "")]
     seen_target_roots = {str(scan_root.resolve())}
     for target_root, prefix in extra_scan_roots:
@@ -4848,8 +6434,16 @@ def main() -> int:
             all_findings.extend(_apply_prefix_findings(c_items, prefix))
             target_finding_counts[str(target_root.resolve())] = target_finding_counts.get(str(target_root.resolve()), 0) + len(c_items)
 
+    all_findings = sorted(
+        {(f.file, f.line, f.function, f.decoded, f.category, f.note): f for f in all_findings}.values(),
+        key=lambda x: (x.file, x.line, x.decoded, x.category),
+    )
+
+    progress(show_progress, "Scan Complete; Finalizing Findings", progress_console)
+
     for target_root, prefix in scan_targets:
         behavior_findings.extend(_apply_prefix_behaviors(discover_structural_behaviors(target_root), prefix))
+        behavior_findings.extend(_apply_prefix_behaviors(detect_token_source_sink_behaviors(target_root), prefix))
         root_key = str(target_root.resolve())
         java_count = target_java_counts.get(root_key, 0)
         class_count = target_class_counts.get(root_key, 0)
@@ -4928,10 +6522,20 @@ def main() -> int:
         {(b.file, b.line, b.behavior, b.evidence): b for b in behavior_findings}.values(),
         key=lambda x: (x.file, x.line, x.behavior),
     )
+    network_endpoint_assessment = assess_network_endpoints(all_findings)
+    progress(show_progress, "Running Variant Signature Detections", progress_console)
+    variant_detections = detect_variant_signatures(scan_root)
+    progress(show_progress, f"Detected {variant_detections.get('detected_count', 0)} Signature Variant(s)", progress_console)
+    progress(show_progress, "Running Raw String Scanner", progress_console)
+    raw_string_detections = run_raw_string_scanner(scan_root)
+    progress(show_progress, f"Raw String Detections: {len(raw_string_detections)}", progress_console)
+    progress(show_progress, "Running Cross-Variant Heuristic Scorer", progress_console)
+    heuristic_detections = run_cross_variant_heuristics(scan_root)
+    progress(show_progress, f"Heuristic Detections: {len(heuristic_detections)}", progress_console)
 
-    progress(phase_logs, f"collected {len(all_findings)} decode/string finding(s)", progress_console)
-    progress(phase_logs, f"detected {len(behavior_findings)} behavior indicator(s)", progress_console)
-    progress(phase_logs, "discovering suspicious artifacts", progress_console)
+    progress(show_progress, f"Collected {len(all_findings)} Decode/String Finding(s)", progress_console)
+    progress(show_progress, f"Detected {len(behavior_findings)} Behavior Indicator(s)", progress_console)
+    progress(show_progress, "Discovering Suspicious Artifacts", progress_console)
     artifact_findings: List[ArtifactFinding] = []
     for target_root, prefix in scan_targets:
         artifact_findings.extend(_apply_prefix_artifacts(discover_artifacts(target_root), prefix))
@@ -4939,8 +6543,9 @@ def main() -> int:
         {(a.path, a.filename, a.size, a.sha256, a.artifact_type, a.evidence): a for a in artifact_findings}.values(),
         key=lambda x: x.path,
     )
-    progress(phase_logs, f"detected {len(artifact_findings)} artifact indicator(s)", progress_console)
+    progress(show_progress, f"Detected {len(artifact_findings)} Artifact Indicator(s)", progress_console)
     runtime_c2 = {"attempted": False, "resolved": False}
+    ratter_scanner = {"attempted": False, "error": "", "results": []}
     stage2_analysis = {
         "enabled": bool(args.analyze_stage2),
         "attempted": False,
@@ -4948,12 +6553,12 @@ def main() -> int:
         "error": "",
     }
     if not args.no_network:
-        progress(phase_logs, "resolving runtime C2 from on-chain config", progress_console)
+        progress(show_progress, "Resolving Runtime C2 From On-Chain Config", progress_console)
         runtime_c2 = resolve_runtime_c2(all_findings)
         if runtime_c2.get("resolved"):
-            progress(phase_logs, f"runtime C2 resolved: {runtime_c2.get('c2_base_url')}", progress_console)
+            progress(show_progress, f"Runtime C2 Resolved: {runtime_c2.get('c2_base_url')}", progress_console)
         else:
-            progress(phase_logs, f"runtime C2 unresolved: {runtime_c2.get('error', 'unknown error')}", progress_console)
+            progress(show_progress, f"Runtime C2 Unresolved: {runtime_c2.get('error', 'unknown error')}", progress_console)
     elif args.analyze_stage2:
         stage2_analysis["error"] = "stage2 analysis requires network access; rerun without --no-network"
 
@@ -4962,35 +6567,139 @@ def main() -> int:
         if not payload_url:
             stage2_analysis["error"] = "payload endpoint not resolved from runtime C2"
         else:
-            progress(phase_logs, f"stage2 static analysis: downloading {payload_url}", progress_console)
+            progress(show_progress, f"stage2 static analysis: downloading {payload_url}", progress_console)
             stage2_analysis = analyze_stage2_payload(payload_url)
             if stage2_analysis.get("error"):
-                progress(phase_logs, f"stage2 analysis error: {stage2_analysis.get('error')}", progress_console)
+                progress(show_progress, f"stage2 analysis error: {stage2_analysis.get('error')}", progress_console)
             else:
                 progress(
-                    phase_logs,
+                    show_progress,
                     f"stage2 static analysis complete: entries={stage2_analysis.get('entry_count', 0)} "
                     f"native_entries={stage2_analysis.get('native_entry_count', 0)} "
                     f"artifacts={len(stage2_analysis.get('artifact_findings', []) or [])}",
                     progress_console,
                 )
 
-    progress(phase_logs, "building summary", progress_console)
+    if not args.no_network:
+        rs_hashes = collect_ratterscanner_hashes(target_metadata, artifact_findings, stage2_analysis, scan_root)
+        if rs_hashes:
+            progress(show_progress, f"Querying RatterScanner For {len(rs_hashes)} Hash(es)", progress_console)
+            ratter_scanner = lookup_ratterscanner(rs_hashes)
+            if ratter_scanner.get("error"):
+                progress(show_progress, f"RatterScanner Error: {ratter_scanner.get('error')}", progress_console)
+            else:
+                progress(
+                    show_progress,
+                    f"RatterScanner Results: {len(ratter_scanner.get('results', []) or [])}",
+                    progress_console,
+                )
 
-    summary = summarize(all_findings, behavior_findings, artifact_findings)
-    if deobf_stats:
-        summary["xor_decrypted_count"] = int(deobf_stats.get("stringdecrypt_xor_replaced", 0))
-        summary["decrypted_string_count"] = int(
-            deobf_stats.get("stringdecrypt_other_replaced", 0)
-        ) + int(deobf_stats.get("load_replaced", 0))
+    progress(show_progress, "Building Summary", progress_console)
 
-    if args.json:
+    if rich_progress_mode and RICH_AVAILABLE and progress_console is not None:
+        with Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=30),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=progress_console,
+            transient=False,
+        ) as build_prog:
+            build_task = build_prog.add_task("Building Report", total=5)
+
+            summary = summarize(all_findings, behavior_findings, artifact_findings)
+            if deobf_stats:
+                summary["xor_decrypted_count"] = int(deobf_stats.get("stringdecrypt_xor_replaced", 0))
+                summary["decrypted_string_count"] = int(
+                    deobf_stats.get("stringdecrypt_other_replaced", 0)
+                ) + int(deobf_stats.get("load_replaced", 0))
+            build_prog.advance(build_task)
+
+            blockchain = extract_blockchain_indicators(all_findings)
+            cwd_report = Path.cwd().resolve()
+            payload = {
+                "root": _display_report_path(scan_root, cwd_report),
+                "scan_roots": [_display_report_path(x[0], cwd_report) for x in scan_targets],
+                "scan_diagnostics": {
+                    _display_report_path(tr, cwd_report): {
+                        "java_files": target_java_counts.get(str(tr), 0),
+                        "class_files": target_class_counts.get(str(tr), 0),
+                        "finding_count": target_finding_counts.get(str(tr), 0),
+                        "scan_mode": target_scan_mode.get(str(tr), "unknown"),
+                    }
+                    for tr, _prefix in scan_targets
+                },
+                "target_metadata": target_metadata,
+                "scan_mode": "post_decryption_only" if decrypt_mode else "standard",
+                "deobfuscation": deobf_stats if deobf_stats else {},
+                "summary": summary,
+                "assessment_summary": summarize_assessments(behavior_findings),
+                "runtime_c2": runtime_c2,
+                "ratter_scanner": ratter_scanner,
+                "network_endpoint_assessment": network_endpoint_assessment,
+                "variant_detections": variant_detections,
+                "raw_string_detections": raw_string_detections,
+                "heuristic_detections": heuristic_detections,
+                "stage2_analysis": stage2_analysis,
+                "stage2_manual_payload_url": runtime_c2.get("payload_endpoint", ""),
+                "blockchain_indicators": blockchain,
+                "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
+                "behavior_findings": [
+                    {**b.__dict__, "severity": behavior_severity(b.behavior)}
+                    for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))
+                ],
+                "artifact_findings": [a.__dict__ for a in artifact_findings],
+            }
+            build_prog.advance(build_task)
+
+            build_prog.update(build_task, description="Generating Executive Summary")
+            executive_summary = build_openai_executive_summary(payload)
+            output_payload = dict(payload)
+            if executive_summary:
+                output_payload = {"executive_summary": executive_summary, **output_payload}
+            build_prog.advance(build_task)
+
+            json_output = json.dumps(output_payload, indent=2)
+            text_output = render_text(
+                all_findings,
+                behavior_findings,
+                artifact_findings,
+                summary,
+                runtime_c2,
+                target_metadata,
+                stage2_analysis,
+                ratter_scanner,
+                network_endpoint_assessment,
+                variant_detections,
+                raw_string_detections,
+                heuristic_detections,
+            )
+            if executive_summary:
+                text_output = f"== Executive Summary ==\n{executive_summary}\n\n{text_output}"
+            width = max(40, shutil.get_terminal_size((120, 20)).columns)
+            centered_banner = "\n".join(line.center(width) for line in BANNER.splitlines())
+            text_output_with_banner = f"{centered_banner}\n\n{text_output}"
+            build_prog.advance(build_task)
+
+            build_prog.update(build_task, description="Rendering HTML Report")
+            html_output = render_html_report(output_payload, executive_summary) if args.html else ""
+            build_prog.advance(build_task)
+    else:
+        summary = summarize(all_findings, behavior_findings, artifact_findings)
+        if deobf_stats:
+            summary["xor_decrypted_count"] = int(deobf_stats.get("stringdecrypt_xor_replaced", 0))
+            summary["decrypted_string_count"] = int(
+                deobf_stats.get("stringdecrypt_other_replaced", 0)
+            ) + int(deobf_stats.get("load_replaced", 0))
+
         blockchain = extract_blockchain_indicators(all_findings)
+        cwd_report = Path.cwd().resolve()
         payload = {
-            "root": str(scan_root),
-            "scan_roots": [str(x[0]) for x in scan_targets],
+            "root": _display_report_path(scan_root, cwd_report),
+            "scan_roots": [_display_report_path(x[0], cwd_report) for x in scan_targets],
             "scan_diagnostics": {
-                str(tr): {
+                _display_report_path(tr, cwd_report): {
                     "java_files": target_java_counts.get(str(tr), 0),
                     "class_files": target_class_counts.get(str(tr), 0),
                     "finding_count": target_finding_counts.get(str(tr), 0),
@@ -5004,6 +6713,11 @@ def main() -> int:
             "summary": summary,
             "assessment_summary": summarize_assessments(behavior_findings),
             "runtime_c2": runtime_c2,
+            "ratter_scanner": ratter_scanner,
+            "network_endpoint_assessment": network_endpoint_assessment,
+            "variant_detections": variant_detections,
+            "raw_string_detections": raw_string_detections,
+            "heuristic_detections": heuristic_detections,
             "stage2_analysis": stage2_analysis,
             "stage2_manual_payload_url": runtime_c2.get("payload_endpoint", ""),
             "blockchain_indicators": blockchain,
@@ -5014,43 +6728,85 @@ def main() -> int:
             ],
             "artifact_findings": [a.__dict__ for a in artifact_findings],
         }
-        output = json.dumps(payload, indent=2)
-    else:
+        executive_summary = build_openai_executive_summary(payload)
+        output_payload = dict(payload)
+        if executive_summary:
+            output_payload = {"executive_summary": executive_summary, **output_payload}
+
+        json_output = json.dumps(output_payload, indent=2)
+        text_output = render_text(
+            all_findings,
+            behavior_findings,
+            artifact_findings,
+            summary,
+            runtime_c2,
+            target_metadata,
+            stage2_analysis,
+            ratter_scanner,
+            network_endpoint_assessment,
+            variant_detections,
+            raw_string_detections,
+            heuristic_detections,
+        )
+        if executive_summary:
+            text_output = f"== Executive Summary ==\n{executive_summary}\n\n{text_output}"
         width = max(40, shutil.get_terminal_size((120, 20)).columns)
         centered_banner = "\n".join(line.center(width) for line in BANNER.splitlines())
-        output = render_text(all_findings, behavior_findings, artifact_findings, summary, runtime_c2, target_metadata, stage2_analysis)
-        output = f"{centered_banner}\n\n{output}"
+        text_output_with_banner = f"{centered_banner}\n\n{text_output}"
+        html_output = render_html_report(output_payload, executive_summary) if args.html else ""
 
-    if args.out:
-        progress(phase_logs, f"writing output to {Path(args.out)}", progress_console)
-        Path(args.out).write_text(output, encoding="utf-8")
-        progress(show_progress, "done", progress_console)
+    if args.json and args.out:
+        progress(
+            phase_logs,
+            f"writing output to {_display_report_path(Path(args.out), Path.cwd().resolve())}",
+            progress_console,
+        )
+        Path(args.out).write_text(json_output, encoding="utf-8")
+    elif (not args.json) and args.out:
+        progress(
+            phase_logs,
+            f"writing output to {_display_report_path(Path(args.out), Path.cwd().resolve())}",
+            progress_console,
+        )
+        Path(args.out).write_text(text_output_with_banner, encoding="utf-8")
+    if args.html and html_out_path is not None:
+        progress(
+            phase_logs,
+            f"writing HTML output to {_display_report_path(html_out_path, Path.cwd().resolve())}",
+            progress_console,
+        )
+        html_out_path.write_text(html_output, encoding="utf-8")
+
+    progress(phase_logs, "printing output", progress_console)
+    if RICH_AVAILABLE and report_console is not None and rich_progress_mode:
+        # Clear scan-phase output so the final report is shown on a clean screen.
+        report_console.clear()
+        if os.name == "nt":
+            os.system("cls")
+    if RICH_AVAILABLE and report_console is not None:
+        print_banner(report_console, to_stderr=False)
+        render_rich(
+            report_console,
+            all_findings,
+            behavior_findings,
+            artifact_findings,
+            summary,
+            runtime_c2,
+            target_metadata,
+            stage2_analysis,
+            ratter_scanner,
+            network_endpoint_assessment,
+            variant_detections,
+            raw_string_detections,
+            heuristic_detections,
+            executive_summary,
+        )
     else:
-        progress(phase_logs, "printing output", progress_console)
-        if RICH_AVAILABLE and report_console is not None and rich_progress_mode:
-            # Clear scan-phase output so the final report is shown on a clean screen.
-            report_console.clear()
-            if os.name == "nt":
-                os.system("cls")
-        if args.json or not RICH_AVAILABLE:
-            print(output)
-        else:
-            print_banner(report_console, to_stderr=False)
-            render_rich(
-                report_console,
-                all_findings,
-                behavior_findings,
-                artifact_findings,
-                summary,
-                runtime_c2,
-                target_metadata,
-                stage2_analysis,
-            )
-        progress(show_progress, "done", progress_console)
+        print(text_output_with_banner)
+    progress(show_progress, "done", progress_console)
 
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
