@@ -126,19 +126,36 @@ Expanded alias coverage includes:
 - UUID access: `method_44717()`, `getProfileId()`, `getUuid()`, `GameProfile.getId()`
 - Token access: `method_1674()`, `getAccessToken()`, `session.getAccessToken()`
 
-## Inspiration
+## JLab Static Scan Enrichment
 
-I saw this on [YouTube](https://www.youtube.com/watch?v=bsZJo49RaBE):
+When enabled, Java Triage will attempt to upload the original source JAR/ZIP to:
 
-![Loser](https://i.imgur.com/mlxkzbL.png)
+- `https://jlab.threat.rip/api/public/static-scan`
 
-It was yet another super obvious Minecraft account stealer or trojan using a fake video to entice fools to lose their accounts.
+Behavior details:
 
-This led me to make this Python app to quickly triage such distributions. The sample I was looking at stole Minecraft credentials, sent them to a Discord webhook through another API, and then downloaded another trojan which extracted a Windows binary as a second payload.
+- Enabled by default (`--jlab-static-scan`)
+- Can be disabled with `--no-jlab-static-scan`
+- Requires network access (disabled by `--no-network`)
+- Upload target priority:
+  - direct target file if scanning a `.jar`/`.zip`
+  - scan root file if scan root is a `.jar`/`.zip`
+  - source JAR metadata path/name fallback for decompiled directory scans
+- Size and format guardrails:
+  - only `.jar`/`.zip` are uploaded
+  - max upload size handled by the tool: `50 MB`
 
-Update: Mediafire later added a warning in response to this repo.
+Returned data is stored under `jlab_static_scan` in JSON and rendered in Rich/HTML reports, including:
 
-![Media](https://i.imgur.com/nTrHgDA.png)
+- upload metadata (filename, size, status)
+- rate-limit metadata when available
+- matched signature count and signature rows (severity, id, name, description, type, count, match preview)
+
+## Executive Summary
+
+If `OPENAI_API_KEY` is set, the tool sends the triage JSON to the OpenAI Responses API and asks for a concise executive summary describing the likely flow, capabilities, risks, and goals of the scanned application or malware.
+
+If no API key is present, the tool behaves as if this feature does not exist and does not mention AI or GPT in the output.
 
 ## Requirements
 
@@ -279,37 +296,6 @@ HTML output is a standalone styled report and includes:
 - expanded metadata and enrichment sections
 - omission of categories that are completely empty
 
-## JLab Static Scan Enrichment
-
-When enabled, Java Triage will attempt to upload the original source JAR/ZIP to:
-
-- `https://jlab.threat.rip/api/public/static-scan`
-
-Behavior details:
-
-- Enabled by default (`--jlab-static-scan`)
-- Can be disabled with `--no-jlab-static-scan`
-- Requires network access (disabled by `--no-network`)
-- Upload target priority:
-  - direct target file if scanning a `.jar`/`.zip`
-  - scan root file if scan root is a `.jar`/`.zip`
-  - source JAR metadata path/name fallback for decompiled directory scans
-- Size and format guardrails:
-  - only `.jar`/`.zip` are uploaded
-  - max upload size handled by the tool: `50 MB`
-
-Returned data is stored under `jlab_static_scan` in JSON and rendered in Rich/HTML reports, including:
-
-- upload metadata (filename, size, status)
-- rate-limit metadata when available
-- matched signature count and signature rows (severity, id, name, description, type, count, match preview)
-
-## Executive Summary
-
-If `OPENAI_API_KEY` is set, the tool sends the triage JSON to the OpenAI Responses API and asks for a concise executive summary describing the likely flow, capabilities, risks, and goals of the scanned application or malware.
-
-If no API key is present, the tool behaves as if this feature does not exist and does not mention AI or GPT in the output.
-
 ## Notes and Limits
 
 - This is a triage helper, not a full malware sandbox or decompiler.
@@ -322,3 +308,17 @@ If no API key is present, the tool behaves as if this feature does not exist and
 - Metadata enrichments such as `SSDEEP`, `TLSH`, `TrID`, `Magika`, and `Vhash` are best-effort and only appear when dependencies are available.
 - Nested archive or payload extraction is heuristic and best-effort; highly custom packers may still evade static expansion.
 - Do **not** rely on this tool alone to determine whether a Java application is safe.
+
+## Inspiration
+
+I saw this on [YouTube](https://www.youtube.com/watch?v=bsZJo49RaBE):
+
+![Loser](https://i.imgur.com/mlxkzbL.png)
+
+It was yet another super obvious Minecraft account stealer or trojan using a fake video to entice fools to lose their accounts.
+
+This led me to make this Python app to quickly triage such distributions. The sample I was looking at stole Minecraft credentials, sent them to a Discord webhook through another API, and then downloaded another trojan which extracted a Windows binary as a second payload.
+
+Update: Mediafire later added a warning in response to this repo.
+
+![Media](https://i.imgur.com/nTrHgDA.png)
