@@ -269,6 +269,8 @@ MAJOR_ENCRYPTED_MIN_FILE_RATIO = 0.20
 MAJOR_ENCRYPTED_MIN_FILES_WITH_CALLS = 5
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 RATTERSCANNER_HASH_URL = "https://api.ratterscanner.com/hash/"
+JLAB_STATIC_SCAN_URL = "https://jlab.threat.rip/api/public/static-scan"
+JLAB_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 OPENAI_EXEC_SUMMARY_INSTRUCTION = (
     "Parse the JSON and create an executive summary of the result detailing the flow of the malware "
     "or application (if clean) and its capabilities, risks, goal. Keep it technical but understandable "
@@ -336,6 +338,138 @@ def lookup_ratterscanner(hashes: List[str], timeout: int = 20) -> dict:
             out["error"] = str(data.get("error"))
             return out
         out["error"] = "invalid response format"
+        return out
+    except Exception as exc:
+        out["error"] = _friendly_network_error(exc)
+        return out
+
+
+def _parse_int_header(headers: Any, name: str) -> int | None:
+    if headers is None:
+        return None
+    try:
+        raw = str(headers.get(name, "") or "").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def lookup_jlab_static_scan(upload_path: Path, timeout: int = 45) -> dict:
+    out = {
+        "attempted": False,
+        "error": "",
+        "status_code": 0,
+        "upload_file": "",
+        "upload_size": 0,
+        "file_name": "",
+        "file_size": 0,
+        "total_signatures": 0,
+        "matched_signatures": 0,
+        "signatures": [],
+        "retry_after": None,
+        "rate_limit_limit": None,
+        "rate_limit_remaining": None,
+    }
+    if not upload_path.is_file():
+        out["error"] = "JLab static scan skipped: upload file not found"
+        return out
+    ext = upload_path.suffix.lower()
+    if ext not in {".jar", ".zip"}:
+        out["error"] = "JLab static scan skipped: upload must be .jar or .zip"
+        return out
+    try:
+        size = int(upload_path.stat().st_size)
+    except Exception:
+        out["error"] = "JLab static scan skipped: failed to read upload file size"
+        return out
+    if size <= 0:
+        out["error"] = "JLab static scan skipped: upload file is empty"
+        return out
+    if size > JLAB_MAX_UPLOAD_BYTES:
+        out["error"] = f"JLab static scan skipped: file exceeds 50 MB ({size} bytes)"
+        return out
+
+    out["attempted"] = True
+    out["upload_file"] = upload_path.name
+    out["upload_size"] = size
+    boundary = f"----JavaTriageBoundary{int(time.time() * 1000)}"
+    mime = "application/java-archive" if ext == ".jar" else "application/zip"
+    try:
+        file_bytes = upload_path.read_bytes()
+        body_prefix = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{upload_path.name}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode("utf-8")
+        body_suffix = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        payload = body_prefix + file_bytes + body_suffix
+        req = request.Request(
+            JLAB_STATIC_SCAN_URL,
+            method="POST",
+            data=payload,
+            headers={
+                "User-Agent": "java-triage/1.0",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        with request.urlopen(req, timeout=timeout) as resp:
+            out["status_code"] = int(getattr(resp, "status", 200) or 200)
+            out["retry_after"] = _parse_int_header(resp.headers, "Retry-After")
+            out["rate_limit_limit"] = _parse_int_header(resp.headers, "X-RateLimit-Limit")
+            out["rate_limit_remaining"] = _parse_int_header(resp.headers, "X-RateLimit-Remaining")
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw) if raw.strip() else {}
+        if isinstance(data, dict) and bool(data.get("success")):
+            out["file_name"] = str(data.get("fileName", "") or "")
+            out["file_size"] = int(data.get("fileSize", 0) or 0)
+            out["total_signatures"] = int(data.get("totalSignatures", 0) or 0)
+            out["matched_signatures"] = int(data.get("matchedSignatures", 0) or 0)
+            sigs = data.get("signatures", [])
+            out["signatures"] = sigs if isinstance(sigs, list) else []
+            return out
+        if isinstance(data, dict) and data.get("error"):
+            out["error"] = str(data.get("error", "") or "unknown API error")
+            return out
+        out["error"] = "invalid response format"
+        return out
+    except error.HTTPError as exc:
+        out["status_code"] = int(getattr(exc, "code", 0) or 0)
+        out["retry_after"] = _parse_int_header(exc.headers, "Retry-After")
+        out["rate_limit_limit"] = _parse_int_header(exc.headers, "X-RateLimit-Limit")
+        out["rate_limit_remaining"] = _parse_int_header(exc.headers, "X-RateLimit-Remaining")
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        message = ""
+        if body.strip():
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    message = str(parsed.get("error", "") or "")
+                    if out["retry_after"] is None:
+                        out["retry_after"] = _parse_int_header(parsed, "retryAfter")
+                    if out["rate_limit_limit"] is None:
+                        out["rate_limit_limit"] = _parse_int_header(parsed, "limit")
+                    if out["rate_limit_remaining"] is None:
+                        out["rate_limit_remaining"] = _parse_int_header(parsed, "remaining")
+            except Exception:
+                message = body.strip()
+        if not message:
+            message = str(exc)
+        if exc.code == 429 and out["retry_after"]:
+            out["error"] = f"Rate limit exceeded. Try again in {out['retry_after']}s."
+        elif exc.code == 413:
+            out["error"] = "File exceeds 50 MB upload limit"
+        else:
+            out["error"] = message
         return out
     except Exception as exc:
         out["error"] = _friendly_network_error(exc)
@@ -1791,6 +1925,7 @@ def _write_source_jar_metadata(scan_dir: Path, source_jar: Path) -> None:
         st = source_jar.stat()
         meta = {
             "name": source_jar.name,
+            "path": str(source_jar.resolve()),
             "size_bytes": int(st.st_size),
             "size_text": _human_size(int(st.st_size)),
             "md5": _hash_file(source_jar, "md5"),
@@ -4818,6 +4953,7 @@ def render_text(
     target_metadata: dict,
     stage2_analysis: dict | None = None,
     ratter_scanner: dict | None = None,
+    jlab_static_scan: dict | None = None,
     network_endpoint_assessment: dict | None = None,
     variant_detections: dict | None = None,
     raw_string_detections: List[dict] | None = None,
@@ -5010,6 +5146,40 @@ def render_text(
                 auto_safe = item.get("automated_safe", None)
                 auto_text = f" automated_safe={auto_safe}" if auto_safe is not None else ""
                 out.append(f"- {h}: safe={safe} malicious={mal}{auto_text}")
+
+    jl = jlab_static_scan or {}
+    if jl.get("attempted") or jl.get("error"):
+        out.append("")
+        out.append("== JLab Static Scan ==")
+        out.append(f"Upload file: {jl.get('upload_file', '')}")
+        out.append(f"Upload size: {jl.get('upload_size', 0)}")
+        if jl.get("status_code"):
+            out.append(f"HTTP status: {jl.get('status_code')}")
+        if jl.get("rate_limit_limit") is not None or jl.get("rate_limit_remaining") is not None:
+            out.append(
+                f"Rate limit: limit={jl.get('rate_limit_limit')} remaining={jl.get('rate_limit_remaining')}"
+            )
+        if jl.get("retry_after") is not None:
+            out.append(f"Retry after: {jl.get('retry_after')}s")
+        if jl.get("error"):
+            out.append(f"Error: {jl.get('error')}")
+        else:
+            out.append(
+                f"Matched signatures: {jl.get('matched_signatures', 0)} / {jl.get('total_signatures', 0)}"
+            )
+            for sig in (jl.get("signatures", []) or [])[:50]:
+                sev = str(sig.get("severity", "") or "")
+                sig_id = str(sig.get("id", "") or "")
+                name = str(sig.get("name", "") or "")
+                count = int(sig.get("count", 0) or 0)
+                sig_type = str(sig.get("type", "") or "")
+                desc = str(sig.get("description", "") or "")
+                out.append(f"- [{sev}] {name} ({sig_id}) type={sig_type} count={count} -> {desc}")
+                for match in (sig.get("matches", []) or [])[:3]:
+                    cls = str(match.get("className", "") or "")
+                    member = str(match.get("member", "") or "")
+                    if cls or member:
+                        out.append(f"  match: class={cls} member={member}")
 
 
     s2 = stage2_analysis or {}
@@ -5206,10 +5376,14 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     stage2 = payload.get("stage2_analysis", {}) or {}
     blockchain = payload.get("blockchain_indicators", {}) or {}
     ratter = payload.get("ratter_scanner", {}) or {}
+    jlab = payload.get("jlab_static_scan", {}) or {}
     net_assess = payload.get("network_endpoint_assessment", {}) or {}
     variant_detections = payload.get("variant_detections", {}) or {}
     raw_string_detections = payload.get("raw_string_detections", []) or []
     heuristic_detections = payload.get("heuristic_detections", []) or []
+    jar_info = target_meta.get("jar_info", {}) or {}
+    bundle_info = target_meta.get("bundle_info", {}) or {}
+    library_fingerprints = target_meta.get("library_fingerprints", {}) or {}
     verdict_layers = summary.get("verdict_layers", {}) or {}
     stage2_error = 1 if str((stage2 or {}).get("error", "")).strip() else 0
     blockchain_count = sum(
@@ -5221,6 +5395,7 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     raw_count = len(raw_string_detections)
     heuristic_count = len(heuristic_detections)
     ratter_bad = sum(1 for x in (ratter.get("results", []) or []) if bool(x.get("malicious", False)))
+    jlab_bad = int((jlab or {}).get("matched_signatures", 0) or 0)
     behavior_bad = int(summary.get("high_risk_behavior_count", 0) or 0)
     finding_bad = int(summary.get("high_risk_count", 0) or 0)
     artifact_bad = int(summary.get("artifact_findings", 0) or 0)
@@ -5234,6 +5409,7 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
         + raw_count
         + heuristic_count
         + ratter_bad
+        + jlab_bad
         + stage2_error
     )
     proof_count = int(verdict_layers.get("proof", 0) or 0)
@@ -5254,6 +5430,25 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
         if cat in warn:
             return "cat-warn"
         return "cat-neutral"
+
+    def sev_class(level: str) -> str:
+        low = str(level or "").strip().lower()
+        if low in {"critical", "high", "medium", "low", "info"}:
+            return f"sev-{low}"
+        return "sev-info"
+
+    def weight_class(weight: int) -> str:
+        if weight >= 20:
+            return "sev-high"
+        if weight >= 10:
+            return "sev-medium"
+        if weight >= 1:
+            return "sev-low"
+        return "sev-info"
+
+    def short_text(value: Any, limit: int = 120) -> str:
+        s = str(value or "")
+        return s if len(s) <= limit else (s[: max(0, limit - 1)] + "…")
 
     findings_limit = 200
     behavior_limit = 200
@@ -5301,6 +5496,254 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
             f"<td>{_h(r.get('evidence', ''))}</td>"
             "</tr>"
         )
+    rows_heur = []
+    for r in heuristic_detections[:1000]:
+        w = int(r.get("weight", 0) or 0)
+        rows_heur.append(
+            "<tr>"
+            f"<td class='tight'><span class='sev {weight_class(w)}'>{_h(w)}</span></td>"
+            f"<td class='tight'>{_h(r.get('file_path', ''))}</td>"
+            f"<td>{_h(r.get('description', ''))}</td>"
+            "</tr>"
+        )
+    rows_jlab = []
+    for sig in (jlab.get("signatures", []) or [])[:1000]:
+        sev = str(sig.get("severity", "") or "").strip().lower()
+        matches_preview = []
+        for m in (sig.get("matches", []) or [])[:3]:
+            cls = str(m.get("className", "") or "")
+            member = str(m.get("member", "") or "")
+            if cls or member:
+                if member:
+                    matches_preview.append(short_text(f"{cls}::{member}", 80))
+                else:
+                    matches_preview.append(short_text(cls, 80))
+        matches_more = max(0, len(sig.get("matches", []) or []) - len(matches_preview))
+        matches_text = " | ".join(matches_preview)
+        if matches_more > 0:
+            matches_text = f"{matches_text} (+{matches_more} more)" if matches_text else f"+{matches_more} more"
+        rows_jlab.append(
+            "<tr>"
+            f"<td class='tight'><span class='sev {sev_class(sev)}'>{_h(sev or 'info')}</span></td>"
+            f"<td class='tight'>{_h(sig.get('id', ''))}</td>"
+            f"<td>{_h(sig.get('name', ''))}</td>"
+            f"<td>{_h(sig.get('description', ''))}</td>"
+            f"<td class='tight'>{_h(sig.get('type', ''))}</td>"
+            f"<td class='tight'>{_h(sig.get('count', 0))}</td>"
+            f"<td class='matches-col'>{_h(matches_text)}</td>"
+            "</tr>"
+        )
+
+    basic_rows = []
+    for k, label in [
+        ("subject", "Subject"),
+        ("md5", "MD5"),
+        ("sha1", "SHA-1"),
+        ("sha256", "SHA-256"),
+        ("file_type", "File Type"),
+        ("compressed", "Compressed"),
+        ("magic", "Magic"),
+        ("file_size_text", "File Size"),
+    ]:
+        val = basic.get(k, "")
+        if _has_nonempty(val):
+            basic_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+
+    jar_meta = jar_info.get("archive_metadata", {}) or {}
+    jar_rows = []
+    for k, label in [
+        ("contained_directories", "Contained Directories"),
+        ("max_directory_depth", "Max Directory Depth"),
+        ("contained_files", "Contained Files"),
+        ("earliest_content_modification", "Earliest Modification"),
+        ("latest_content_modification", "Latest Modification"),
+    ]:
+        val = jar_meta.get(k, "")
+        if _has_nonempty(val):
+            jar_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+
+    bundle_rows = []
+    for k, label in [
+        ("contained_files", "Contained Files"),
+        ("uncompressed_size_text", "Uncompressed Size"),
+        ("earliest_content_modification", "Earliest Modification"),
+        ("latest_content_modification", "Latest Modification"),
+    ]:
+        val = bundle_info.get(k, "")
+        if _has_nonempty(val):
+            bundle_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+
+    artifact_rows = []
+    for k, label in [
+        ("scan_root_name", "Scan Root Name"),
+        ("scan_root_tree_sha256", "Scan Root Tree SHA256"),
+        ("scan_root_file_count", "Scan Root File Count"),
+    ]:
+        val = artifact_identity.get(k, "")
+        if _has_nonempty(val):
+            artifact_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+
+    lib_rows = []
+    detected_libs = library_fingerprints.get("detected", []) or []
+    if detected_libs:
+        libs = library_fingerprints.get("libraries", {}) or {}
+        for lib in detected_libs:
+            info = libs.get(lib, {}) or {}
+            lib_rows.append(
+                "<tr>"
+                f"<td>{_h(lib)}</td>"
+                f"<td class='tight'>{_h(info.get('java_files', 0))}</td>"
+                f"<td>{_h(', '.join((info.get('sample_paths', []) or [])[:3]))}</td>"
+                "</tr>"
+            )
+    jlab_overview_rows = []
+    if jlab.get("attempted") or jlab.get("error"):
+        for label, val in [
+            ("Upload file", jlab.get("upload_file", "")),
+            ("Upload size", jlab.get("upload_size", 0)),
+            ("HTTP status", jlab.get("status_code", "")),
+            ("Rate limit", f"limit={jlab.get('rate_limit_limit')} remaining={jlab.get('rate_limit_remaining')}"),
+            ("Retry after", f"{jlab.get('retry_after')}s" if jlab.get("retry_after") is not None else ""),
+            ("Matched signatures", f"{jlab.get('matched_signatures', 0)} / {jlab.get('total_signatures', 0)}"),
+            ("Error", jlab.get("error", "")),
+        ]:
+            if _has_nonempty(val):
+                jlab_overview_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+
+    rows_variant = []
+    rows_variant_matches = []
+    for item in (variant_detections.get("detected", []) or [])[:200]:
+        variant_name = str(item.get("variant", "") or "")
+        score = int(item.get("confidence_score", 0) or 0)
+        matches = item.get("matches", []) or []
+        rows_variant.append(
+            "<tr>"
+            f"<td>{_h(variant_name)}</td>"
+            f"<td class='tight'><span class='sev {weight_class(score)}'>{_h(score)}</span></td>"
+            f"<td class='tight'>{_h(len(matches))}</td>"
+            "</tr>"
+        )
+        for m in matches[:20]:
+            rows_variant_matches.append(
+                "<tr>"
+                f"<td>{_h(variant_name)}</td>"
+                f"<td>{_h(m.get('kind', ''))}</td>"
+                f"<td>{_h(short_text(m.get('description', ''), 180))}</td>"
+                f"<td>{_h(m.get('file', ''))}</td>"
+                f"<td class='tight'>{_h(m.get('weight', 0))}</td>"
+                "</tr>"
+            )
+
+    rows_raw = []
+    for r in raw_string_detections[:1000]:
+        w = int(r.get("weight", 0) or 0)
+        rows_raw.append(
+            "<tr>"
+            f"<td class='tight'><span class='sev {weight_class(w)}'>{_h(w)}</span></td>"
+            f"<td class='tight'>{_h(r.get('file_path', ''))}</td>"
+            f"<td>{_h(r.get('description', ''))}</td>"
+            "</tr>"
+        )
+
+    runtime_rows = []
+    for label, val in [
+        ("Attempted", runtime.get("attempted", False)),
+        ("Resolved", runtime.get("resolved", False)),
+        ("RPC used", runtime.get("rpc_used", "")),
+        ("C2 base URL", runtime.get("c2_base_url", "")),
+        ("Exfil endpoint", runtime.get("exfil_endpoint", "")),
+        ("Payload endpoint", runtime.get("payload_endpoint", "")),
+        ("Error", runtime.get("error", "")),
+    ]:
+        if _has_nonempty(val):
+            runtime_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+    rows_runtime_layers = []
+    for layer in (runtime.get("decoded_response_layers", []) or [])[:50]:
+        rows_runtime_layers.append(
+            "<tr>"
+            f"<td class='tight'>{_h(layer.get('category', ''))}</td>"
+            f"<td>{_h(short_text(layer.get('decoded', ''), 160))}</td>"
+            f"<td>{_h(layer.get('note', ''))}</td>"
+            "</tr>"
+        )
+
+    rows_ratter = []
+    for item in (ratter.get("results", []) or [])[:1000]:
+        malicious = bool(item.get("malicious", False))
+        safe = bool(item.get("safe", False))
+        status = "malicious" if malicious else ("safe" if safe else "unknown")
+        status_class = "sev-critical" if malicious else ("sev-low" if safe else "sev-info")
+        rows_ratter.append(
+            "<tr>"
+            f"<td class='tight'><span class='sev {status_class}'>{_h(status)}</span></td>"
+            f"<td>{_h(item.get('hash', ''))}</td>"
+            f"<td>{_h(item.get('fileName', ''))}</td>"
+            f"<td class='tight'>{_h(item.get('automated_safe', ''))}</td>"
+            "</tr>"
+        )
+    ratter_rows = []
+    if ratter.get("attempted") or ratter.get("error"):
+        for label, val in [
+            ("Attempted", ratter.get("attempted", False)),
+            ("Error", ratter.get("error", "")),
+            ("Results", len(ratter.get("results", []) or [])),
+        ]:
+            if _has_nonempty(val):
+                ratter_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+
+    stage2_rows = []
+    for label, val in [
+        ("Enabled", stage2.get("enabled", False)),
+        ("Attempted", stage2.get("attempted", False)),
+        ("Static-only mode", stage2.get("static_only_no_execution", True)),
+        ("Payload URL", stage2.get("resolved_payload_url", "")),
+        ("Downloaded", stage2.get("downloaded", False)),
+        ("Downloaded path", stage2.get("download_path", "")),
+        ("Downloaded size", stage2.get("download_size", 0)),
+        ("Downloaded SHA256", stage2.get("download_sha256", "")),
+        ("Archive signature", stage2.get("archive_signature", "")),
+        ("Entry count", stage2.get("entry_count", 0)),
+        ("Class count", stage2.get("class_count", 0)),
+        ("Native entry count", stage2.get("native_entry_count", 0)),
+        ("Error", stage2.get("error", "")),
+    ]:
+        if _has_nonempty(val):
+            stage2_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+    rows_stage2_native = []
+    for item in (stage2.get("native_entries_sample", []) or [])[:80]:
+        rows_stage2_native.append(f"<tr><td>{_h(item)}</td></tr>")
+    rows_stage2_artifacts = []
+    for a in (stage2.get("artifact_findings", []) or [])[:300]:
+        rows_stage2_artifacts.append(
+            "<tr>"
+            f"<td>{_h(a.get('artifact_type', ''))}</td>"
+            f"<td>{_h(a.get('path', ''))}</td>"
+            f"<td>{_h(short_text(a.get('evidence', ''), 180))}</td>"
+            "</tr>"
+        )
+
+    net_rows = []
+    for label, val in [
+        ("Total URLs", net_assess.get("total_urls", 0)),
+        ("Vendor URLs", net_assess.get("vendor_count", 0)),
+        ("Unknown URLs", net_assess.get("unknown_count", 0)),
+        ("Suspicious URLs", net_assess.get("suspicious_count", 0)),
+    ]:
+        if _has_nonempty(val):
+            net_rows.append(f"<tr><td class='meta-k'>{_h(label)}</td><td class='meta-v'>{_h(val)}</td></tr>")
+    rows_net_suspicious = [f"<tr><td>{_h(u)}</td></tr>" for u in (net_assess.get("suspicious_urls", []) or [])[:200]]
+    rows_net_unknown = [f"<tr><td>{_h(u)}</td></tr>" for u in (net_assess.get("unknown_urls", []) or [])[:200]]
+
+    rows_blockchain = []
+    for label, items in [
+        ("Contracts", blockchain.get("contracts", []) or []),
+        ("Method selectors", blockchain.get("selectors", []) or []),
+        ("RPC hosts", blockchain.get("rpc_hosts", []) or []),
+        ("RPC URLs", blockchain.get("rpc_urls", []) or []),
+        ("RPC URLs with API keys", blockchain.get("api_key_urls", []) or []),
+    ]:
+        for item in items[:200]:
+            rows_blockchain.append(f"<tr><td class='tight'>{_h(label)}</td><td>{_h(item)}</td></tr>")
 
     return f"""<!doctype html>
 <html lang="en">
@@ -5374,6 +5817,15 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     .behavior-table col.file-col {{ width:28ch; }}
     .behavior-table col.line-col {{ width:6ch; }}
     .behavior-table col.beh-col {{ width:30ch; }}
+    .meta-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:.75rem; }}
+    .meta-box {{ border:1px solid rgba(255,255,255,.08); border-radius:10px; background:rgba(8,22,35,.72); padding:.65rem; }}
+    .meta-box h3 {{ margin:.1rem 0 .55rem; color:#9dd5ff; }}
+    .meta-table {{ width:100%; border-collapse:collapse; font-size:.86rem; }}
+    .meta-table td {{ padding:.42rem .5rem; border-bottom:1px dashed rgba(255,255,255,.08); vertical-align:top; }}
+    .meta-table tr:last-child td {{ border-bottom:0; }}
+    .meta-k {{ color:#9dd5ff; font-family:Consolas,Monaco,monospace; width:38%; }}
+    .meta-v {{ color:#edf4fb; }}
+    .matches-col {{ max-width:32ch; color:#a8c7df; font-size:.82rem; }}
   </style>
 </head>
 <body>
@@ -5412,18 +5864,57 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
         <div class="kpi"><div class="k">Raw String Detections</div><div class="v">{_h(raw_count)}</div></div>
         <div class="kpi"><div class="k">Heuristic Detections</div><div class="v">{_h(heuristic_count)}</div></div>
         <div class="kpi"><div class="k">RatterScanner Malicious</div><div class="v">{_h(ratter_bad)}</div></div>
+        <div class="kpi"><div class="k">JLab Signatures</div><div class="v">{_h(jlab_bad)}</div></div>
       </div>
     </div>
     {"<div class='card'><h2>Executive Summary</h2><pre>" + _h(executive_summary) + "</pre></div>" if executive_summary else ""}
-    {("<div class='card'><h2 class='triage-title'>Target Metadata</h2>" + _render_json_node_html(target_meta_view, "Target Metadata", open_all=False, open_root=True, expanded_titles={'target metadata', 'basic_properties'}) + "</div>") if _has_nonempty((target_meta_view or {}).get("basic_properties", {})) else ""}
-    {("<div class='card'><h2 class='triage-title'>Runtime C2</h2>" + _render_json_node_html(runtime, "Runtime C2", open_all=True, open_root=True) + "</div>") if _has_nonempty(runtime) else ""}
-    {("<div class='card'><h2 class='triage-title'>RatterScanner</h2>" + _render_json_node_html(ratter, "RatterScanner", open_all=True, open_root=True) + "</div>") if _has_nonempty(ratter) else ""}
-    {("<div class='card'><h2 class='triage-title'>Stage2 Analysis</h2>" + _render_json_node_html(stage2, "Stage2 Analysis", open_all=True, open_root=True) + "</div>") if _has_nonempty(stage2) else ""}
-    {("<div class='card'><h2 class='triage-title'>Blockchain Indicators</h2>" + _render_json_node_html(blockchain, "Blockchain Indicators", open_all=True, open_root=True) + "</div>") if _has_nonempty(blockchain) else ""}
-    {("<div class='card'><h2 class='triage-title'>Network Endpoint Assessment</h2>" + _render_json_node_html(net_assess, "Network Endpoint Assessment", open_all=True, open_root=True) + "</div>") if _has_nonempty(net_assess) else ""}
-    {("<div class='card'><h2 class='triage-title'>Variant Detections</h2>" + _render_json_node_html(variant_detections, "Variant Detections", open_all=True, open_root=True) + "</div>") if _has_nonempty((variant_detections or {}).get("detected", [])) else ""}
-    {("<div class='card'><h2 class='triage-title'>Raw String Detections</h2>" + _render_json_node_html(raw_string_detections, "Raw String Detections", open_all=True, open_root=True) + "</div>") if _has_nonempty(raw_string_detections) else ""}
-    {("<div class='card'><h2 class='triage-title'>Heuristic Detections</h2>" + _render_json_node_html(heuristic_detections, "Heuristic Detections", open_all=True, open_root=True) + "</div>") if _has_nonempty(heuristic_detections) else ""}
+    {("<div class='card'><h2 class='triage-title'>Target Metadata</h2>"
+      + "<div class='meta-grid'>"
+      + ("<div class='meta-box'><h3>Basic Properties</h3><table class='meta-table'>" + "".join(basic_rows) + "</table></div>" if basic_rows else "")
+      + ("<div class='meta-box'><h3>Artifact Identity</h3><table class='meta-table'>" + "".join(artifact_rows) + "</table></div>" if artifact_rows else "")
+      + ("<div class='meta-box'><h3>JAR Archive Metadata</h3><table class='meta-table'>" + "".join(jar_rows) + "</table></div>" if jar_rows else "")
+      + ("<div class='meta-box'><h3>Bundle Metadata</h3><table class='meta-table'>" + "".join(bundle_rows) + "</table></div>" if bundle_rows else "")
+      + ("<div class='meta-box'><h3>Library Fingerprints</h3><div class='table-wrap'><table class='smart-table'><thead><tr><th>Library</th><th class='tight'>Java Files</th><th>Sample Paths</th></tr></thead><tbody>" + "".join(lib_rows) + "</tbody></table></div></div>" if lib_rows else "")
+      + "</div>"
+      + "</div>") if (basic_rows or artifact_rows or jar_rows or bundle_rows or lib_rows) else ""}
+    {("<div class='card'><h2 class='triage-title'>Runtime C2</h2>"
+      + ("<div class='meta-box'><table class='meta-table'>" + "".join(runtime_rows) + "</table></div>" if runtime_rows else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th class='tight'>Layer Type</th><th>Decoded</th><th>Note</th></tr></thead><tbody>" + "".join(rows_runtime_layers) + "</tbody></table></div>" if rows_runtime_layers else "")
+      + "</div>") if (runtime_rows or rows_runtime_layers) else ""}
+    {("<div class='card'><h2 class='triage-title'>RatterScanner</h2>"
+      + ("<div class='meta-box'><table class='meta-table'>" + "".join(ratter_rows) + "</table></div>" if ratter_rows else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th class='tight'>Status</th><th>Hash</th><th>File</th><th class='tight'>Automated Safe</th></tr></thead><tbody>" + "".join(rows_ratter) + "</tbody></table></div>" if rows_ratter else "")
+      + "</div>") if (ratter_rows or rows_ratter) else ""}
+    {("<div class='card'><h2 class='triage-title'>JLab Static Scan</h2>"
+      + ("<div class='meta-box'><table class='meta-table'>" + "".join(jlab_overview_rows) + "</table></div>" if jlab_overview_rows else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th class='tight'>Severity</th><th class='tight'>ID</th><th>Name</th><th>Description</th><th class='tight'>Type</th><th class='tight'>Count</th><th>Matches (preview)</th></tr></thead><tbody>" + "".join(rows_jlab) + "</tbody></table></div>" if rows_jlab else "")
+      + "</div>") if (jlab_overview_rows or rows_jlab) else ""}
+    {("<div class='card'><h2 class='triage-title'>Stage2 Analysis</h2>"
+      + ("<div class='meta-box'><table class='meta-table'>" + "".join(stage2_rows) + "</table></div>" if stage2_rows else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Native Entry (sample)</th></tr></thead><tbody>" + "".join(rows_stage2_native) + "</tbody></table></div>" if rows_stage2_native else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Type</th><th>Path</th><th>Evidence</th></tr></thead><tbody>" + "".join(rows_stage2_artifacts) + "</tbody></table></div>" if rows_stage2_artifacts else "")
+      + "</div>") if (stage2_rows or rows_stage2_native or rows_stage2_artifacts) else ""}
+    {("<div class='card'><h2 class='triage-title'>Blockchain Indicators</h2>"
+      "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Indicator Type</th><th>Value</th></tr></thead><tbody>"
+      + "".join(rows_blockchain) + "</tbody></table></div>"
+      + "</div>") if rows_blockchain else ""}
+    {("<div class='card'><h2 class='triage-title'>Network Endpoint Assessment</h2>"
+      + ("<div class='meta-box'><table class='meta-table'>" + "".join(net_rows) + "</table></div>" if net_rows else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Suspicious URLs</th></tr></thead><tbody>" + "".join(rows_net_suspicious) + "</tbody></table></div>" if rows_net_suspicious else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Unknown URLs</th></tr></thead><tbody>" + "".join(rows_net_unknown) + "</tbody></table></div>" if rows_net_unknown else "")
+      + "</div>") if (net_rows or rows_net_suspicious or rows_net_unknown) else ""}
+    {("<div class='card'><h2 class='triage-title'>Variant Detections</h2>"
+      + ("<div class='table-wrap'><table class='smart-table'><thead><tr><th>Variant</th><th class='tight'>Confidence</th><th class='tight'>Matches</th></tr></thead><tbody>" + "".join(rows_variant) + "</tbody></table></div>" if rows_variant else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Variant</th><th>Kind</th><th>Description</th><th>File</th><th class='tight'>Weight</th></tr></thead><tbody>" + "".join(rows_variant_matches) + "</tbody></table></div>" if rows_variant_matches else "")
+      + "</div>") if (rows_variant or rows_variant_matches) else ""}
+    {("<div class='card'><h2 class='triage-title'>Raw String Detections</h2>"
+      "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Weight</th><th class='tight'>File</th><th>Description</th></tr></thead><tbody>"
+      + "".join(rows_raw) + "</tbody></table></div>"
+      + "</div>") if rows_raw else ""}
+    {("<div class='card'><h2 class='triage-title'>Heuristic Detections</h2>"
+      "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Weight</th><th class='tight'>File</th><th>Description</th></tr></thead><tbody>"
+      + "".join(rows_heur) + "</tbody></table></div>"
+      + "</div>") if rows_heur else ""}
     {("<div class='card'><h2 class='triage-title'>Decoded Findings</h2>"
       "<div class='table-wrap'><table class='smart-table findings-table'><colgroup><col class='file-col'><col class='line-col'><col class='func-col'><col class='cat-col'><col></colgroup><thead><tr><th class='tight'>File</th><th class='tight'>Line</th><th class='func-col'>Function</th><th class='cat-col'>Category</th><th>Decoded</th></tr></thead><tbody>"
       + "".join(rows_find) + "</tbody></table></div>"
@@ -5576,6 +6067,69 @@ def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, pro
     return out_dir
 
 
+def resolve_jlab_upload_target(initial_target: Path, scan_root: Path, target_metadata: dict) -> tuple[Path | None, str]:
+    def _is_jar_or_zip(path: Path) -> bool:
+        return path.is_file() and path.suffix.lower() in {".jar", ".zip"}
+
+    if _is_jar_or_zip(initial_target):
+        return initial_target, "initial target file"
+    if _is_jar_or_zip(scan_root):
+        return scan_root, "scan root file"
+
+    source_jar_meta = (target_metadata or {}).get("source_jar_metadata", {}) or {}
+    source_name = str(source_jar_meta.get("name", "") or "").strip()
+    source_path_raw = str(source_jar_meta.get("path", "") or "").strip()
+    expected_size = int(source_jar_meta.get("size_bytes", 0) or 0)
+    expected_sha256 = str(source_jar_meta.get("sha256", "") or "").strip().lower()
+
+    if source_path_raw:
+        direct = Path(source_path_raw)
+        if _is_jar_or_zip(direct):
+            return direct, "source metadata path"
+
+    candidates: List[Path] = []
+    if source_name:
+        roots_to_check = [initial_target.parent, scan_root.parent, Path.cwd().resolve()]
+        seen_roots: set[str] = set()
+        for root in roots_to_check:
+            try:
+                root_resolved = root.resolve()
+            except Exception:
+                root_resolved = root
+            key = str(root_resolved)
+            if key in seen_roots:
+                continue
+            seen_roots.add(key)
+            cand = root_resolved / source_name
+            if _is_jar_or_zip(cand):
+                candidates.append(cand)
+
+    if not candidates:
+        basic = (target_metadata or {}).get("basic_properties", {}) or {}
+        subject = str(basic.get("subject", "") or "").strip()
+        if subject and subject.lower().endswith((".jar", ".zip")):
+            fallback = Path.cwd().resolve() / subject
+            if _is_jar_or_zip(fallback):
+                candidates.append(fallback)
+
+    if not candidates:
+        return None, "unable to locate source JAR/ZIP for upload"
+
+    for cand in candidates:
+        try:
+            if expected_size and int(cand.stat().st_size) != expected_size:
+                continue
+            if expected_sha256:
+                if _hash_file(cand, "sha256").lower() != expected_sha256:
+                    continue
+            return cand, "matched source metadata"
+        except Exception:
+            continue
+
+    # If metadata match failed, still allow first candidate by filename for best-effort scan.
+    return candidates[0], "best-effort filename match"
+
+
 def progress(enabled: bool, message: str, console=None) -> None:
     if enabled:
         msg = f"• {message}"
@@ -5609,6 +6163,7 @@ def render_rich(
     target_metadata: dict,
     stage2_analysis: dict | None = None,
     ratter_scanner: dict | None = None,
+    jlab_static_scan: dict | None = None,
     network_endpoint_assessment: dict | None = None,
     variant_detections: dict | None = None,
     raw_string_detections: List[dict] | None = None,
@@ -5893,6 +6448,50 @@ def render_rich(
                 )
             console.print(tr)
 
+    jl = jlab_static_scan or {}
+    if jl.get("attempted") or jl.get("error"):
+        console.print(Rule("[bold blue]JLab Static Scan"))
+        jt = Table(show_header=False, box=box.SIMPLE)
+        jt.add_row("Upload file", str(jl.get("upload_file", "")))
+        jt.add_row("Upload size", str(jl.get("upload_size", 0)))
+        if jl.get("status_code"):
+            jt.add_row("HTTP status", str(jl.get("status_code")))
+        if jl.get("rate_limit_limit") is not None or jl.get("rate_limit_remaining") is not None:
+            jt.add_row(
+                "Rate limit",
+                f"limit={jl.get('rate_limit_limit')} remaining={jl.get('rate_limit_remaining')}",
+            )
+        if jl.get("retry_after") is not None:
+            jt.add_row("Retry after", f"{jl.get('retry_after')}s")
+        if jl.get("error"):
+            jt.add_row("Error", str(jl.get("error")))
+        else:
+            jt.add_row(
+                "Matched signatures",
+                f"{jl.get('matched_signatures', 0)} / {jl.get('total_signatures', 0)}",
+            )
+        console.print(jt)
+
+        if not jl.get("error"):
+            sig_tbl = Table(title="JLab Matched Signatures", show_header=True, box=box.SIMPLE, expand=True)
+            sig_tbl.add_column("Severity", style="red", no_wrap=True)
+            sig_tbl.add_column("ID", style="cyan", overflow="fold")
+            sig_tbl.add_column("Name", style="yellow", overflow="fold")
+            sig_tbl.add_column("Type", style="green", no_wrap=True)
+            sig_tbl.add_column("Count", justify="right")
+            sig_tbl.add_column("Description", style="white", overflow="fold")
+            for sig in (jl.get("signatures", []) or [])[:80]:
+                sig_tbl.add_row(
+                    str(sig.get("severity", "")),
+                    str(sig.get("id", "")),
+                    str(sig.get("name", "")),
+                    str(sig.get("type", "")),
+                    str(sig.get("count", 0)),
+                    short(str(sig.get("description", "")), 180),
+                )
+            if (jl.get("signatures", []) or []):
+                console.print(sig_tbl)
+
 
     s2 = stage2_analysis or {}
     manual_payload_url = str(runtime_c2.get("payload_endpoint", "") or "")
@@ -6141,6 +6740,18 @@ def main() -> int:
     p.add_argument("--no-progress", action="store_true", help="Disable progress messages")
     p.add_argument("--no-network", action="store_true", help="Disable runtime C2 resolution over network")
     p.add_argument(
+        "--jlab-static-scan",
+        action="store_true",
+        default=True,
+        help="Upload source JAR/ZIP to JLab public static scan API and include matched signature results (default: enabled)",
+    )
+    p.add_argument(
+        "--no-jlab-static-scan",
+        dest="jlab_static_scan",
+        action="store_false",
+        help="Disable JLab public static scan lookup",
+    )
+    p.add_argument(
         "--analyze-stage2",
         action="store_true",
         default=True,
@@ -6180,6 +6791,7 @@ def main() -> int:
     args = p.parse_args()
 
     root = resolve_target(args.target)
+    initial_target = root
     show_progress = not args.no_progress
     pref_width = max(80, int(args.rich_width))
     progress_console = Console(stderr=False, width=pref_width) if RICH_AVAILABLE else None
@@ -6546,6 +7158,21 @@ def main() -> int:
     progress(show_progress, f"Detected {len(artifact_findings)} Artifact Indicator(s)", progress_console)
     runtime_c2 = {"attempted": False, "resolved": False}
     ratter_scanner = {"attempted": False, "error": "", "results": []}
+    jlab_static_scan = {
+        "attempted": False,
+        "error": "",
+        "status_code": 0,
+        "upload_file": "",
+        "upload_size": 0,
+        "file_name": "",
+        "file_size": 0,
+        "total_signatures": 0,
+        "matched_signatures": 0,
+        "signatures": [],
+        "retry_after": None,
+        "rate_limit_limit": None,
+        "rate_limit_remaining": None,
+    }
     stage2_analysis = {
         "enabled": bool(args.analyze_stage2),
         "attempted": False,
@@ -6594,6 +7221,33 @@ def main() -> int:
                     progress_console,
                 )
 
+    if args.jlab_static_scan:
+        if args.no_network:
+            jlab_static_scan["error"] = "JLab static scan requires network access; rerun without --no-network"
+        else:
+            upload_target, target_note = resolve_jlab_upload_target(initial_target, scan_root, target_metadata)
+            if upload_target is None:
+                jlab_static_scan["error"] = f"JLab static scan skipped: {target_note}"
+            else:
+                progress(
+                    show_progress,
+                    f"Querying JLab Static Scan API For {_display_report_path(upload_target, Path.cwd().resolve())}",
+                    progress_console,
+                )
+                jlab_static_scan = lookup_jlab_static_scan(upload_target)
+                if target_note:
+                    jlab_static_scan["upload_resolution"] = target_note
+                if jlab_static_scan.get("error"):
+                    progress(show_progress, f"JLab Static Scan Error: {jlab_static_scan.get('error')}", progress_console)
+                else:
+                    progress(
+                        show_progress,
+                        "JLab Static Scan Results: "
+                        f"matched={jlab_static_scan.get('matched_signatures', 0)} "
+                        f"total={jlab_static_scan.get('total_signatures', 0)}",
+                        progress_console,
+                    )
+
     progress(show_progress, "Building Summary", progress_console)
 
     if rich_progress_mode and RICH_AVAILABLE and progress_console is not None:
@@ -6637,6 +7291,7 @@ def main() -> int:
                 "assessment_summary": summarize_assessments(behavior_findings),
                 "runtime_c2": runtime_c2,
                 "ratter_scanner": ratter_scanner,
+                "jlab_static_scan": jlab_static_scan,
                 "network_endpoint_assessment": network_endpoint_assessment,
                 "variant_detections": variant_detections,
                 "raw_string_detections": raw_string_detections,
@@ -6670,6 +7325,7 @@ def main() -> int:
                 target_metadata,
                 stage2_analysis,
                 ratter_scanner,
+                jlab_static_scan,
                 network_endpoint_assessment,
                 variant_detections,
                 raw_string_detections,
@@ -6714,6 +7370,7 @@ def main() -> int:
             "assessment_summary": summarize_assessments(behavior_findings),
             "runtime_c2": runtime_c2,
             "ratter_scanner": ratter_scanner,
+            "jlab_static_scan": jlab_static_scan,
             "network_endpoint_assessment": network_endpoint_assessment,
             "variant_detections": variant_detections,
             "raw_string_detections": raw_string_detections,
@@ -6743,6 +7400,7 @@ def main() -> int:
             target_metadata,
             stage2_analysis,
             ratter_scanner,
+            jlab_static_scan,
             network_endpoint_assessment,
             variant_detections,
             raw_string_detections,
@@ -6795,6 +7453,7 @@ def main() -> int:
             target_metadata,
             stage2_analysis,
             ratter_scanner,
+            jlab_static_scan,
             network_endpoint_assessment,
             variant_detections,
             raw_string_detections,
