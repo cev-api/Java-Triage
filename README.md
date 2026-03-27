@@ -7,7 +7,7 @@
 
 `java_triage.py` is a static triage tool for suspicious Java codebases, decompiled JARs, and Minecraft mods.
 
-It can decompile JARs with CFR, rewrite supported obfuscated string patterns, scan suspicious strings and behaviors, identify suspicious artifacts, resolve runtime C2 hints from on-chain config data, optionally inspect a resolved stage-2 JAR in static-only mode, and produce Rich console, JSON, and HTML reports.
+It can decompile JARs with CFR, rewrite supported obfuscated string patterns, scan suspicious strings and behaviors, identify suspicious artifacts, resolve runtime C2 hints from on-chain config data, optionally inspect a resolved stage-2 JAR in static-only mode, query external enrichment APIs (RatterScanner and JLab static scan), and produce Rich console, JSON, and HTML reports.
 
 ## Features
 
@@ -41,6 +41,7 @@ It can decompile JARs with CFR, rewrite supported obfuscated string patterns, sc
 - Extracts blockchain indicators from decoded strings such as contracts, selectors, RPC hosts, and RPC URLs.
 - Detects known malware variants, runs raw string detections, and applies cross-variant heuristics.
 - Queries the free RatterScanner API for discovered SHA256 hashes.
+- Queries the JLab public static scan API by uploading the source JAR/ZIP (when available) and includes matched signature results.
 - Produces:
   - human-readable console output with optional Rich tables and progress bars
   - machine-readable JSON output
@@ -61,7 +62,7 @@ will:
 3. Run a quick obfuscation-density probe on the scan root.
 4. If supported obfuscated call patterns are detected, copy the target to a deobfuscated working folder and rewrite supported string calls there.
 5. Scan the resulting source tree.
-6. Optionally resolve runtime C2 hints, perform stage-2 static analysis, and enrich results with RatterScanner.
+6. Optionally resolve runtime C2 hints, perform stage-2 static analysis, and enrich results with RatterScanner and JLab static scan.
 7. Render the Rich console report and write JSON and HTML reports by default.
 
 If the probe does **not** detect any supported obfuscated call patterns, no deobfuscated copy is created and the source tree is scanned directly.
@@ -209,6 +210,9 @@ python java_triage.py ./sample_project --no-network
 # Disable stage-2 static analysis
 python java_triage.py ./sample_project --no-analyze-stage2
 
+# Disable JLab static scan enrichment
+python java_triage.py ./sample_project --no-jlab-static-scan
+
 # Wider rich output
 python java_triage.py ./sample_project --rich-width 220
 ```
@@ -224,6 +228,8 @@ python java_triage.py ./sample_project --rich-width 220
 - `--html-out <path>`: write HTML report to a custom file
 - `--no-progress`: disable progress messages
 - `--no-network`: disable runtime C2 resolution and related network lookups
+- `--jlab-static-scan`: upload source JAR/ZIP to JLab public static scan API and include matched signature results (enabled by default)
+- `--no-jlab-static-scan`: disable JLab public static scan lookup
 - `--analyze-stage2`: after resolving a runtime payload endpoint, download the stage-2 JAR and perform static-only analysis (enabled by default)
 - `--no-analyze-stage2`: disable stage-2 static analysis
 - `--rich-width <int>`: preferred Rich console width for progress and final report rendering
@@ -248,6 +254,7 @@ Text and Rich output include:
 - Raw String Detections
 - Heuristic Detections
 - RatterScanner results
+- JLab static scan results
 - Summary counts and verdict layers
 
 JSON output includes the full scan payload, including:
@@ -260,6 +267,7 @@ JSON output includes the full scan payload, including:
 - `raw_string_detections`
 - `heuristic_detections`
 - `ratter_scanner`
+- `jlab_static_scan`
 - `findings`
 - `behavior_findings`
 - `artifact_findings`
@@ -270,6 +278,31 @@ HTML output is a standalone styled report and includes:
 - executive summary, when available
 - expanded metadata and enrichment sections
 - omission of categories that are completely empty
+
+## JLab Static Scan Enrichment
+
+When enabled, Java Triage will attempt to upload the original source JAR/ZIP to:
+
+- `https://jlab.threat.rip/api/public/static-scan`
+
+Behavior details:
+
+- Enabled by default (`--jlab-static-scan`)
+- Can be disabled with `--no-jlab-static-scan`
+- Requires network access (disabled by `--no-network`)
+- Upload target priority:
+  - direct target file if scanning a `.jar`/`.zip`
+  - scan root file if scan root is a `.jar`/`.zip`
+  - source JAR metadata path/name fallback for decompiled directory scans
+- Size and format guardrails:
+  - only `.jar`/`.zip` are uploaded
+  - max upload size handled by the tool: `50 MB`
+
+Returned data is stored under `jlab_static_scan` in JSON and rendered in Rich/HTML reports, including:
+
+- upload metadata (filename, size, status)
+- rate-limit metadata when available
+- matched signature count and signature rows (severity, id, name, description, type, count, match preview)
 
 ## Executive Summary
 
@@ -284,6 +317,8 @@ If no API key is present, the tool behaves as if this feature does not exist and
 - Class-constant fallback mode provides useful indicators but less semantic context than full source scanning.
 - Behavioral and signature detections are heuristic-based and may produce false positives or miss novel techniques.
 - Network-based runtime C2 resolution and stage-2 enrichment are best-effort and may fail due to missing indicators, DNS failure, RPC issues, or decoding variance.
+- External API enrichments (RatterScanner/JLab) are best-effort and may fail due to network issues, API errors, rate limits, or response format changes.
+- JLab public scan is an external experimental endpoint; response fields and behavior may change over time.
 - Metadata enrichments such as `SSDEEP`, `TLSH`, `TrID`, `Magika`, and `Vhash` are best-effort and only appear when dependencies are available.
 - Nested archive or payload extraction is heuristic and best-effort; highly custom packers may still evade static expansion.
 - Do **not** rely on this tool alone to determine whether a Java application is safe.
