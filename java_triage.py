@@ -23,19 +23,23 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.rule import Rule
+    from rich.panel import Panel
+    from rich.text import Text
     from rich import box
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn, TimeElapsedColumn
     RICH_AVAILABLE = True
 except Exception:
     RICH_AVAILABLE = False
 
-BANNER = r"""     __              ______    _              
- __ / /__ __  _____ /_  __/___(_)__ ____ ____ 
-/ // / _ `/ |/ / _ `// / / __/ / _ `/ _ `/ -_)
-\___/\_,_/|___/\_,_//_/ /_/ /_/\_,_/\_, /\__/ 
-            github.com/cev-api      /___/      
-    
-    """
+BANNER = r"""                                                 
+     ██  █████  ██    ██  █████  ████████ ██████  ██  █████   ██████  ███████ 
+     ██ ██   ██ ██    ██ ██   ██    ██    ██   ██ ██ ██   ██ ██       ██      
+     ██ ███████ ██    ██ ███████    ██    ██████  ██ ███████ ██   ███ █████   
+██   ██ ██   ██  ██  ██  ██   ██    ██    ██   ██ ██ ██   ██ ██    ██ ██      
+ █████  ██   ██   ████   ██   ██    ██    ██   ██ ██ ██   ██  ██████  ███████ 
+https://github.com/cev-api/Java-Triage
+
+"""
 
 
 LOAD_CALL_RE = re.compile(
@@ -1563,9 +1567,9 @@ def deobfuscate_codebase(root: Path, profile: Optional[DecryptProfile], enabled_
 
     if use_rich_progress:
         with Progress(
-            SpinnerColumn(style="cyan"),
-            TextColumn("[bold cyan]Deobfuscating Java files"),
-            BarColumn(bar_width=30),
+            SpinnerColumn(style="#C000FF"),
+            TextColumn("[bold white]Deobfuscating Java files"),
+            BarColumn(bar_width=30, complete_style="#C000FF", finished_style="#C000FF", pulse_style="#C000FF"),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             console=progress_console,
@@ -2000,9 +2004,9 @@ def _run_subprocess_with_progress(
             start = time.time()
             if show_progress and RICH_AVAILABLE and progress_console is not None:
                 with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[bold cyan]{task.description}"),
-                    BarColumn(bar_width=32),
+                    SpinnerColumn(style="#C000FF"),
+                    TextColumn("[bold white]{task.description}"),
+                    BarColumn(bar_width=32, complete_style="#C000FF", finished_style="#C000FF", pulse_style="#C000FF"),
                     TimeElapsedColumn(),
                     console=progress_console,
                     transient=False,
@@ -5473,14 +5477,17 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     rows_beh = []
     for r in behaviors[:1000]:
         idx = len(rows_beh)
+        sev = str(r.get("severity", "info") or "info").strip().lower()
+        row_class = f"row-{sev}" if sev in {"critical", "high", "medium", "low", "info"} else ""
+        evidence_class = "behavior-evidence-high" if sev in {"critical", "high"} else ("behavior-evidence-medium" if sev == "medium" else "")
         hidden_attr = " style='display:none' data-behavior-extra='1'" if idx >= behavior_limit else ""
         rows_beh.append(
-            f"<tr{hidden_attr}>"
-            f"<td class='tight'><span class='sev sev-{_h(r.get('severity', 'info'))}'>{_h(r.get('severity', 'info'))}</span></td>"
+            f"<tr class='{row_class}'{hidden_attr}>"
+            f"<td class='tight'><span class='sev sev-{_h(sev)}'>{_h(sev)}</span></td>"
             f"<td class='tight'>{_h(r.get('file', ''))}</td>"
             f"<td class='tight'>{_h(r.get('line', ''))}</td>"
             f"<td>{_h(r.get('behavior', ''))}</td>"
-            f"<td>{_h(r.get('evidence', ''))}</td>"
+            f"<td class='{evidence_class}'>{_h(r.get('evidence', ''))}</td>"
             "</tr>"
         )
     rows_art = []
@@ -5817,6 +5824,11 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     .behavior-table col.file-col {{ width:28ch; }}
     .behavior-table col.line-col {{ width:6ch; }}
     .behavior-table col.beh-col {{ width:30ch; }}
+    .smart-table tbody tr.row-critical td:first-child {{ box-shadow:inset 3px 0 0 rgba(255,70,70,.92); }}
+    .smart-table tbody tr.row-high td:first-child {{ box-shadow:inset 3px 0 0 rgba(255,116,116,.85); }}
+    .smart-table tbody tr.row-medium td:first-child {{ box-shadow:inset 3px 0 0 rgba(255,210,102,.78); }}
+    .behavior-evidence-high {{ color:#ffd6d6; font-weight:600; }}
+    .behavior-evidence-medium {{ color:#ffeabf; }}
     .meta-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:.75rem; }}
     .meta-box {{ border:1px solid rgba(255,255,255,.08); border-radius:10px; background:rgba(8,22,35,.72); padding:.65rem; }}
     .meta-box h3 {{ margin:.1rem 0 .55rem; color:#9dd5ff; }}
@@ -5825,7 +5837,12 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     .meta-table tr:last-child td {{ border-bottom:0; }}
     .meta-k {{ color:#9dd5ff; font-family:Consolas,Monaco,monospace; width:38%; }}
     .meta-v {{ color:#edf4fb; }}
-    .matches-col {{ max-width:32ch; color:#a8c7df; font-size:.82rem; }}
+    .jlab-table col.sev-col {{ width:10ch; }}
+    .jlab-table col.id-col {{ width:16ch; }}
+    .jlab-table col.type-col {{ width:11ch; }}
+    .jlab-table col.count-col {{ width:7ch; }}
+    .jlab-table col.matches-col {{ width:48ch; }}
+    .jlab-table td.matches-col {{ min-width:42ch; max-width:none; color:#a8c7df; font-size:.82rem; white-space:normal; overflow-wrap:anywhere; word-break:break-word; }}
   </style>
 </head>
 <body>
@@ -5887,7 +5904,7 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
       + "</div>") if (ratter_rows or rows_ratter) else ""}
     {("<div class='card'><h2 class='triage-title'>JLab Static Scan</h2>"
       + ("<div class='meta-box'><table class='meta-table'>" + "".join(jlab_overview_rows) + "</table></div>" if jlab_overview_rows else "")
-      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th class='tight'>Severity</th><th class='tight'>ID</th><th>Name</th><th>Description</th><th class='tight'>Type</th><th class='tight'>Count</th><th>Matches (preview)</th></tr></thead><tbody>" + "".join(rows_jlab) + "</tbody></table></div>" if rows_jlab else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table jlab-table'><colgroup><col class='sev-col'><col class='id-col'><col><col><col class='type-col'><col class='count-col'><col class='matches-col'></colgroup><thead><tr><th class='tight'>Severity</th><th class='tight'>ID</th><th>Name</th><th>Description</th><th class='tight'>Type</th><th class='tight'>Count</th><th>Matches (preview)</th></tr></thead><tbody>" + "".join(rows_jlab) + "</tbody></table></div>" if rows_jlab else "")
       + "</div>") if (jlab_overview_rows or rows_jlab) else ""}
     {("<div class='card'><h2 class='triage-title'>Stage2 Analysis</h2>"
       + ("<div class='meta-box'><table class='meta-table'>" + "".join(stage2_rows) + "</table></div>" if stage2_rows else "")
@@ -5969,11 +5986,30 @@ def resolve_target(raw_target: str) -> Path:
     return Path(raw_target).resolve()
 
 
-def _prompt_select_jar(candidates: List[Path]) -> Path | None:
-    print("Multiple JAR files found. Pick one to scan:", file=sys.stderr)
-    for idx, jar in enumerate(candidates, start=1):
-        print(f"  {idx}. {jar.name}", file=sys.stderr)
-    print("  0. Cancel", file=sys.stderr)
+def _prompt_select_jar(candidates: List[Path], console=None) -> Path | None:
+    if RICH_AVAILABLE:
+        ui_console = console or Console(stderr=True, width=_triage_ui_width())
+        width = _triage_ui_width(ui_console)
+        table = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0, 1))
+        table.width = width - 4
+        table.add_column("#", style="bold #C000FF", no_wrap=True)
+        table.add_column("JAR", style="bold white", overflow="fold")
+        for idx, jar in enumerate(candidates, start=1):
+            table.add_row(str(idx), jar.name)
+        table.add_row("0", "Cancel")
+        ui_console.print(
+            Panel(
+                table,
+                border_style="#C000FF",
+                width=width,
+            )
+        )
+    else:
+        print("Multiple JAR files found. Pick one to scan:", file=sys.stderr)
+        for idx, jar in enumerate(candidates, start=1):
+            print(f"  {idx}. {jar.name}", file=sys.stderr)
+        print("  0. Cancel", file=sys.stderr)
+
     while True:
         print("Select JAR number to decompile and scan: ", end="", file=sys.stderr, flush=True)
         try:
@@ -5989,8 +6025,10 @@ def _prompt_select_jar(candidates: List[Path]) -> Path | None:
             continue
         choice = int(raw)
         if choice == 0:
+            print("", file=sys.stderr)
             return None
         if 1 <= choice <= len(candidates):
+            print("", file=sys.stderr)
             return candidates[choice - 1]
         print(f"Invalid selection. Enter 0-{len(candidates)}.", file=sys.stderr)
 
@@ -6028,7 +6066,7 @@ def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, pro
                 progress_console,
             )
             return initial_root
-        selected = _prompt_select_jar(jar_candidates)
+        selected = _prompt_select_jar(jar_candidates, progress_console)
         if selected is None:
             print("JAR selection cancelled. Continuing with current target.", file=sys.stderr)
             return initial_root
@@ -6134,23 +6172,158 @@ def progress(enabled: bool, message: str, console=None) -> None:
     if enabled:
         msg = f"• {message}"
         if RICH_AVAILABLE and console is not None:
-            console.print(msg, style="bold cyan", highlight=False)
+            console.print(msg, style="bold white", highlight=False)
         else:
             print(msg, file=sys.stderr, flush=True)
 
 
-def print_banner(console=None, to_stderr: bool = False) -> None:
-    width = 120
+def _triage_ui_width(console=None) -> int:
+    try:
+        if RICH_AVAILABLE and console is not None:
+            width = getattr(console, "width", None)
+            if not width:
+                size = getattr(console, "size", None)
+                width = getattr(size, "width", 120) if size else 120
+            return max(60, min(120, int(width) - 2))
+    except Exception:
+        pass
+    return max(60, min(120, shutil.get_terminal_size((120, 20)).columns - 2))
+
+
+def _print_section(console, title: str) -> None:
+    console.print()
+    console.print(Rule(Text(title, style="bold white"), style="#C000FF"))
+
+
+def _print_scan_beginning(console=None) -> None:
     if RICH_AVAILABLE and console is not None:
-        width = max(40, console.size.width)
+        console.print()
+        console.print("[bold #C000FF]Scan beginning[/bold #C000FF]")
+        console.print(Rule(style="#C000FF"))
+        console.print()
     else:
-        width = max(40, shutil.get_terminal_size((120, 20)).columns)
-    centered = "\n".join(line.center(width) for line in BANNER.splitlines())
+        print("", file=sys.stderr)
+        print("Scan beginning", file=sys.stderr)
+        print("=" * 48, file=sys.stderr)
+        print("", file=sys.stderr)
+
+
+def _lerp(a: int, b: int, t: float) -> int:
+    return int(a + (b - a) * t)
+
+
+def make_multi_gradient(stops: List[tuple[int, int, int]], steps: int) -> List[tuple[int, int, int]]:
+    if steps <= 1:
+        return [stops[0]]
+    segs = len(stops) - 1
+    out: List[tuple[int, int, int]] = []
+    for i in range(steps):
+        pos = i * segs / (steps - 1)
+        idx = int(pos)
+        if idx >= segs:
+            idx = segs - 1
+            t = 1.0
+        else:
+            t = pos - idx
+        r = _lerp(stops[idx][0], stops[idx + 1][0], t)
+        g = _lerp(stops[idx][1], stops[idx + 1][1], t)
+        b = _lerp(stops[idx][2], stops[idx + 1][2], t)
+        out.append((r, g, b))
+    return out
+
+
+def _gradient_banner_text(width: int) -> str:
+    lines = BANNER.splitlines()
+    stops = [
+        (85, 0, 145),
+        (122, 87, 176),
+        (199, 162, 255),
+    ]
+    colors = make_multi_gradient(stops, max(1, len(lines)))
+    out: List[str] = []
+    for line, (r, g, b) in zip(lines, colors):
+        out.append(f"\033[38;2;{r};{g};{b}m{line.center(width)}\033[0m")
+    return "\n".join(out)
+
+
+def print_banner(console=None, to_stderr: bool = False) -> None:
+    try:
+        os.system("")
+    except Exception:
+        pass
+    width = _triage_ui_width(console)
+    rendered = _gradient_banner_text(width)
     if RICH_AVAILABLE and console is not None:
-        console.print(centered, style="bold cyan", markup=False, highlight=False)
+        console.print(Text.from_ansi(rendered), highlight=False)
     else:
         stream = sys.stderr if to_stderr else sys.stdout
-        print(centered, file=stream)
+        print(rendered, file=stream)
+
+
+def _unlink_existing_result(path: Path | None, show_progress: bool, progress_console=None) -> None:
+    if path is None or not path.exists():
+        return
+    try:
+        path.unlink()
+        progress(
+            show_progress,
+            f"removed old result: {_display_report_path(path, Path.cwd().resolve())}",
+            progress_console,
+        )
+    except Exception as exc:
+        progress(
+            show_progress,
+            f"warning: failed to remove old result {_display_report_path(path, Path.cwd().resolve())}: {exc}",
+            progress_console,
+        )
+
+
+def _prompt_existing_scan_result(json_path: Path, html_path: Path | None, progress_console=None) -> str:
+    html_status = "disabled"
+    if html_path is not None:
+        html_status = "exists" if html_path.exists() else "missing"
+
+    if RICH_AVAILABLE:
+        ui_console = progress_console or Console(stderr=True, width=_triage_ui_width())
+        width = _triage_ui_width(ui_console)
+        table = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0, 1))
+        table.width = width - 4
+        table.add_column("Item", style="#C000FF", no_wrap=True)
+        table.add_column("Status", style="bold white", no_wrap=True)
+        table.add_column("Path", style="white", overflow="fold")
+        table.add_row("JSON", "exists", _display_report_path(json_path, Path.cwd().resolve()))
+        if html_path is not None:
+            table.add_row("HTML", html_status, _display_report_path(html_path, Path.cwd().resolve()))
+        ui_console.print("\n[bold #C000FF]Existing scan result found[/bold #C000FF]")
+        ui_console.print(
+            Panel(
+                table,
+                border_style="#C000FF",
+                width=width,
+            )
+        )
+    else:
+        print(f"Existing JSON result found: {_display_report_path(json_path, Path.cwd().resolve())}", file=sys.stderr)
+        if html_path is not None:
+            print(
+                f"Existing HTML result status: {html_status} ({_display_report_path(html_path, Path.cwd().resolve())})",
+                file=sys.stderr,
+            )
+
+    while True:
+        print("Rescan and overwrite previous result? [R]escan / [U]se existing / [C]ancel: ", end="", file=sys.stderr, flush=True)
+        try:
+            raw = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("", file=sys.stderr)
+            return "cancel"
+        if raw in {"", "u", "use", "reuse", "existing"}:
+            return "reuse"
+        if raw in {"r", "rescan", "overwrite", "yes", "y"}:
+            return "rescan"
+        if raw in {"c", "cancel", "q", "quit", "no", "n"}:
+            return "cancel"
+        print("Invalid selection. Enter R, U, or C.", file=sys.stderr)
 
 
 def render_rich(
@@ -6181,7 +6354,7 @@ def render_rich(
     artifact_identity = target_metadata.get("artifact_identity", {}) or {}
     library_fingerprints = target_metadata.get("library_fingerprints", {}) or {}
 
-    console.print(Rule("[bold blue]Basic Properties"))
+    _print_section(console, "Basic Properties")
     bt = Table(show_header=False, box=box.SIMPLE)
     bt.add_row("Subject", str(basic.get("subject", "")))
     bt.add_row("MD5", str(basic.get("md5", "")))
@@ -6203,7 +6376,7 @@ def render_rich(
     bt.add_row("File size", f"{basic.get('file_size_text', '')} ({basic.get('file_size_bytes', 0)} bytes)")
     console.print(bt)
 
-    console.print(Rule("[bold blue]JAR Info"))
+    _print_section(console, "JAR Info")
     mt = Table(show_header=False, box=box.SIMPLE)
     mt.add_row("Manifest", short(jar_info.get("manifest", "") or "<not found>", 800))
     am = jar_info.get("archive_metadata", {})
@@ -6222,7 +6395,7 @@ def render_rich(
             amt.add_row(str(k), str(v))
         console.print(amt)
 
-    console.print(Rule("[bold blue]Bundle Info"))
+    _print_section(console, "Bundle Info")
     bmt = Table(show_header=False, box=box.SIMPLE)
     bmt.add_row("Contained Files", str(bundle_info.get("contained_files", 0)))
     bmt.add_row(
@@ -6248,13 +6421,13 @@ def render_rich(
         for k, v in b_ext.items():
             bet.add_row(str(k), str(v))
         console.print(bet)
-    console.print(Rule("[bold blue]Artifact Identity"))
+    _print_section(console, "Artifact Identity")
     ai = Table(show_header=False, box=box.SIMPLE)
     ai.add_row("Scan Root Name", str(artifact_identity.get("scan_root_name", "")))
     ai.add_row("Scan Root Tree SHA256", str(artifact_identity.get("scan_root_tree_sha256", "")))
     ai.add_row("Scan Root File Count", str(artifact_identity.get("scan_root_file_count", 0)))
     console.print(ai)
-    console.print(Rule("[bold blue]Library Fingerprints"))
+    _print_section(console, "Library Fingerprints")
     lt = Table(show_header=True, box=box.SIMPLE)
     lt.add_column("Library")
     lt.add_column("Java Files", justify="right")
@@ -6268,7 +6441,7 @@ def render_rich(
     console.print(lt)
 
     if findings:
-        console.print(Rule("[bold blue]Decode + String Findings"))
+        _print_section(console, "Decode + String Findings")
         t = Table(show_lines=False, expand=True)
         t.add_column("Category", style="magenta", max_width=22, no_wrap=True, overflow="ellipsis")
         t.add_column("Location", style="cyan", overflow="fold")
@@ -6290,11 +6463,11 @@ def render_rich(
             has_assessment_rows = True
             at.add_row(label, f"{item['file']}:{item['line']}", item["behavior"], short(item["evidence"]))
     if has_assessment_rows:
-        console.print(Rule("[bold blue]Assessment Findings"))
+        _print_section(console, "Assessment Findings")
         console.print(at)
 
     if behaviors:
-        console.print(Rule("[bold blue]Behavioral Findings"))
+        _print_section(console, "Behavioral Findings")
         t = Table(show_lines=False, box=box.SIMPLE, expand=True)
         t.add_column("Risk", style="red")
         t.add_column("Behavior", style="yellow")
@@ -6305,7 +6478,7 @@ def render_rich(
         console.print(t)
 
     if artifacts:
-        console.print(Rule("[bold blue]Artifact Findings"))
+        _print_section(console, "Artifact Findings")
         t = Table(show_lines=False, box=box.SIMPLE, expand=True)
         t.add_column("Type", style="red")
         t.add_column("Path", style="cyan")
@@ -6320,7 +6493,7 @@ def render_rich(
         console.print(t)
 
     net = network_endpoint_assessment or {}
-    console.print(Rule("[bold blue]Network Endpoint Assessment"))
+    _print_section(console, "Network Endpoint Assessment")
     nt = Table(show_header=False, box=box.SIMPLE)
     nt.add_row("Total URLs", str(net.get("total_urls", 0)))
     nt.add_row("Vendor URLs", str(net.get("vendor_count", 0)))
@@ -6335,7 +6508,7 @@ def render_rich(
         console.print(st)
 
     if runtime_c2.get("attempted"):
-        console.print(Rule("[bold blue]Runtime C2 Resolution"))
+        _print_section(console, "Runtime C2 Resolution")
         if runtime_c2.get("resolved"):
             console.print(f"[green]Resolved:[/green] yes via {runtime_c2.get('rpc_used')}")
             console.print(f"C2 base URL: {runtime_c2.get('c2_base_url')}")
@@ -6363,7 +6536,7 @@ def render_rich(
             console.print(f"Error: {runtime_c2.get('error')}")
 
     vd = variant_detections or {}
-    console.print(Rule("[bold blue]Variant Detections"))
+    _print_section(console, "Variant Detections")
     vdt = Table(show_header=True, box=box.SIMPLE)
     vdt.add_column("Variant")
     vdt.add_column("Score", justify="right")
@@ -6375,7 +6548,7 @@ def render_rich(
     else:
         vdt.add_row("none", "0", "0")
     console.print(vdt)
-    console.print(Rule("[bold blue]Raw String Detections"))
+    _print_section(console, "Raw String Detections")
     rsd = raw_string_detections or []
     rst = Table(show_header=True, box=box.SIMPLE)
     rst.add_column("Weight", justify="right")
@@ -6387,7 +6560,7 @@ def render_rich(
     else:
         rst.add_row("0", "-", "none")
     console.print(rst)
-    console.print(Rule("[bold blue]Heuristic Detections"))
+    _print_section(console, "Heuristic Detections")
     hd = heuristic_detections or []
     hdt = Table(show_header=True, box=box.SIMPLE)
     hdt.add_column("Weight", justify="right")
@@ -6402,7 +6575,7 @@ def render_rich(
 
     rs = ratter_scanner or {}
     if rs.get("attempted"):
-        console.print(Rule("[bold blue]RatterScanner"))
+        _print_section(console, "RatterScanner")
         if rs.get("error"):
             console.print(f"[red]Error:[/red] {rs.get('error')}")
         else:
@@ -6450,7 +6623,7 @@ def render_rich(
 
     jl = jlab_static_scan or {}
     if jl.get("attempted") or jl.get("error"):
-        console.print(Rule("[bold blue]JLab Static Scan"))
+        _print_section(console, "JLab Static Scan")
         jt = Table(show_header=False, box=box.SIMPLE)
         jt.add_row("Upload file", str(jl.get("upload_file", "")))
         jt.add_row("Upload size", str(jl.get("upload_size", 0)))
@@ -6496,14 +6669,14 @@ def render_rich(
     s2 = stage2_analysis or {}
     manual_payload_url = str(runtime_c2.get("payload_endpoint", "") or "")
     if s2.get("enabled") and not s2.get("attempted"):
-        console.print(Rule("[bold blue]Stage2 Analysis"))
+        _print_section(console, "Stage2 Analysis")
         console.print("Attempted: no")
         if manual_payload_url:
             console.print(f"Manual stage2 download URL: {manual_payload_url}")
         if s2.get("error"):
             console.print(f"Reason: {s2.get('error')}")
     elif s2.get("enabled"):
-        console.print(Rule("[bold blue]Stage2 Analysis"))
+        _print_section(console, "Stage2 Analysis")
         t2 = Table(show_header=False, box=box.SIMPLE)
         t2.add_row("Attempted", "yes")
         t2.add_row("Static-only mode", str(bool(s2.get("static_only_no_execution", True))))
@@ -6537,7 +6710,7 @@ def render_rich(
             console.print(at)
 
     if any([blockchain["contracts"], blockchain["selectors"], blockchain["rpc_hosts"], blockchain["rpc_urls"], blockchain["api_key_urls"]]):
-        console.print(Rule("[bold blue]Blockchain Indicators"))
+        _print_section(console, "Blockchain Indicators")
         bt = Table(show_header=False, box=box.SIMPLE)
         bt.add_row("Contracts", str(len(blockchain["contracts"])))
         bt.add_row("Method selectors", str(len(blockchain["selectors"])))
@@ -6570,7 +6743,7 @@ def render_rich(
                 t_api.add_row(item)
             console.print(t_api)
 
-    console.print(Rule("[bold blue]Summary"))
+    _print_section(console, "Summary")
     s = Table(show_header=False, box=None)
     s.add_row("Total findings", str(summary["total_findings"]))
     s.add_row("Unique decoded strings", str(summary["unique_decoded_strings"]))
@@ -6598,7 +6771,7 @@ def render_rich(
             b.add_row(sev, str(count))
         console.print(b)
     if executive_summary:
-        console.print(Rule("[bold blue]Executive Summary"))
+        _print_section(console, "Executive Summary")
         console.print(executive_summary)
 
 
@@ -6885,17 +7058,6 @@ def main() -> int:
         shutil.copytree(root, out_root)
         scan_root = out_root
 
-    if args.json and not args.out:
-        default_json_out = Path.cwd().resolve() / _json_output_name_for_scan_root(scan_root, Path.cwd().resolve())
-        if default_json_out.exists():
-            progress(
-                phase_logs,
-                f"existing JSON result found; skipping scan: {_display_report_path(default_json_out, Path.cwd().resolve())}",
-                progress_console,
-            )
-            return 0
-        args.out = str(default_json_out)
-
     if args.html_out:
         args.html = True
     if args.html:
@@ -6904,6 +7066,43 @@ def main() -> int:
             if args.html_out
             else (Path.cwd().resolve() / _html_output_name_for_scan_root(scan_root, Path.cwd().resolve()))
         )
+
+    if args.json and not args.out:
+        default_json_out = Path.cwd().resolve() / _json_output_name_for_scan_root(scan_root, Path.cwd().resolve())
+        if default_json_out.exists():
+            html_missing = bool(args.html and html_out_path is not None and not html_out_path.exists())
+            if sys.stdin.isatty():
+                existing_choice = _prompt_existing_scan_result(default_json_out, html_out_path, progress_console)
+                if existing_choice == "reuse":
+                    progress(
+                        phase_logs,
+                        f"using existing JSON result: {_display_report_path(default_json_out, Path.cwd().resolve())}",
+                        progress_console,
+                    )
+                    return 0
+                if existing_choice == "cancel":
+                    progress(phase_logs, "scan cancelled by user", progress_console)
+                    return 0
+                _unlink_existing_result(default_json_out, phase_logs, progress_console)
+                if args.html and html_out_path is not None:
+                    _unlink_existing_result(html_out_path, phase_logs, progress_console)
+            elif not html_missing:
+                progress(
+                    phase_logs,
+                    f"existing JSON result found; skipping scan: {_display_report_path(default_json_out, Path.cwd().resolve())}",
+                    progress_console,
+                )
+                return 0
+            else:
+                progress(
+                    phase_logs,
+                    "existing JSON result found but HTML output is missing; continuing to regenerate report",
+                    progress_console,
+                )
+        args.out = str(default_json_out)
+
+    if show_progress:
+        _print_scan_beginning(progress_console if rich_progress_mode else None)
 
     decrypt_profile = None
     if decrypt_mode:
@@ -7009,9 +7208,9 @@ def main() -> int:
     scan_total = len(file_jobs) + len(class_jobs)
     if rich_progress_mode:
         with Progress(
-            SpinnerColumn(style="cyan"),
-            TextColumn("[bold cyan]Scanning sources"),
-            BarColumn(bar_width=30),
+            SpinnerColumn(style="#C000FF"),
+            TextColumn("[bold white]Scanning sources"),
+            BarColumn(bar_width=30, complete_style="#C000FF", finished_style="#C000FF", pulse_style="#C000FF"),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             console=progress_console,
@@ -7252,9 +7451,9 @@ def main() -> int:
 
     if rich_progress_mode and RICH_AVAILABLE and progress_console is not None:
         with Progress(
-            SpinnerColumn(style="cyan"),
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(bar_width=30),
+            SpinnerColumn(style="#C000FF"),
+            TextColumn("[bold white]{task.description}"),
+            BarColumn(bar_width=30, complete_style="#C000FF", finished_style="#C000FF", pulse_style="#C000FF"),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
             console=progress_console,
@@ -7463,6 +7662,10 @@ def main() -> int:
     else:
         print(text_output_with_banner)
     progress(show_progress, "done", progress_console)
+    try:
+        input("\nPress Enter to quit...")
+    except EOFError:
+        pass
 
     return 0
 
