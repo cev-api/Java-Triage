@@ -210,7 +210,11 @@ BEHAVIOR_SEVERITY_MAP = {
     "obfuscated_short_classname_cluster": "low",
     "proof_token_source_to_network_sink": "high",
     "proof_raw_token_logging": "high",
+    "proof_reachable_command_token_disclosure_chain": "critical",
+    "exposed_local_websocket_command_bridge": "high",
     "capability_token_access": "medium",
+    "audio_capture_capability": "high",
+    "audio_playback_capability": "low",
 }
 
 MINECRAFT_AUTH_HOSTS = {
@@ -242,10 +246,20 @@ KNOWN_LIBRARY_PREFIXES = {
     "lenni_httpclient": ["net/lenni0451/commons/httpclient/"],
     "lenni_gson": ["net/lenni0451/commons/gson/"],
     "gson": ["com/google/gson/"],
+    "java_websocket": ["org/java_websocket/"],
+    "slf4j": ["org/slf4j/"],
     "fabric": ["net/fabricmc/", "fabric/"],
     "org_json": ["org/json/"],
     "jna": ["com/sun/jna/"],
 }
+
+
+def _is_known_library_relpath(rel_path: str) -> bool:
+    rel_low = str(rel_path or "").replace("\\", "/").lower().lstrip("./")
+    for prefixes in KNOWN_LIBRARY_PREFIXES.values():
+        if any(rel_low.startswith(prefix.lower()) for prefix in prefixes):
+            return True
+    return False
 RAW_STRING_PATTERNS = [
     ("erawaggin", "Reversed 'niggaware' string", 50),
     ("erawoobmab", "Reversed 'bambooware' string", 50),
@@ -271,14 +285,19 @@ AUTO_DECRYPT_TRIGGER_MIN_FILES_WITH_CALLS = 1
 MAJOR_ENCRYPTED_MIN_CALLS = 200
 MAJOR_ENCRYPTED_MIN_FILE_RATIO = 0.20
 MAJOR_ENCRYPTED_MIN_FILES_WITH_CALLS = 5
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/v1/chat/completions"
 RATTERSCANNER_HASH_URL = "https://api.ratterscanner.com/hash/"
 JLAB_STATIC_SCAN_URL = "https://jlab.threat.rip/api/public/static-scan"
 JLAB_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 OPENAI_EXEC_SUMMARY_INSTRUCTION = (
     "Parse the JSON and create an executive summary of the result detailing the flow of the malware "
     "or application (if clean) and its capabilities, risks, goal. Keep it technical but understandable "
-    "for both layman and professional. Max 500 words."
+    "for both layman and professional. Max 500 words. Output must be plain text optimized for terminal "
+    "display. Do NOT use markdown headings, bold/italic markers, tables, code fences, horizontal rules, "
+    "or backticks. Use short section labels and simple bullet lines prefixed with '- '. Prioritize "
+    "confirmed_behavior proof chains over generic suspicious indicators. Explicitly include caveats from "
+    "contradiction_notes and avoid overstating automatic exfiltration when only exposure is proven."
 )
 
 
@@ -2227,7 +2246,7 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     low = text.lower()
     rel = str(path.relative_to(root))
     rel_low = rel.replace("\\", "/").lower()
-    is_vendor_lib = rel_low.startswith("com/sun/jna/") or rel_low.startswith("org/json/")
+    is_vendor_lib = _is_known_library_relpath(rel_low)
     out: List[BehaviorFinding] = []
     reconstructed_urls = [item for item in _reconstruct_split_string_arrays(text) if URL_RE.match(item[1])]
     byte_array_strings = _extract_printable_byte_array_strings(text)
@@ -2545,6 +2564,40 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 line=find_line(text, "createScreenCapture("),
                 behavior="screenshot_capture_collection",
                 evidence="Captures full screen via AWT Robot and base64-encodes image for collection/exfiltration",
+            )
+        )
+
+    has_audio_capture = (
+        "TargetDataLine" in text
+        or "AudioSystem.getTargetDataLine(" in text
+        or "DataLine.Info(TargetDataLine.class" in text
+    ) and ".read(" in text
+    if has_audio_capture:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=(
+                    find_line(text, "TargetDataLine")
+                    if "TargetDataLine" in text
+                    else find_line(text, "AudioSystem.getTargetDataLine(")
+                ),
+                behavior="audio_capture_capability",
+                evidence="Uses TargetDataLine capture APIs and reads audio buffers (microphone capture path)",
+            )
+        )
+
+    has_audio_playback = (
+        ("AudioSystem.getClip(" in text or "Clip.open(" in text)
+        and "AudioInputStream" in text
+        and not has_audio_capture
+    )
+    if has_audio_playback:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "AudioSystem.getClip(") if "AudioSystem.getClip(" in text else find_line(text, "Clip.open("),
+                behavior="audio_playback_capability",
+                evidence="Uses Clip/AudioInputStream playback APIs; this is not microphone capture by itself",
             )
         )
 
@@ -4100,6 +4153,8 @@ def detect_token_source_sink_behaviors(root: Path) -> List[BehaviorFinding]:
             continue
         low = text.lower()
         rel = str(p.relative_to(root))
+        if _is_known_library_relpath(rel):
+            continue
         has_source = any(m in low for m in token_markers)
         has_sink = any(m in low for m in sink_markers)
         if has_source:
@@ -4129,6 +4184,68 @@ def detect_token_source_sink_behaviors(root: Path) -> List[BehaviorFinding]:
                     evidence="Raw token string appears in logging/print context",
                 )
             )
+    return out
+
+
+def detect_reachability_proof_chains(root: Path) -> List[BehaviorFinding]:
+    out: List[BehaviorFinding] = []
+    idx = _build_source_index(root)
+    texts: dict[str, str] = idx["texts"]
+
+    def has(marker: str) -> tuple[bool, str]:
+        m = marker.lower()
+        for rel, txt in texts.items():
+            if _is_known_library_relpath(rel):
+                continue
+            if m in txt.lower():
+                return True, rel
+        return False, ""
+
+    has_entry, rel_entry = has("onInitializeClient(")
+    has_cmd_init, rel_cmd_init = has("CommandSystem.init(")
+    has_ws_init, rel_ws_init = has("WebSocketCommandServer.init(")
+    has_ws_msg, rel_ws_msg = has("onMessage(")
+    has_exec_cmd, rel_exec_cmd = has("executeCommand(")
+    has_account_exec, rel_acc_exec = has("AccountCommand")
+    has_token, rel_token = has("method_1674(")
+    if not has_token:
+        has_token, rel_token = has("getAccessToken(")
+    has_send = False
+    rel_send = ""
+    for marker in ["conn.send(", "send(", "CommandResult", "toJson(", "toString("]:
+        ok, rel = has(marker)
+        if ok:
+            has_send = True
+            rel_send = rel
+            break
+
+    if has_ws_msg and has_exec_cmd:
+        out.append(
+            BehaviorFinding(
+                file=rel_ws_msg or rel_exec_cmd or ".",
+                line=1,
+                behavior="exposed_local_websocket_command_bridge",
+                evidence=(
+                    "Local WebSocket command bridge detected (web-origin gated control surface). "
+                    "Origin checks are authorization hints, not strong authentication."
+                ),
+            )
+        )
+
+    if all([has_entry, has_cmd_init, has_ws_init, has_ws_msg, has_exec_cmd, has_account_exec, has_token, has_send]):
+        chain = (
+            "onInitializeClient -> CommandSystem.init -> WebSocketCommandServer.init -> "
+            "WebSocketCommandServer.onMessage -> CommandSystem.executeCommand -> "
+            "AccountCommand -> session token accessor -> command/response send"
+        )
+        out.append(
+            BehaviorFinding(
+                file=rel_entry or rel_cmd_init or rel_ws_msg or rel_exec_cmd or rel_token or ".",
+                line=1,
+                behavior="proof_reachable_command_token_disclosure_chain",
+                evidence=f"Reachable proof chain: {chain}",
+            )
+        )
     return out
 
 
@@ -4510,6 +4627,7 @@ def run_cross_variant_heuristics(root: Path) -> List[dict]:
         rel = str(p.relative_to(root)).replace("\\", "/")
         t = _read_text_safe(p)
         low = t.lower()
+        is_vendor_lib = _is_known_library_relpath(rel)
 
         def add(desc: str, weight: int) -> None:
             out.append({"category": "heuristic", "description": desc, "file_path": rel, "weight": int(weight)})
@@ -4532,7 +4650,7 @@ def run_cross_variant_heuristics(root: Path) -> List[dict]:
             "readallbytes(" in low or "tobytearray(" in low
         ):
             add("HTTP download to byte array", 10)
-        if "base64" in low:
+        if (not is_vendor_lib) and "base64" in low:
             add("Base64 encoding/decoding", 10)
         if any(x in low for x in ["hkey_", "software\\microsoft", "reg add"]):
             add("Windows registry access", 15)
@@ -4546,8 +4664,8 @@ def run_cross_variant_heuristics(root: Path) -> List[dict]:
             add("Telegram Bot API URL (common exfiltration channel)", 25)
         if "discord.com/api/webhooks/" in low:
             add("Discord webhook URL (common exfiltration channel)", 25)
-        if any(x in low for x in ["login data", "chrome", "user data", "logins.json", "key4.db", "signons.sqlite"]):
-            add("Browser credential database access", 20)
+        if (not is_vendor_lib) and any(x in low for x in ["login data", "logins.json", "key4.db", "signons.sqlite"]):
+            add("Potential credential-store file access strings", 20)
         if "select" in low and any(x in low for x in ["from logins", "from cookies", "from moz_logins"]):
             add("SQL query targeting credential/cookie tables", 20)
         if any(x in low for x in ["sun/misc/unsafe", "jdk/internal/misc/unsafe"]):
@@ -4564,10 +4682,10 @@ def run_cross_variant_heuristics(root: Path) -> List[dict]:
             add("JNA usage for native API calls", 10)
         if any(x in low for x in ["ncrypt", "cryptunprotectdata", "ncryptopenstorageprovider"]):
             add("Windows crypto API usage (NCrypt/DPAPI)", 20)
-        if "java/net/socket" in low and "getinputstream" in low and "getoutputstream" in low:
+        if (not is_vendor_lib) and "java/net/socket" in low and "getinputstream" in low and "getoutputstream" in low:
             add("Raw socket communication (potential C2 channel)", 10)
-        if "java/net/http/websocket" in low:
-            add("WebSocket communication (potential C2 channel)", 10)
+        if (not is_vendor_lib) and "java/net/http/websocket" in low:
+            add("WebSocket communication capability", 10)
         if ".workers.dev" in low:
             add("Cloudflare Workers endpoint (common malware C2 platform)", 15)
         if any(x in low for x in ["prismlauncher", "atlauncher", "gdlauncher", "modrinth.theseus"]) and (
@@ -4846,6 +4964,51 @@ def summarize_assessments(behaviors: List[BehaviorFinding]) -> dict:
     }
 
 
+def behavior_verdict_tier(behavior: str) -> str:
+    if behavior.startswith("proof_"):
+        return "confirmed_behavior"
+    if behavior.startswith("capability_") or behavior in {
+        "command_execution_capability",
+        "dynamic_class_execution",
+        "dynamic_urlclassloader_usage",
+        "remote_urlclassloader_usage",
+        "exposed_local_websocket_command_bridge",
+        "audio_capture_capability",
+        "audio_playback_capability",
+    }:
+        return "exposed_capability"
+    if behavior.startswith("assessment_suspicious_") or behavior.startswith("assessment_needs_review_"):
+        return "suspicious_capability"
+    return "suspicious_capability"
+
+
+def summarize_verdict_tiers(behaviors: List[BehaviorFinding]) -> dict[str, int]:
+    counts = {
+        "confirmed_behavior": 0,
+        "exposed_capability": 0,
+        "suspicious_capability": 0,
+        "library_noise": 0,
+    }
+    for b in behaviors:
+        if _is_known_library_relpath(b.file):
+            counts["library_noise"] += 1
+            continue
+        counts[behavior_verdict_tier(b.behavior)] += 1
+    return counts
+
+
+def build_contradiction_notes(behaviors: List[BehaviorFinding]) -> List[str]:
+    by_behavior = {b.behavior for b in behaviors}
+    notes: List[str] = []
+    if "minecraft_access_token_access" in by_behavior and "proof_token_source_to_network_sink" not in by_behavior and "proof_reachable_command_token_disclosure_chain" not in by_behavior:
+        notes.append("Access token is read, but no confirmed automatic token exfiltration path was proven.")
+    if "exposed_local_websocket_command_bridge" in by_behavior:
+        notes.append("WebSocket control surface appears local/origin-gated; treat as local command bridge, not definitive public Internet C2.")
+    if "audio_playback_capability" in by_behavior and "audio_capture_capability" not in by_behavior:
+        notes.append("Audio usage appears playback-only (Clip/AudioInputStream), not microphone capture.")
+    return notes
+
+
 def behavior_severity(behavior: str) -> str:
     sev = BEHAVIOR_SEVERITY_MAP.get(behavior)
     if sev:
@@ -4884,6 +5047,8 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         behavior_severity_counts[behavior_severity(b.behavior)] += 1
 
     assessment_summary = summarize_assessments(behaviors)
+    verdict_tiers = summarize_verdict_tiers(behaviors)
+    contradiction_notes = build_contradiction_notes(behaviors)
     proof_count = sum(1 for b in behaviors if b.behavior.startswith("proof_"))
     capability_count = sum(1 for b in behaviors if b.behavior.startswith("capability_"))
     suspicion_count = int(assessment_summary["counts"].get("suspicious", 0)) + sum(
@@ -4908,6 +5073,8 @@ def summarize(findings: List[Finding], behaviors: List[BehaviorFinding], artifac
         },
         "artifact_findings": len(artifacts),
         "assessment_counts": assessment_summary["counts"],
+        "verdict_tiers": verdict_tiers,
+        "contradiction_notes": contradiction_notes,
     }
 
 
@@ -5056,12 +5223,30 @@ def render_text(
             for item in entries:
                 out.append(f"- [{item['behavior']}] {item['file']}:{item['line']} -> {item['evidence']}")
 
+    vt = summary.get("verdict_tiers", {}) or {}
+    out.append("")
+    out.append("== Verdict Tiers ==")
+    out.append(
+        "confirmed_behavior={0} exposed_capability={1} suspicious_capability={2} library_noise={3}".format(
+            vt.get("confirmed_behavior", 0),
+            vt.get("exposed_capability", 0),
+            vt.get("suspicious_capability", 0),
+            vt.get("library_noise", 0),
+        )
+    )
+    cn = summary.get("contradiction_notes", []) or []
+    if cn:
+        out.append("Contradiction / Caveat Notes:")
+        for n in cn:
+            out.append(f"- {n}")
+
     if behaviors:
         out.append("")
         out.append("== Behavioral Findings ==")
         for b in sorted(behaviors, key=lambda x: (x.file, x.line, x.behavior)):
             sev = behavior_severity(b.behavior)
-            out.append(f"[{sev}] [{b.behavior}] {b.file}:{b.line} -> {b.evidence}")
+            tier = behavior_verdict_tier(b.behavior)
+            out.append(f"[{sev}] [{tier}] [{b.behavior}] {b.file}:{b.line} -> {b.evidence}")
 
     if artifacts:
         out.append("")
@@ -6872,19 +7057,18 @@ def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
         + "\n\nTriage JSON (truncated where necessary):\n"
         + compact_json
     )
+    model = os.getenv("TRIAGE_OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
     req_body = {
-        "model": "gpt-5",
-        "input": [
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": "You are a senior malware analyst. Be concise, structured, and objective."}],
-            },
-            {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a senior malware analyst. Be concise, structured, and objective."},
+            {"role": "user", "content": user_text},
         ],
+        "temperature": 0.2,
     }
     try:
         req = request.Request(
-            OPENAI_RESPONSES_URL,
+            OPENAI_CHAT_COMPLETIONS_URL,
             method="POST",
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -6896,7 +7080,101 @@ def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return ""
-    return _extract_responses_output_text(data)
+    return _normalize_executive_summary_text(_extract_chat_completions_output_text(data))
+
+
+def _extract_chat_completions_output_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices", []) or []
+    if not isinstance(choices, list):
+        return ""
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message", {}) or {}
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
+def _normalize_executive_summary_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    out_lines: List[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.rstrip()
+        if not line:
+            out_lines.append("")
+            continue
+        if re.fullmatch(r"\s*[-*_]{3,}\s*", line):
+            continue
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = line.replace("**", "").replace("__", "").replace("`", "")
+        if "|" in line and line.count("|") >= 2:
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            if not cells:
+                continue
+            if all(re.fullmatch(r"[:\-]+", c) for c in cells):
+                continue
+            line = " - ".join(cells)
+        out_lines.append(line)
+    normalized = "\n".join(out_lines)
+    return re.sub(r"\n{3,}", "\n\n", normalized).strip()
+
+
+def build_deepseek_executive_summary(triage_payload: dict[str, Any]) -> str:
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return ""
+    compact_json = json.dumps(triage_payload, ensure_ascii=False, separators=(",", ":"))
+    max_chars = 120000
+    if len(compact_json) > max_chars:
+        compact_json = compact_json[:max_chars] + "...<truncated>"
+    user_text = (
+        OPENAI_EXEC_SUMMARY_INSTRUCTION
+        + "\n\nTriage JSON (truncated where necessary):\n"
+        + compact_json
+    )
+    model = os.getenv("TRIAGE_DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
+    req_body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a senior malware analyst. Be concise, structured, and objective."},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.2,
+        "reasoning_effort": os.getenv("TRIAGE_DEEPSEEK_REASONING_EFFORT", "high").strip() or "high",
+        "thinking": {"type": "enabled"},
+    }
+    try:
+        req = request.Request(
+            DEEPSEEK_CHAT_COMPLETIONS_URL,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(req_body).encode("utf-8"),
+        )
+        with request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return ""
+    return _normalize_executive_summary_text(_extract_chat_completions_output_text(data))
+
+
+def build_executive_summary(triage_payload: dict[str, Any]) -> str:
+    provider = os.getenv("TRIAGE_LLM_PROVIDER", "auto").strip().lower()
+    if provider in {"openai", "oai"}:
+        return build_openai_executive_summary(triage_payload)
+    if provider in {"deepseek", "ds"}:
+        return build_deepseek_executive_summary(triage_payload)
+    summary = build_openai_executive_summary(triage_payload)
+    if summary:
+        return summary
+    return build_deepseek_executive_summary(triage_payload)
 
 
 def main() -> int:
@@ -7255,6 +7533,7 @@ def main() -> int:
     for target_root, prefix in scan_targets:
         behavior_findings.extend(_apply_prefix_behaviors(discover_structural_behaviors(target_root), prefix))
         behavior_findings.extend(_apply_prefix_behaviors(detect_token_source_sink_behaviors(target_root), prefix))
+        behavior_findings.extend(_apply_prefix_behaviors(detect_reachability_proof_chains(target_root), prefix))
         root_key = str(target_root.resolve())
         java_count = target_java_counts.get(root_key, 0)
         class_count = target_class_counts.get(root_key, 0)
@@ -7488,6 +7767,8 @@ def main() -> int:
                 "deobfuscation": deobf_stats if deobf_stats else {},
                 "summary": summary,
                 "assessment_summary": summarize_assessments(behavior_findings),
+                "verdict_tiers": summarize_verdict_tiers(behavior_findings),
+                "contradiction_notes": build_contradiction_notes(behavior_findings),
                 "runtime_c2": runtime_c2,
                 "ratter_scanner": ratter_scanner,
                 "jlab_static_scan": jlab_static_scan,
@@ -7500,7 +7781,7 @@ def main() -> int:
                 "blockchain_indicators": blockchain,
                 "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
                 "behavior_findings": [
-                    {**b.__dict__, "severity": behavior_severity(b.behavior)}
+                    {**b.__dict__, "severity": behavior_severity(b.behavior), "verdict_tier": behavior_verdict_tier(b.behavior)}
                     for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))
                 ],
                 "artifact_findings": [a.__dict__ for a in artifact_findings],
@@ -7508,7 +7789,7 @@ def main() -> int:
             build_prog.advance(build_task)
 
             build_prog.update(build_task, description="Generating Executive Summary")
-            executive_summary = build_openai_executive_summary(payload)
+            executive_summary = build_executive_summary(payload)
             output_payload = dict(payload)
             if executive_summary:
                 output_payload = {"executive_summary": executive_summary, **output_payload}
@@ -7567,6 +7848,8 @@ def main() -> int:
             "deobfuscation": deobf_stats if deobf_stats else {},
             "summary": summary,
             "assessment_summary": summarize_assessments(behavior_findings),
+            "verdict_tiers": summarize_verdict_tiers(behavior_findings),
+            "contradiction_notes": build_contradiction_notes(behavior_findings),
             "runtime_c2": runtime_c2,
             "ratter_scanner": ratter_scanner,
             "jlab_static_scan": jlab_static_scan,
@@ -7579,12 +7862,12 @@ def main() -> int:
             "blockchain_indicators": blockchain,
             "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
             "behavior_findings": [
-                {**b.__dict__, "severity": behavior_severity(b.behavior)}
+                {**b.__dict__, "severity": behavior_severity(b.behavior), "verdict_tier": behavior_verdict_tier(b.behavior)}
                 for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))
             ],
             "artifact_findings": [a.__dict__ for a in artifact_findings],
         }
-        executive_summary = build_openai_executive_summary(payload)
+        executive_summary = build_executive_summary(payload)
         output_payload = dict(payload)
         if executive_summary:
             output_payload = {"executive_summary": executive_summary, **output_payload}
