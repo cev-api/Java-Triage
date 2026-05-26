@@ -34,6 +34,9 @@ It can decompile JARs with CFR, rewrite supported obfuscated string patterns, sc
 - Adds explicit heavy-obfuscation, decompiler-failure, and class-fallback diagnostic behaviors.
 - Splits assessment behavior findings into `benign`, `needs_review`, and `suspicious`.
 - Assigns behavior severities (`critical`, `high`, `medium`, `low`, `info`) and reports severity counts.
+- Adds verdict-tier grading: `confirmed_behavior`, `exposed_capability`, `suspicious_capability`, and `library_noise`.
+- Emits contradiction/caveat notes when evidence is exposure-only (for example token access without proven automatic exfiltration).
+- Suppresses or down-weights generic heuristic noise inside known bundled libraries (for example Gson, Java-WebSocket, SLF4J).
 - Adds metadata sections such as `Basic Properties`, `JAR Info`, and `Bundle Info`.
 - Optionally enriches metadata with `Vhash`, `SSDEEP`, `TLSH`, `TrID`, and `Magika` when local tools or libraries are available.
 - Identifies suspicious artifacts such as `*.jar.*`, large opaque `.dat` or `.bin`, and embedded resource payloads.
@@ -153,9 +156,20 @@ Returned data is stored under `jlab_static_scan` in JSON and rendered in Rich/HT
 
 ## Executive Summary
 
-If `OPENAI_API_KEY` is set, the tool sends the triage JSON to the OpenAI Responses API and asks for a concise executive summary describing the likely flow, capabilities, risks, and goals of the scanned application or malware.
+The tool can generate an AI executive summary using either OpenAI or DeepSeek.
 
-If no API key is present, the tool behaves as if this feature does not exist and does not mention AI or GPT in the output.
+- `OPENAI_API_KEY`: enables OpenAI Chat Completions
+- `DEEPSEEK_API_KEY`: enables DeepSeek Chat Completions
+- `TRIAGE_LLM_PROVIDER`: optional provider selector:
+  - `auto` (default): tries OpenAI first, then DeepSeek
+  - `openai`: use only OpenAI
+  - `deepseek`: use only DeepSeek
+- `TRIAGE_OPENAI_MODEL`: OpenAI model override (default: `gpt-4.1-mini`)
+- `TRIAGE_DEEPSEEK_MODEL`: DeepSeek model override (default: `deepseek-v4-flash`)
+  - Common values: `deepseek-v4-flash`, `deepseek-v4-pro`
+- `TRIAGE_DEEPSEEK_REASONING_EFFORT`: DeepSeek reasoning effort (default: `high`)
+
+If neither API key is present, the tool behaves as if this feature does not exist and does not mention AI in the output.
 
 ## Requirements
 
