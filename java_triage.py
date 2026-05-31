@@ -215,6 +215,28 @@ BEHAVIOR_SEVERITY_MAP = {
     "capability_token_access": "medium",
     "audio_capture_capability": "high",
     "audio_playback_capability": "low",
+    "obf_xor_encoded_name_access": "medium",
+    "obf_base64_encoded_name_access": "medium",
+    "obf_caesar_encoded_name_access": "medium",
+    "obf_methodhandle_token_access": "high",
+    "obf_lambdametafactory_token_access": "high",
+    "obf_array_indirect_dispatch_token_access": "medium",
+    "obf_split_reassembled_name_access": "medium",
+    "obf_unsafe_field_token_access": "high",
+    "obf_varhandle_field_token_access": "high",
+    "obf_stackwalker_indirect_access": "medium",
+    "obf_int_array_encoded_name_access": "medium",
+    "obf_classloader_bypass_token_access": "high",
+    "token_class_sweep_static_field_harvest": "high",
+    "token_spin_race_window_harvest": "critical",
+    "token_yggdrasil_internal_probe": "high",
+    "token_process_commandline_harvest": "high",
+    "token_processhandle_commandline_probe": "medium",
+    "token_runtime_mxbean_arg_probe": "medium",
+    "token_system_property_auth_probe": "medium",
+    "token_environment_auth_probe": "medium",
+    "token_sun_java_command_probe": "medium",
+    "token_jdk_internal_process_probe": "medium",
 }
 
 MINECRAFT_AUTH_HOSTS = {
@@ -282,11 +304,14 @@ RAW_STRING_PATTERNS = [
     ("func_148254_d", "Legacy MCP raw token accessor", 20),
     ("field_1983", "MC accessToken field", 20),
     ("field_148258_c", "Legacy MCP token field", 20),
+    ("field_152429_d", "Legacy MCP accountType field", 15),
     ("field_34961", "MC clientId field", 15),
     ("field_34960", "MC xuid field", 15),
     ("field_1984", "MC accountType field", 15),
     ("field_71449_j", "Legacy MCP Minecraft.session field", 15),
     ("field_1726", "Intermediary MinecraftClient.session field", 15),
+    ("net.minecraft.client.MinecraftClient", "Yarn/Fabric MinecraftClient class", 15),
+    ("net.minecraft.class_310", "Intermediary MinecraftClient class", 15),
     ("net.minecraft.client.User", "Mojmap/NeoForge User class", 15),
     ("net.minecraft.class_320", "Intermediary Session class", 15),
     ("Lnet/minecraft/class_310;method_1551()Lnet/minecraft/class_310;", "Intermediary MinecraftClient.getInstance descriptor", 20),
@@ -2721,9 +2746,12 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
         "method_1548()",
         "getSession()",
         "getUser()",
+        "getInstance()",
         "func_110432_I()",
         "Minecraft.getMinecraft()",
         "Minecraft.func_71410_x()",
+        "net.minecraft.client.MinecraftClient",
+        "net.minecraft.class_310",
         "field_1726",
         "field_71449_j",
         "net.minecraft.client.util.Session",
@@ -2946,6 +2974,11 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
         "field_34960",
         "method_35718()",
         "getAccountType()",
+        "field_152429_d",
+        "getProfile()",
+        "func_148256_e()",
+        "getSessionType()",
+        "func_152428_f()",
         "field_1984",
         "mcAccessToken",
         "access_token",
@@ -3030,6 +3063,208 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 line=find_line(text, "com.sun.jna") if "com.sun.jna" in text else find_line(text, "Unsafe"),
                 behavior="sandbox_escape_primitive_usage",
                 evidence="Contains JNA/Unsafe style primitive often used to bridge outside normal JVM safety boundaries",
+            )
+        )
+
+    # Explicit methodology detections for obfuscated token/session access patterns.
+    if ("decodeXor(" in text or "xor" in low) and ("Class.forName(" in text or "getDeclaredMethod(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "decodeXor(") if "decodeXor(" in text else find_line(text, "xor"),
+                behavior="obf_xor_encoded_name_access",
+                evidence="Uses XOR-decoded names to resolve token/session access methods reflectively",
+            )
+        )
+    if ("Base64.getDecoder().decode(" in text and ("Class.forName(" in text or "getDeclaredMethod(" in text)):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "Base64.getDecoder().decode("),
+                behavior="obf_base64_encoded_name_access",
+                evidence="Uses Base64-decoded class/method names for reflective access",
+            )
+        )
+    if any(k in low for k in ["caesar", "char-offset", "char offset"]) and ("Class.forName(" in text or "getDeclaredMethod(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "caesar") if "caesar" in low else find_line(text, "char"),
+                behavior="obf_caesar_encoded_name_access",
+                evidence="Uses character offset/Caesar-style decoding to reconstruct sensitive access names",
+            )
+        )
+    if "MethodHandles" in text and ("findVirtual(" in text or "findGetter(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "MethodHandles"),
+                behavior="obf_methodhandle_token_access",
+                evidence="Uses MethodHandles lookup/findVirtual/findGetter to bypass straightforward reflection checks",
+            )
+        )
+    if "LambdaMetafactory" in text and ("Supplier<" in text or "metafactory(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "LambdaMetafactory"),
+                behavior="obf_lambdametafactory_token_access",
+                evidence="Generates callable accessors via LambdaMetafactory for indirect token/session reads",
+            )
+        )
+    if ("new String[]" in text or "new Method[" in text or "new Object[" in text) and ("dispatch" in low or "index" in low):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "new String[]") if "new String[]" in text else find_line(text, "new Method["),
+                behavior="obf_array_indirect_dispatch_token_access",
+                evidence="Uses array-indexed indirection for method/field dispatch to obscure call targets",
+            )
+        )
+    if ("StringBuilder" in text and ".append(" in text and ("Class.forName(" in text or "getDeclaredMethod(" in text)):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "StringBuilder"),
+                behavior="obf_split_reassembled_name_access",
+                evidence="Reassembles class/method names from fragments before reflective sensitive access",
+            )
+        )
+    if "sun.misc.Unsafe" in text and ("objectFieldOffset(" in text or "getObject(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "sun.misc.Unsafe"),
+                behavior="obf_unsafe_field_token_access",
+                evidence="Uses sun.misc.Unsafe field offsets and raw object reads for protected token/session fields",
+            )
+        )
+    if "VarHandle" in text and ("findVarHandle(" in text or ".get(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "VarHandle"),
+                behavior="obf_varhandle_field_token_access",
+                evidence="Uses VarHandle-based field access to reach sensitive runtime state",
+            )
+        )
+    if "StackWalker" in text and ("walk(" in text or "getCallerClass(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "StackWalker"),
+                behavior="obf_stackwalker_indirect_access",
+                evidence="Uses StackWalker/caller indirection to obscure sensitive access call path",
+            )
+        )
+    if "new int[]" in text and ("(char)" in text or "StringBuilder" in text) and ("Class.forName(" in text or "getDeclaredMethod(" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "new int[]"),
+                behavior="obf_int_array_encoded_name_access",
+                evidence="Builds access names from integer arrays and uses reflective invocation",
+            )
+        )
+    if ("FabricLoader" in text or "classloader" in low) and ("loadClass(" in text and ("session" in low or "user" in low)):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "FabricLoader") if "FabricLoader" in text else find_line(text, "loadClass("),
+                behavior="obf_classloader_bypass_token_access",
+                evidence="Uses alternate classloader/Fabric loader paths to reach session/token classes",
+            )
+        )
+
+    # Breakthrough vectors and process-argument token harvesting methodology detections.
+    if ("getAllLoadedClasses(" in text or "ClassLoader.class.getDeclaredField(\"classes\")" in text) and ("startsWith(\"eyJ\")" in text or "jwt" in low):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "getAllLoadedClasses(") if "getAllLoadedClasses(" in text else find_line(text, "ClassLoader.class.getDeclaredField(\"classes\")"),
+                behavior="token_class_sweep_static_field_harvest",
+                evidence="Sweeps loaded classes/static fields for JWT-like token strings",
+            )
+        )
+    if ("Thread spinner" in text or "SpinRace" in text or "while (System.nanoTime() < deadline)" in text) and ("accessToken" in text and "Unsafe" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "SpinRace") if "SpinRace" in text else find_line(text, "while (System.nanoTime() < deadline)"),
+                behavior="token_spin_race_window_harvest",
+                evidence="Implements high-frequency polling race to capture transient real accessToken windows",
+            )
+        )
+    if ("YggdrasilAuthenticationService" in text and ("drillAllFields" in text or "getDeclaredFields()" in text)):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "YggdrasilAuthenticationService"),
+                behavior="token_yggdrasil_internal_probe",
+                evidence="Introspects YggdrasilAuthenticationService internals for token side-channel extraction",
+            )
+        )
+    if "--accessToken" in text and ("commandLine()" in text or "sun.java.command" in text):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "--accessToken"),
+                behavior="token_process_commandline_harvest",
+                evidence="Parses process command-line arguments for --accessToken credential leakage",
+            )
+        )
+    if "ProcessHandle.current()" in text and "commandLine()" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "ProcessHandle.current()"),
+                behavior="token_processhandle_commandline_probe",
+                evidence="Reads process command line via ProcessHandle.info().commandLine()",
+            )
+        )
+    if "ManagementFactory.getRuntimeMXBean()" in text and "getInputArguments()" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "ManagementFactory.getRuntimeMXBean()"),
+                behavior="token_runtime_mxbean_arg_probe",
+                evidence="Enumerates RuntimeMXBean JVM input arguments for auth/session leakage",
+            )
+        )
+    if "System.getProperties()" in text and ("token" in low or "session" in low or "auth" in low):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "System.getProperties()"),
+                behavior="token_system_property_auth_probe",
+                evidence="Enumerates system properties for token/access/session/auth material",
+            )
+        )
+    if "System.getenv()" in text and ("token" in low or "minecraft" in low or "mojang" in low):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "System.getenv()"),
+                behavior="token_environment_auth_probe",
+                evidence="Enumerates environment variables for token/access/auth indicators",
+            )
+        )
+    if "sun.java.command" in text:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "sun.java.command"),
+                behavior="token_sun_java_command_probe",
+                evidence="Reads sun.java.command property to recover raw process launch arguments",
+            )
+        )
+    if "ProcessHandleImpl" in text or "jdk.internal.process" in low:
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "ProcessHandleImpl") if "ProcessHandleImpl" in text else find_line(text, "jdk.internal.process"),
+                behavior="token_jdk_internal_process_probe",
+                evidence="Attempts jdk-internal process inspection pathways to obtain process/auth metadata",
             )
         )
 
