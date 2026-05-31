@@ -270,8 +270,34 @@ RAW_STRING_PATTERNS = [
     ("Mod init state: M", "Weedhack debug string", 30),
     ("Resource state: S", "Weedhack debug string", 30),
     ("method_1674", "MC accessToken accessor", 20),
+    ("method_1675", "MC sessionId accessor", 20),
+    ("method_38740", "MC clientId accessor", 15),
+    ("method_38741", "MC xuid accessor", 15),
+    ("method_35718", "MC accountType accessor", 15),
     ("method_1676", "MC username accessor", 20),
+    ("method_1673", "MC UUID accessor", 20),
     ("method_44717", "MC UUID accessor", 20),
+    ("func_110432_I", "Legacy MCP getSession accessor", 20),
+    ("func_111286_b", "Legacy MCP getSessionID accessor", 20),
+    ("func_148254_d", "Legacy MCP raw token accessor", 20),
+    ("field_1983", "MC accessToken field", 20),
+    ("field_148258_c", "Legacy MCP token field", 20),
+    ("field_34961", "MC clientId field", 15),
+    ("field_34960", "MC xuid field", 15),
+    ("field_1984", "MC accountType field", 15),
+    ("field_71449_j", "Legacy MCP Minecraft.session field", 15),
+    ("field_1726", "Intermediary MinecraftClient.session field", 15),
+    ("net.minecraft.client.User", "Mojmap/NeoForge User class", 15),
+    ("net.minecraft.class_320", "Intermediary Session class", 15),
+    ("Lnet/minecraft/class_310;method_1551()Lnet/minecraft/class_310;", "Intermediary MinecraftClient.getInstance descriptor", 20),
+    ("Lnet/minecraft/class_310;method_1548()Lnet/minecraft/class_320;", "Intermediary MinecraftClient.getSession descriptor", 20),
+    ("Lnet/minecraft/class_320;method_1674()Ljava/lang/String;", "Intermediary Session.getAccessToken descriptor", 20),
+    ("Lnet/minecraft/class_320;method_1675()Ljava/lang/String;", "Intermediary Session.getSessionId descriptor", 20),
+    ("Lnet/minecraft/class_320;field_1983:Ljava/lang/String;", "Intermediary Session.accessToken field descriptor", 20),
+    ("Lnet/minecraft/client/session/Session;accessToken:Ljava/lang/String;", "Yarn Session.accessToken field descriptor", 20),
+    ("Lnet/minecraft/client/util/Session;accessToken:Ljava/lang/String;", "Yarn legacy Session.accessToken field descriptor", 20),
+    ("Lnet/minecraft/client/User;accessToken:Ljava/lang/String;", "Mojmap User.accessToken field descriptor", 20),
+    ("Lnet/minecraft/util/Session;field_148258_c:Ljava/lang/String;", "MCP Session.token field descriptor", 20),
     ("eth_call", "Ethereum RPC call", 15),
     ("0x70a08231", "Ethereum balanceOf selector", 15),
     ("Wscript.Shell", "Windows Script Host", 20),
@@ -2695,13 +2721,28 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
         "method_1548()",
         "getSession()",
         "getUser()",
+        "func_110432_I()",
+        "Minecraft.getMinecraft()",
+        "Minecraft.func_71410_x()",
+        "field_1726",
+        "field_71449_j",
         "net.minecraft.client.util.Session",
+        "net.minecraft.client.session.Session",
+        "net.minecraft.util.Session",
+        "net.minecraft.class_320",
+        "class_320",
+        "net.minecraft.client.User",
         "new Session("
     ])
     has_get_access_token = _contains_any(text, [
         "method_1674()",
         "getAccessToken()",
-        "session.getAccessToken()"
+        "session.getAccessToken()",
+        "func_148254_d()",
+        "getToken()",
+        "field_1983",
+        "field_148258_c",
+        "accessToken"
     ])
     has_fake_player_clone = False
     has_self_name_filtering = False
@@ -2741,7 +2782,16 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
-    if "method_1676()" in text or ".getName()" in text or ".getUsername()" in text:
+    if (
+        "method_1676()" in text
+        or ".getName()" in text
+        or ".getUsername()" in text
+        or "func_111285_a()" in text
+        or "username" in text
+        or "field_1982" in text
+        or "field_74286_b" in text
+        or "name" in text
+    ):
         out.append(
             BehaviorFinding(
                 file=rel,
@@ -2759,8 +2809,15 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     # UUID access via multiple mappings: method_44717, getProfileId (mapped), getUuid (Session), getId (GameProfile)
     if (
         "method_44717()" in text
+        or "method_1673()" in text
         or ".getProfileId()" in text
         or ".getUuid()" in text
+        or ".getUuidOrNull()" in text
+        or ".getPlayerID()" in text
+        or "func_148255_b()" in text
+        or "field_1985" in text
+        or "field_148257_b" in text
+        or "uuid" in text
         or (".getId()" in text and ("GameProfile" in text or "getGameProfile()" in text))
     ):
         out.append(
@@ -2791,7 +2848,13 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
     # Session ID access (older flows); track separately
-    if ".getSessionId()" in text or "session.getSessionId()" in text:
+    if (
+        ".getSessionId()" in text
+        or "session.getSessionId()" in text
+        or ".getSessionID()" in text
+        or "method_1675()" in text
+        or "func_111286_b()" in text
+    ):
         out.append(
             BehaviorFinding(
                 file=rel,
@@ -2865,8 +2928,25 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
 
     token_markers = [
         "method_1674()",
+        "func_148254_d()",
         "getAccessToken()",
+        "getToken()",
+        "method_1675()",
+        "func_111286_b()",
+        "getSessionId()",
+        "getSessionID()",
         "session.getAccessToken()",
+        "field_1983",
+        "field_148258_c",
+        "method_38740()",
+        "getClientId()",
+        "field_34961",
+        "method_38741()",
+        "getXuid()",
+        "field_34960",
+        "method_35718()",
+        "getAccountType()",
+        "field_1984",
         "mcAccessToken",
         "access_token",
     ]
@@ -4132,10 +4212,33 @@ def detect_token_source_sink_behaviors(root: Path) -> List[BehaviorFinding]:
     out: List[BehaviorFinding] = []
     token_markers = [
         "accesstoken",
+        "getaccesstoken",
+        "method_1674",
+        "func_148254_d",
+        "field_1983",
+        "field_148258_c",
         "refresh_token",
         "xbl",
         "session.json",
         "launcher_accounts.json",
+        "getsessionid",
+        "method_1675",
+        "func_111286_b",
+        "getclientid",
+        "method_38740",
+        "field_34961",
+        "getxuid",
+        "method_38741",
+        "field_34960",
+        "getaccounttype",
+        "method_35718",
+        "field_1984",
+        "net.minecraft.client.user",
+        "net.minecraft.client.session.session",
+        "net.minecraft.client.util.session",
+        "net.minecraft.util.session",
+        "net.minecraft.class_320",
+        "class_320",
         "authorization",
         "bearer ",
     ]
