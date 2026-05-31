@@ -31,6 +31,9 @@ It can decompile JARs with CFR, rewrite supported obfuscated string patterns, sc
   - native payload extraction or loading
   - command execution and dropper or elevation helpers
   - CMSTP, UAC bypass, and Defender tampering indicators
+- Adds explicit methodology detections for obfuscated token/session access patterns and token-harvest vectors, including:
+  - XOR/Base64/Caesar decoded names, MethodHandles, LambdaMetafactory, array-indirect dispatch, split-name reconstruction, Unsafe/VarHandle access, StackWalker indirection, integer-array encoded names, and classloader-bypass access
+  - class-sweep token harvest, spin-race window harvest, Yggdrasil internal probing, and process-argument/system-property/environment token probing paths
 - Adds explicit heavy-obfuscation, decompiler-failure, and class-fallback diagnostic behaviors.
 - Splits assessment behavior findings into `benign`, `needs_review`, and `suspicious`.
 - Assigns behavior severities (`critical`, `high`, `medium`, `low`, `info`) and reports severity counts.
@@ -81,7 +84,7 @@ Auto output folder naming for rewritten trees:
 Default report naming:
 
 - scanning `ExampleMod` writes `ExampleMod.json` and `ExampleMod.html`
-- scanning `example.jar` writes `example.json` and `example.html`
+- scanning a directory such as `example_project` writes `example_project.json` and `example_project.html`
 
 ## String + Discord Coverage
 
@@ -141,9 +144,8 @@ Behavior details:
 - Can be disabled with `--no-jlab-static-scan`
 - Requires network access (disabled by `--no-network`)
 - Upload target priority:
-  - direct target file if scanning a `.jar`/`.zip`
-  - scan root file if scan root is a `.jar`/`.zip`
-  - source JAR metadata path/name fallback for decompiled directory scans
+  - source JAR metadata path/name fallback for directory scans that originated from a JAR
+  - scan root file if internal analysis root resolves to a `.jar`/`.zip`
 - Size and format guardrails:
   - only `.jar`/`.zip` are uploaded
   - max upload size handled by the tool: `50 MB`
@@ -195,6 +197,8 @@ pip install magika
 ```bash
 python java_triage.py [target]
 ```
+
+`target` is a directory path (or omitted for current directory).
 
 For a full list of options at any time:
 
@@ -268,6 +272,33 @@ python java_triage.py ./sample_project --rich-width 220
 - `--decrypt-codebase-out <path>`: copy the tree to `<path>`, rewrite there, then scan that rewritten tree
 - `--no-rescan-after-decrypt`: perform rewrite only and exit
 - `--no-auto-decrypt`: disable opportunistic auto-decrypt probe and rewrite behavior
+
+## Methodology Behavior IDs
+
+The following behavior IDs were added for explicit methodology coverage and can be searched directly in JSON output:
+
+- `obf_xor_encoded_name_access`
+- `obf_base64_encoded_name_access`
+- `obf_caesar_encoded_name_access`
+- `obf_methodhandle_token_access`
+- `obf_lambdametafactory_token_access`
+- `obf_array_indirect_dispatch_token_access`
+- `obf_split_reassembled_name_access`
+- `obf_unsafe_field_token_access`
+- `obf_varhandle_field_token_access`
+- `obf_stackwalker_indirect_access`
+- `obf_int_array_encoded_name_access`
+- `obf_classloader_bypass_token_access`
+- `token_class_sweep_static_field_harvest`
+- `token_spin_race_window_harvest`
+- `token_yggdrasil_internal_probe`
+- `token_process_commandline_harvest`
+- `token_processhandle_commandline_probe`
+- `token_runtime_mxbean_arg_probe`
+- `token_system_property_auth_probe`
+- `token_environment_auth_probe`
+- `token_sun_java_command_probe`
+- `token_jdk_internal_process_probe`
 
 ## Output
 
