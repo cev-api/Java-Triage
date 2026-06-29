@@ -1,9 +1,6 @@
 # Java Triage
 
-![1](https://i.imgur.com/UI2YkSr.png)
-![2](https://i.imgur.com/jBc8bNq.png)
-![3](https://i.imgur.com/kJiw9Uh.png)
-![4](https://i.imgur.com/QelAGpR.png)
+![1](https://i.imgur.com/Dwdt1FS.png)
 
 `java_triage.py` is a static triage tool for suspicious Java codebases, decompiled JARs, and Minecraft mods.
 
@@ -22,6 +19,10 @@ It can decompile JARs with CFR, rewrite supported obfuscated string patterns, sc
 - Detects Discord Chromium encrypted-token marker payloads (`dQw4w9WgXcQ:<base64>`) and classifies them as credential-theft context.
 - Detects additional comms indicators, including Telegram bot tokens, Telegram API patterns, and generic non-Discord webhook patterns.
 - Detects additional encoded literals such as Base64, Base32, hex, and XOR-recovered text where possible.
+- Performs a full XOR string decoding pass over all `getBytes("ISO-8859-1")` and `toCharArray()` prefixed-key patterns, capturing complete decoded strings — including JSON payload templates, User-Agent strings, static UUIDs, and persistence paths — rather than only filtering to "interesting" candidates.
+- Traces Minecraft session/token/identity API calls through variable assignments to network/write sinks (data flow tracer), emitting specific `dataflow_*` behavior findings when a source-to-sink path is confirmed.
+- Detects multi-payload exfiltration architectures where malware sends tiered POST requests — e.g. a lightweight prefire beacon followed by a separate full-credential profile POST.
+- Detects self-copy + detached re-launch persistence chains: JAR resolves its own path → copies to LOCALAPPDATA → spawns javaw.exe detached → survives game shutdown.
 - Classifies decoded strings into categories such as URLs, RPC templates, credential fields, paths, and crypto-related values.
 - Falls back to `.class` constant-pool scanning when decompiled `.java` sources are unavailable.
 - Expands scan roots by unpacking nested dropped JARs and embedded Base32 archive resources for recursive triage.
@@ -51,7 +52,9 @@ It can decompile JARs with CFR, rewrite supported obfuscated string patterns, sc
 - Produces:
   - human-readable console output with optional Rich tables and progress bars
   - machine-readable JSON output
-  - standalone HTML reports
+  - standalone HTML reports with clickable sortable columns
+- Interactive post-scan prompt for optional stage-2 payload download + AES decryption
+- Optional live infrastructure probing (DNS + HTTP HEAD) via post-scan prompt
 
 ## Default Workflow
 
@@ -272,6 +275,8 @@ python java_triage.py ./sample_project --rich-width 220
 - `--decrypt-codebase-out <path>`: copy the tree to `<path>`, rewrite there, then scan that rewritten tree
 - `--no-rescan-after-decrypt`: perform rewrite only and exit
 - `--no-auto-decrypt`: disable opportunistic auto-decrypt probe and rewrite behavior
+- `--decipher-codebase`: produce a deciphered copy of the target with all XOR-obfuscated `getBytes`/`toCharArray` strings replaced by decoded literals, then scan both copies (enabled by default; disable with `--no-auto-decrypt`)
+- `--decipher-only <path>`: decipher a single `.java` file and write decoded strings to JSON (no scan)
 
 ## Methodology Behavior IDs
 
@@ -299,29 +304,59 @@ The following behavior IDs were added for explicit methodology coverage and can 
 - `token_environment_auth_probe`
 - `token_sun_java_command_probe`
 - `token_jdk_internal_process_probe`
+- `dataflow_token_to_network_sink`
+- `dataflow_username_to_network_sink`
+- `dataflow_uuid_to_network_sink`
+- `two_payload_exfil_architecture`
+- `persistence_filesystem_copy_relaunch_chain`
+- `persistence_detached_process_relaunch`
+- `c2_fallback_domain`
+- `payload_download_endpoint`
+- `persistence_install_directory`
+- `python_executable_reference`
+- `python_script_reference`
+- `exfil_endpoint_prefiremc`
+- `exfil_endpoint_submit_log`
+- `python_subprocess_argument_chain`
+- `detached_process_runtime_indicator`
+- `minecraft_coordinate_exfiltration`
+- `discord_webhook_url_reassembly`
+- `multi_path_exfil_breakdown`
+- `inline_xor_string_decoder`
+- `sensitive_game_data_comment`
+
+The `decipher` section in JSON reports contains counts of XOR strings replaced and files changed when `--decipher-codebase` is used (enabled by default).
 
 ## Output
 
 Text and Rich output include:
 - Basic Properties, JAR Info, and Bundle Info
-- Decode and string findings
+- Cryptocurrency Addresses
+- Discord / Webhook Indicators
+- Windows Persistence / Staging Indicators
+- Decode and string findings (sorted by category priority)
 - Assessment findings (`benign`, `needs_review`, `suspicious`)
-- Behavioral findings with severity
+- Behavioral findings (sorted by severity)
 - Artifact findings
-- Runtime C2 resolution status
-- Stage-2 Analysis status
-- Blockchain Indicators
 - Network Endpoint Assessment
+- Runtime C2 Resolution
+- Assembled C2 URLs
+- Infrastructure Probe Results
+- Blockchain Indicators
 - Variant Detections
 - Raw String Detections
 - Heuristic Detections
 - RatterScanner results
-- JLab static scan results
+- JLab static scan results (sorted by severity)
+- Stage-2 Analysis status
+- Interactive post-scan download + decrypt prompt
 - Summary counts and verdict layers
 
 JSON output includes the full scan payload, including:
 - `target_metadata`
 - `runtime_c2`
+- `url_assembly`
+- `infra_probe`
 - `stage2_analysis`
 - `blockchain_indicators`
 - `network_endpoint_assessment`
@@ -330,6 +365,7 @@ JSON output includes the full scan payload, including:
 - `heuristic_detections`
 - `ratter_scanner`
 - `jlab_static_scan`
+- `decipher`
 - `findings`
 - `behavior_findings`
 - `artifact_findings`
@@ -339,7 +375,53 @@ HTML output is a standalone styled report and includes:
 - top-level summary cards and overall assessment
 - executive summary, when available
 - expanded metadata and enrichment sections
+- clickable column headers for sorting tables
 - omission of categories that are completely empty
+
+## Changelog (vs GitHub cev-api/Java-Triage main)
+
+### New Detection Capabilities
+- **Bitcoin/cryptocurrency address detection** — Base58 P2PKH/P2SH + Bech32 regex, dedicated `cryptocurrency_address` category
+- **Java comment scanning** — extracts `//` and `/* */` comments for malware self-documentation (coordinate exfil, stealer labels, C2 references)
+- **Inline XOR string decoder** — Skidfuscator-style `byte[] arr = "XORdata"` first-byte-key patterns
+- **Full XOR decode pass** — captures all decoded `getBytes`/`toCharArray` strings, not just "interesting" ones
+- **Discord keyword detection** — catches `"Discord Notification"` and similar in decoded strings
+- **Coordinate exfiltration detection** — `minecraft_coordinate_exfiltration` behavior when position reads meet Discord/HTTP
+- **Discord webhook URL reassembly detection** — flags XOR-fragmented webhook URLs with snowflake IDs
+- **Multi-path exfiltration breakdown** — `multi_path_exfil_breakdown` describes exactly which data flows to which endpoint
+- **Windows persistence/staging** — dedicated section showing env vars, staging paths, executables, launched payloads, confirmed/not-confirmed persistence
+
+### String Classification Fixes
+- `LOCALAPPDATA`/`APPDATA`/`TEMP` → `path` (was `string`)
+- `-restarted`/`-cp`/`-Detached` → `dynamic_execution` (was `path`)
+- `java.home` → `path` (was `comms_indicator`)
+- `"null"` JSON placeholder → `string` (was `path`)
+- `User-Agent`/`Content-Type:` → `http_header` (was `string`)
+- Bitcoin addresses → `cryptocurrency_address` (was missing or `hex_decoded_binary`)
+- `"Discord Notification"` → `discord_indicator` (was `string`)
+
+### Infrastructure & C2
+- **C2 URL assembler** — `assemble_c2_urls()` builds full URLs from blockchain-resolved domain + decoded path fragments
+- **Infrastructure probe** — DNS + HTTP HEAD (Range: bytes=0-0 for CDN) — OPT-IN via post-scan prompt
+- **Enhanced `resolve_runtime_c2()`** — assembles correct `payload_endpoint` from path fragments, not guessing `/api/delivery/handler`
+- **AES stage-2 decryption** — `_aes_decrypt_stage2_blob()` decrypts Zenith-style AES/CBC/NoPadding payloads using key from source
+- **`--analyze-stage2` no longer auto-downloads** — download is deferred to the interactive Y/N prompt after the scan
+
+### Output Improvements
+- **Tables sorted by priority** — decoded findings by category danger, behaviors by severity, JLab signatures by severity
+- **Clickable HTML headers** — all smart-tables have click-to-sort column headers
+- **HTML column width improvements** — behavior File/Behavior thinner, Evidence wider; JLab ID thinner, Name wider
+- **Rich & HTML parity** — same sections in same order across console and HTML
+- **Windows Persistence / Staging section** — env vars, paths, executables, payloads, confirmed/not-confirmed
+- **Cryptocurrency Addresses section** — dedicated card for BTC addresses
+- **Discord / Webhook Indicators section** — dedicated card with signal type + value
+- **Assembled C2 URLs section** — full URLs with method + description
+- **Infrastructure Probe Results section** — live/dead/error status per endpoint
+
+### Interactive Prompt
+- Post-scan Y/N prompt for stage-2 download + AES decrypt
+- Post-scan y/N prompt for endpoint probing
+- Neither runs automatically — fully opt-in
 
 ## Notes and Limits
 
@@ -354,16 +436,3 @@ HTML output is a standalone styled report and includes:
 - Nested archive or payload extraction is heuristic and best-effort; highly custom packers may still evade static expansion.
 - Do **not** rely on this tool alone to determine whether a Java application is safe.
 
-## Inspiration
-
-I saw this on [YouTube](https://www.youtube.com/watch?v=bsZJo49RaBE):
-
-![Loser](https://i.imgur.com/mlxkzbL.png)
-
-It was yet another super obvious Minecraft account stealer or trojan using a fake video to entice fools to lose their accounts.
-
-This led me to make this Python app to quickly triage such distributions. The sample I was looking at stole Minecraft credentials, sent them to a Discord webhook through another API, and then downloaded another trojan which extracted a Windows binary as a second payload.
-
-Update: Mediafire later added a warning in response to this repo.
-
-![Media](https://i.imgur.com/nTrHgDA.png)
