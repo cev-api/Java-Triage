@@ -136,6 +136,10 @@ GENERIC_WEBHOOK_URL_RE = re.compile(
 )
 DISCORD_SNOWFLAKE_RE = re.compile(r"^\d{17,20}$")
 DISCORD_SNOWFLAKE_ANY_RE = re.compile(r"\b\d{17,20}\b")
+
+def _is_binary_looking_digits(s: str) -> bool:
+    """Return True if the string looks like binary data (only 0 and 1 digits) rather than a real ID."""
+    return set(s) <= {"0", "1"}
 # Bitcoin / cryptocurrency address patterns (Base58 P2PKH/P2SH, Bech32)
 BITCOIN_ADDRESS_RE = re.compile(
     r'\b(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[ac-hj-np-z02-9]{11,71})\b'
@@ -2210,11 +2214,15 @@ def detect_discord_indicator(decoded: str) -> tuple[str, str]:
             return "discord_bot_authorization_header", f"token={masked}"
         return "discord_bot_token", f"token={masked}"
 
-    if DISCORD_SNOWFLAKE_RE.match(d):
+    if DISCORD_SNOWFLAKE_RE.match(d) and not _is_binary_looking_digits(d):
         return "discord_snowflake_id", "snowflake_numeric_id"
 
-    if DISCORD_ID_CONTEXT_RE.search(d) and DISCORD_SNOWFLAKE_ANY_RE.search(d):
-        return "discord_contextual_id", "contextual_snowflake_in_literal"
+    if DISCORD_ID_CONTEXT_RE.search(d):
+        # Check for a real snowflake that isn't binary-looking
+        snowflake_candidates = [m.group(0) for m in DISCORD_SNOWFLAKE_ANY_RE.finditer(d)]
+        real_snowflakes = [s for s in snowflake_candidates if not _is_binary_looking_digits(s)]
+        if real_snowflakes:
+            return "discord_contextual_id", f"contextual_snowflake_in_literal id={real_snowflakes[0]}"
 
     if "discord.com/api/webhooks/" in low or "discordapp.com/api/webhooks/" in low:
         return "discord_webhook_path", "webhook_pattern_fragment"
@@ -4953,19 +4961,28 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             or "api/webhooks/" in decoded_low_blob
         )
         has_snowflake_in_obf = any(
-            DISCORD_SNOWFLAKE_ANY_RE.search(s) for s in obfuscated_values
+            not _is_binary_looking_digits(m.group(0))
+            for s in obfuscated_values
+            for m in DISCORD_SNOWFLAKE_ANY_RE.finditer(s)
         )
-        has_snowflake_in_text = bool(DISCORD_SNOWFLAKE_ANY_RE.search(text))
+        _snow_text_match = DISCORD_SNOWFLAKE_ANY_RE.search(text)
+        has_snowflake_in_text = bool(
+            _snow_text_match and not _is_binary_looking_digits(_snow_text_match.group(0))
+        )
 
         if has_webhook_path_fragment and (has_snowflake_in_obf or has_snowflake_in_text):
             # Look for the specific webhook URL assembly pattern: base URL + snowflake + token fragments
             snowflake_matches = []
             for s in obfuscated_values:
                 for sm in DISCORD_SNOWFLAKE_ANY_RE.finditer(s):
-                    snowflake_matches.append(sm.group(0))
+                    candidate = sm.group(0)
+                    if not _is_binary_looking_digits(candidate):
+                        snowflake_matches.append(candidate)
             if not snowflake_matches:
                 for sm in DISCORD_SNOWFLAKE_ANY_RE.finditer(text):
-                    snowflake_matches.append(sm.group(0))
+                    candidate = sm.group(0)
+                    if not _is_binary_looking_digits(candidate):
+                        snowflake_matches.append(candidate)
             snowflake_preview = ", ".join(snowflake_matches[:3])
             out.append(
                 BehaviorFinding(
@@ -8970,9 +8987,9 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     .findings-table td.func-col, .findings-table th.func-col {{ white-space:nowrap; overflow-wrap:normal; word-break:normal; }}
     .findings-table td.cat-col, .findings-table th.cat-col {{ white-space:nowrap; overflow-wrap:normal; word-break:normal; }}
     .behavior-table col.sev-col {{ width:10ch; }}
-    .behavior-table col.file-col {{ width:20ch; }}
+    .behavior-table col.file-col {{ width:14ch; }}
     .behavior-table col.line-col {{ width:5ch; }}
-    .behavior-table col.beh-col {{ width:26ch; }}
+    .behavior-table col.beh-col {{ width:32ch; }}
     .smart-table tbody tr.row-critical td:first-child {{ box-shadow:inset 3px 0 0 rgba(255,70,70,.92); }}
     .smart-table tbody tr.row-high td:first-child {{ box-shadow:inset 3px 0 0 rgba(255,116,116,.85); }}
     .smart-table tbody tr.row-medium td:first-child {{ box-shadow:inset 3px 0 0 rgba(255,210,102,.78); }}
@@ -8987,7 +9004,8 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     .meta-k {{ color:#9dd5ff; font-family:Consolas,Monaco,monospace; width:38%; }}
     .meta-v {{ color:#edf4fb; }}
     .jlab-table col.sev-col {{ width:10ch; }}
-    .jlab-table col.id-col {{ width:8ch; }}
+    .jlab-table col.id-col {{ width:6ch; }}
+    .jlab-table col.name-col {{ width:22ch; }}
     .jlab-table col.type-col {{ width:11ch; }}
     .jlab-table col.count-col {{ width:7ch; }}
     .jlab-table col.matches-col {{ width:48ch; }}
@@ -9053,21 +9071,13 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
       + "</div>") if (ratter_rows or rows_ratter) else ""}
     {("<div class='card'><h2 class='triage-title'>JLab Static Scan</h2>"
       + ("<div class='meta-box'><table class='meta-table'>" + "".join(jlab_overview_rows) + "</table></div>" if jlab_overview_rows else "")
-      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table jlab-table'><colgroup><col class='sev-col'><col class='id-col'><col><col><col class='type-col'><col class='count-col'><col class='matches-col'></colgroup><thead><tr><th class='tight'>Severity</th><th class='tight'>ID</th><th>Name</th><th>Description</th><th class='tight'>Type</th><th class='tight'>Count</th><th>Matches (preview)</th></tr></thead><tbody>" + "".join(rows_jlab) + "</tbody></table></div>" if rows_jlab else "")
+      + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table jlab-table'><colgroup><col class='sev-col'><col class='id-col'><col class='name-col'><col><col class='type-col'><col class='count-col'><col class='matches-col'></colgroup><thead><tr><th class='tight'>Severity</th><th class='tight'>ID</th><th>Name</th><th>Description</th><th class='tight'>Type</th><th class='tight'>Count</th><th>Matches (preview)</th></tr></thead><tbody>" + "".join(rows_jlab) + "</tbody></table></div>" if rows_jlab else "")
       + "</div>") if (jlab_overview_rows or rows_jlab) else ""}
     {("<div class='card'><h2 class='triage-title'>Stage2 Analysis</h2>"
       + ("<div class='meta-box'><table class='meta-table'>" + "".join(stage2_rows) + "</table></div>" if stage2_rows else "")
       + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Native Entry (sample)</th></tr></thead><tbody>" + "".join(rows_stage2_native) + "</tbody></table></div>" if rows_stage2_native else "")
       + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Type</th><th>Path</th><th>Evidence</th></tr></thead><tbody>" + "".join(rows_stage2_artifacts) + "</tbody></table></div>" if rows_stage2_artifacts else "")
       + "</div>") if (stage2_rows or rows_stage2_native or rows_stage2_artifacts) else ""}
-    {("<div class='card'><h2 class='triage-title'>Cryptocurrency Addresses</h2>"
-      "<div class='table-wrap'><table class='smart-table'><thead><tr><th>Address</th><th class='tight'>File</th><th class='tight'>Line</th></tr></thead><tbody>"
-      + "".join(rows_crypto_html) + "</tbody></table></div>"
-      + "</div>") if rows_crypto_html else ""}
-    {("<div class='card'><h2 class='triage-title'>Discord / Webhook Indicators</h2>"
-      "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Signal</th><th>Value</th><th class='tight'>File</th><th class='tight'>Line</th></tr></thead><tbody>"
-      + "".join(rows_discord_html) + "</tbody></table></div>"
-      + "</div>") if rows_discord_html else ""}
     {("<div class='card'><h2 class='triage-title'>Assembled C2 URLs</h2>"
       + (f"<p style='color:#9dd5ff;margin:.4rem 0'>C2 domain: <strong>{_h(c2_domain_html)}</strong> (source: {_h(c2_source_html)})</p>" if c2_domain_html else "")
       + "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Method</th><th>URL</th><th>Description</th></tr></thead><tbody>"
@@ -9085,6 +9095,14 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
       "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Indicator Type</th><th>Value</th></tr></thead><tbody>"
       + "".join(rows_blockchain) + "</tbody></table></div>"
       + "</div>") if rows_blockchain else ""}
+    {("<div class='card'><h2 class='triage-title'>Cryptocurrency Addresses</h2>"
+      "<div class='table-wrap'><table class='smart-table'><thead><tr><th>Address</th><th class='tight'>File</th><th class='tight'>Line</th></tr></thead><tbody>"
+      + "".join(rows_crypto_html) + "</tbody></table></div>"
+      + "</div>") if rows_crypto_html else ""}
+    {("<div class='card'><h2 class='triage-title'>Discord / Webhook Indicators</h2>"
+      "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Signal</th><th>Value</th><th class='tight'>File</th><th class='tight'>Line</th></tr></thead><tbody>"
+      + "".join(rows_discord_html) + "</tbody></table></div>"
+      + "</div>") if rows_discord_html else ""}
     {("<div class='card'><h2 class='triage-title'>Network Endpoint Assessment</h2>"
       + ("<div class='meta-box'><table class='meta-table'>" + "".join(net_rows) + "</table></div>" if net_rows else "")
       + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Suspicious URLs</th></tr></thead><tbody>" + "".join(rows_net_suspicious) + "</tbody></table></div>" if rows_net_suspicious else "")
@@ -9829,32 +9847,6 @@ def render_rich(
     bt.add_row("File size", f"{basic.get('file_size_text', '')} ({basic.get('file_size_bytes', 0)} bytes)")
     console.print(bt)
 
-    # ── Cryptocurrency Addresses (before JAR Info for visibility) ──
-    crypto_findings = [f for f in findings if f.category == "cryptocurrency_address"]
-    if crypto_findings:
-        _print_section(console, "Cryptocurrency Addresses")
-        ct = Table(show_header=True, box=box.SIMPLE, expand=True)
-        ct.add_column("Address", style="bright_yellow")
-        ct.add_column("Location", style="cyan")
-        for f in crypto_findings:
-            ct.add_row(f.decoded, f"{f.file}:{f.line}")
-        console.print(ct)
-
-    # ── Discord Webhook / Token Indicators ──
-    discord_findings = [f for f in findings if f.category == "discord_indicator" and any(
-        k in (f.note or "").lower() for k in ("webhook", "token", "snowflake_id", "notification")
-    )]
-    if discord_findings:
-        _print_section(console, "Discord / Webhook Indicators")
-        dt = Table(show_header=True, box=box.SIMPLE, expand=True)
-        dt.add_column("Indicator", style="bright_magenta")
-        dt.add_column("Value", style="white", overflow="fold")
-        dt.add_column("Location", style="cyan")
-        for f in discord_findings[:30]:
-            signal = (f.note or "").replace("source=string_scanner signal=", "")
-            dt.add_row(signal[:40], f.decoded[:80], f"{f.file}:{f.line}")
-        console.print(dt)
-
     _print_section(console, "JAR Info")
     mt = Table(show_header=False, box=box.SIMPLE)
     mt.add_row("Manifest", short(jar_info.get("manifest", "") or "<not found>", 800))
@@ -10243,6 +10235,32 @@ def render_rich(
             for item in blockchain["api_key_urls"]:
                 t_api.add_row(item)
             console.print(t_api)
+
+    # ── Cryptocurrency Addresses ──
+    crypto_findings = [f for f in findings if f.category == "cryptocurrency_address"]
+    if crypto_findings:
+        _print_section(console, "Cryptocurrency Addresses")
+        ct = Table(show_header=True, box=box.SIMPLE, expand=True)
+        ct.add_column("Address", style="bright_yellow")
+        ct.add_column("Location", style="cyan")
+        for f in crypto_findings:
+            ct.add_row(f.decoded, f"{f.file}:{f.line}")
+        console.print(ct)
+
+    # ── Discord Webhook / Token Indicators ──
+    discord_findings = [f for f in findings if f.category == "discord_indicator" and any(
+        k in (f.note or "").lower() for k in ("webhook", "token", "snowflake_id", "notification")
+    )]
+    if discord_findings:
+        _print_section(console, "Discord / Webhook Indicators")
+        dt = Table(show_header=True, box=box.SIMPLE, expand=True)
+        dt.add_column("Indicator", style="bright_magenta")
+        dt.add_column("Value", style="white", overflow="fold")
+        dt.add_column("Location", style="cyan")
+        for f in discord_findings[:30]:
+            signal = (f.note or "").replace("source=string_scanner signal=", "")
+            dt.add_row(signal[:40], f.decoded[:80], f"{f.file}:{f.line}")
+        console.print(dt)
 
     # ── Assembled C2 URLs (from url_assembly) ──
     ua = url_assembly or {}
