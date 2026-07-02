@@ -2653,12 +2653,137 @@ def deobfuscate_codebase(root: Path, profile: Optional[DecryptProfile], enabled_
     }
 
 
-def iter_java_files(root: Path) -> Iterable[Path]:
-    yield from root.rglob("*.java")
+def iter_java_files(root: Path, include_pathological: bool = False) -> Iterable[Path]:
+    for p in root.rglob("*.java"):
+        if include_pathological or not _source_pathology(p).get("pathological"):
+            yield p
+
+
+def iter_pathological_java_files(root: Path) -> Iterable[Path]:
+    for p in root.rglob("*.java"):
+        if _source_pathology(p).get("pathological"):
+            yield p
 
 
 def iter_class_files(root: Path) -> Iterable[Path]:
     yield from root.rglob("*.class")
+
+
+MAX_SOURCE_SCAN_BYTES = 2_500_000
+MAX_SOURCE_SCAN_LINE_BYTES = 250_000
+MAX_ESKID_SOURCE_SCAN_BYTES = 300_000
+MAX_ESKID_SOURCE_SCAN_LINE_BYTES = 12_000
+ESKID_MARKER = "protected_by_eskid"
+
+
+def _path_has_eskid_profile(path: Path) -> bool:
+    for parent in [path.parent, *path.parents]:
+        marker = parent / ".java_triage_jar_static_profile.json"
+        if marker.is_file():
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8", errors="replace"))
+                return bool(data.get("eskid_marker") or "protected_by_eskid" in (data.get("notes") or []))
+            except Exception:
+                return False
+    return False
+
+
+def _source_pathology(path: Path) -> dict:
+    """Fast guard for decompiler-hostile Java output.
+
+    eSkid-style samples can make CFR/Vineflower emit megabyte-scale single
+    lines and illegal identifiers. Running all source regexes over those files
+    can look like a freeze, so classify them before full text scanning.
+    """
+    out = {
+        "pathological": False,
+        "reason": "",
+        "size": 0,
+        "max_line": 0,
+        "eskid_marker": False,
+    }
+    try:
+        st = path.stat()
+        out["size"] = int(st.st_size)
+        eskid_parent = _path_has_eskid_profile(path)
+        if eskid_parent and st.st_size > MAX_ESKID_SOURCE_SCAN_BYTES:
+            out["pathological"] = True
+            out["reason"] = f"eskid_source_too_large:{st.st_size}"
+            return out
+        if st.st_size > MAX_SOURCE_SCAN_BYTES:
+            out["pathological"] = True
+            out["reason"] = f"source_too_large:{st.st_size}"
+            return out
+        max_line = 0
+        marker = False
+        with path.open("rb") as fh:
+            for raw in fh:
+                ln = len(raw)
+                if ln > max_line:
+                    max_line = ln
+                if ESKID_MARKER.encode("ascii") in raw:
+                    marker = True
+                if eskid_parent and ln > MAX_ESKID_SOURCE_SCAN_LINE_BYTES:
+                    out["pathological"] = True
+                    out["reason"] = f"eskid_line_too_large:{ln}"
+                    break
+                if ln > MAX_SOURCE_SCAN_LINE_BYTES:
+                    out["pathological"] = True
+                    out["reason"] = f"line_too_large:{ln}"
+                    break
+        out["max_line"] = max_line
+        out["eskid_marker"] = marker
+        if marker and max_line > 50_000:
+            out["pathological"] = True
+            out["reason"] = "eskid_giant_line"
+    except Exception as exc:
+        out["pathological"] = True
+        out["reason"] = f"read_error:{exc}"
+    return out
+
+
+def _pathology_finding(path: Path, root: Path, pathology: dict) -> Finding:
+    try:
+        rel = str(path.relative_to(root))
+    except Exception:
+        rel = str(path)
+    reason = str(pathology.get("reason") or "pathological_source")
+    size = int(pathology.get("size") or 0)
+    max_line = int(pathology.get("max_line") or 0)
+    note = f"source=source_guard signal={reason} size={size} max_line={max_line}"
+    if pathology.get("eskid_marker"):
+        note += " marker=protected_by_eskid"
+    return Finding(
+        file=rel,
+        line=1,
+        function="<source_guard>",
+        decoded="Decompiler-hostile source skipped; use class constant-pool fallback / bytecode view",
+        category="encrypted_or_unresolved",
+        note=note,
+    )
+
+
+def _is_fallback_class_path(path: Path) -> bool:
+    return ".java_triage_classes" in path.parts
+
+
+def _scan_root_has_eskid_profile(root: Path) -> bool:
+    marker = root / ".java_triage_jar_static_profile.json"
+    if marker.is_file():
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8", errors="replace"))
+            if data.get("eskid_marker") or "protected_by_eskid" in (data.get("notes") or []):
+                return True
+        except Exception:
+            pass
+    try:
+        for p in list(root.rglob("*.java"))[:50]:
+            info = _source_pathology(p)
+            if info.get("eskid_marker"):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _extract_class_utf8_constants(class_bytes: bytes, max_items: int = 6000) -> List[str]:
@@ -2707,6 +2832,459 @@ def _extract_class_utf8_constants(class_bytes: bytes, max_items: int = 6000) -> 
             break
         idx += 1
     return out
+
+
+def _parse_classfile_static(class_bytes: bytes) -> dict:
+    """Parse enough of a JVM class file for static indy/bootstrap triage."""
+    if len(class_bytes) < 10 or class_bytes[:4] != b"\xCA\xFE\xBA\xBE":
+        return {}
+    off = 8
+
+    def u1() -> int:
+        nonlocal off
+        if off + 1 > len(class_bytes):
+            raise ValueError("truncated_u1")
+        val = class_bytes[off]
+        off += 1
+        return val
+
+    def u2() -> int:
+        nonlocal off
+        if off + 2 > len(class_bytes):
+            raise ValueError("truncated_u2")
+        val = int.from_bytes(class_bytes[off : off + 2], "big")
+        off += 2
+        return val
+
+    def u4() -> int:
+        nonlocal off
+        if off + 4 > len(class_bytes):
+            raise ValueError("truncated_u4")
+        val = int.from_bytes(class_bytes[off : off + 4], "big")
+        off += 4
+        return val
+
+    def skip(n: int) -> None:
+        nonlocal off
+        if n < 0 or off + n > len(class_bytes):
+            raise ValueError("truncated_skip")
+        off += n
+
+    try:
+        cp_count = u2()
+        cp: List[dict | None] = [None] * cp_count
+        idx = 1
+        while idx < cp_count:
+            tag = u1()
+            item: dict = {"tag": tag}
+            if tag == 1:
+                ln = u2()
+                raw = class_bytes[off : off + ln]
+                skip(ln)
+                item["value"] = raw.decode("utf-8", errors="replace")
+            elif tag == 3:
+                val = u4()
+                item["value"] = val - 0x100000000 if val & 0x80000000 else val
+            elif tag == 4:
+                skip(4)
+            elif tag == 5:
+                val = int.from_bytes(class_bytes[off : off + 8], "big", signed=True)
+                skip(8)
+                item["value"] = val
+                cp[idx] = item
+                idx += 2
+                continue
+            elif tag == 6:
+                skip(8)
+                cp[idx] = item
+                idx += 2
+                continue
+            elif tag in {7, 8, 16, 19, 20}:
+                item["index"] = u2()
+            elif tag in {9, 10, 11}:
+                item["class_index"] = u2()
+                item["name_and_type_index"] = u2()
+            elif tag == 12:
+                item["name_index"] = u2()
+                item["descriptor_index"] = u2()
+            elif tag == 15:
+                item["reference_kind"] = u1()
+                item["reference_index"] = u2()
+            elif tag in {17, 18}:
+                item["bootstrap_method_attr_index"] = u2()
+                item["name_and_type_index"] = u2()
+            else:
+                raise ValueError(f"unknown_cp_tag_{tag}")
+            cp[idx] = item
+            idx += 1
+
+        def utf(cp_index: int) -> str:
+            if 0 < cp_index < len(cp):
+                item = cp[cp_index] or {}
+                if item.get("tag") == 1:
+                    return str(item.get("value") or "")
+            return ""
+
+        def cp_value(cp_index: int):
+            if not (0 < cp_index < len(cp)):
+                return None
+            item = cp[cp_index] or {}
+            tag = item.get("tag")
+            if tag == 1:
+                return item.get("value")
+            if tag in {3, 5}:
+                return item.get("value")
+            if tag == 7:
+                return {"kind": "class", "name": utf(int(item.get("index") or 0))}
+            if tag == 8:
+                return {"kind": "string", "value": utf(int(item.get("index") or 0))}
+            if tag == 16:
+                return {"kind": "method_type", "descriptor": utf(int(item.get("index") or 0))}
+            if tag == 12:
+                return {
+                    "kind": "name_and_type",
+                    "name": utf(int(item.get("name_index") or 0)),
+                    "descriptor": utf(int(item.get("descriptor_index") or 0)),
+                }
+            if tag in {9, 10, 11}:
+                cls = cp_value(int(item.get("class_index") or 0))
+                nt = cp_value(int(item.get("name_and_type_index") or 0))
+                return {
+                    "kind": {9: "field_ref", 10: "method_ref", 11: "interface_method_ref"}.get(tag),
+                    "owner": (cls or {}).get("name") if isinstance(cls, dict) else None,
+                    "name": (nt or {}).get("name") if isinstance(nt, dict) else None,
+                    "descriptor": (nt or {}).get("descriptor") if isinstance(nt, dict) else None,
+                }
+            if tag == 15:
+                ref = cp_value(int(item.get("reference_index") or 0))
+                out = {
+                    "kind": "method_handle",
+                    "reference_kind": item.get("reference_kind"),
+                    "reference": ref,
+                }
+                if isinstance(ref, dict):
+                    out.update(
+                        {
+                            "owner": ref.get("owner"),
+                            "name": ref.get("name"),
+                            "descriptor": ref.get("descriptor"),
+                        }
+                    )
+                return out
+            if tag in {17, 18}:
+                nt = cp_value(int(item.get("name_and_type_index") or 0))
+                return {
+                    "kind": "dynamic" if tag == 17 else "invokedynamic",
+                    "bootstrap_method_attr_index": item.get("bootstrap_method_attr_index"),
+                    "name": (nt or {}).get("name") if isinstance(nt, dict) else None,
+                    "descriptor": (nt or {}).get("descriptor") if isinstance(nt, dict) else None,
+                }
+            return None
+
+        access_flags = u2()
+        this_class = u2()
+        super_class = u2()
+        interfaces_count = u2()
+        skip(2 * interfaces_count)
+
+        fields_count = u2()
+        for _ in range(fields_count):
+            skip(6)
+            attr_count = u2()
+            for _ in range(attr_count):
+                skip(2)
+                attr_len = u4()
+                skip(attr_len)
+
+        method_invokedynamics: list[dict] = []
+        methods_count = u2()
+        for _ in range(methods_count):
+            skip(2)
+            method_name = utf(u2())
+            method_descriptor = utf(u2())
+            attr_count = u2()
+            for _ in range(attr_count):
+                attr_name = utf(u2())
+                attr_len = u4()
+                attr_start = off
+                if attr_name == "Code" and attr_len >= 8:
+                    max_stack = u2()
+                    max_locals = u2()
+                    code_len = u4()
+                    code_start = off
+                    code = class_bytes[code_start : code_start + code_len]
+                    skip(code_len)
+                    i = 0
+                    while i < len(code):
+                        op = code[i]
+                        if op == 0xBA and i + 4 < len(code):  # invokedynamic
+                            cp_index = int.from_bytes(code[i + 1 : i + 3], "big")
+                            indy = cp_value(cp_index)
+                            item = {
+                                "method": method_name,
+                                "method_descriptor": method_descriptor,
+                                "bytecode_offset": i,
+                                "constant_pool_index": cp_index,
+                            }
+                            if isinstance(indy, dict):
+                                item.update(
+                                    {
+                                        "bootstrap_method_attr_index": indy.get("bootstrap_method_attr_index"),
+                                        "name": indy.get("name"),
+                                        "descriptor": indy.get("descriptor"),
+                                    }
+                                )
+                            method_invokedynamics.append(item)
+                            i += 5
+                        else:
+                            i += _jvm_instruction_size(code, i)
+                    exception_table_len = u2()
+                    skip(8 * exception_table_len)
+                    code_attr_count = u2()
+                    for _ in range(code_attr_count):
+                        skip(2)
+                        code_attr_len = u4()
+                        skip(code_attr_len)
+                off = attr_start + attr_len
+
+        bootstrap_methods: list[dict] = []
+        class_attr_count = u2()
+        for _ in range(class_attr_count):
+            attr_name = utf(u2())
+            attr_len = u4()
+            attr_start = off
+            if attr_name == "BootstrapMethods" and attr_len >= 2:
+                bm_count = u2()
+                for bm_index in range(bm_count):
+                    handle_index = u2()
+                    arg_count = u2()
+                    args = [cp_value(u2()) for _ in range(arg_count)]
+                    handle = cp_value(handle_index)
+                    bootstrap_methods.append(
+                        {
+                            "index": bm_index,
+                            "method_handle_index": handle_index,
+                            "method_handle": handle,
+                            "arguments": args,
+                            "arguments_count": len(args),
+                        }
+                    )
+            off = attr_start + attr_len
+
+        invokedynamic_constants: list[dict] = []
+        for cp_index, item in enumerate(cp):
+            if not item or item.get("tag") != 18:
+                continue
+            value = cp_value(cp_index)
+            if isinstance(value, dict):
+                value["constant_pool_index"] = cp_index
+                invokedynamic_constants.append(value)
+
+        this_info = cp_value(this_class)
+        super_info = cp_value(super_class)
+        return {
+            "class_name": (this_info or {}).get("name") if isinstance(this_info, dict) else "",
+            "super_name": (super_info or {}).get("name") if isinstance(super_info, dict) else "",
+            "access_flags": access_flags,
+            "bootstrap_methods": bootstrap_methods,
+            "invokedynamic_constants": invokedynamic_constants,
+            "invokedynamic_instructions": method_invokedynamics,
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _jvm_instruction_size(code: bytes, offset: int) -> int:
+    op = code[offset]
+    if op == 0xAA:  # tableswitch
+        pad = (4 - ((offset + 1) % 4)) % 4
+        base = offset + 1 + pad
+        if base + 12 > len(code):
+            return max(1, len(code) - offset)
+        low = int.from_bytes(code[base + 4 : base + 8], "big", signed=True)
+        high = int.from_bytes(code[base + 8 : base + 12], "big", signed=True)
+        return 1 + pad + 12 + max(0, high - low + 1) * 4
+    if op == 0xAB:  # lookupswitch
+        pad = (4 - ((offset + 1) % 4)) % 4
+        base = offset + 1 + pad
+        if base + 8 > len(code):
+            return max(1, len(code) - offset)
+        npairs = int.from_bytes(code[base + 4 : base + 8], "big", signed=True)
+        return 1 + pad + 8 + max(0, npairs) * 8
+    if op == 0xC4:  # wide
+        if offset + 1 >= len(code):
+            return 1
+        return 6 if code[offset + 1] == 0x84 else 4
+    fixed = {
+        **{x: 1 for x in list(range(0x00, 0x10)) + list(range(0x1A, 0x35)) + list(range(0x3B, 0x84)) + list(range(0x85, 0x99)) + [0xAC, 0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xBE, 0xBF, 0xC2, 0xC3]},
+        **{x: 2 for x in [0x10, 0x12, 0x15, 0x16, 0x17, 0x18, 0x19, 0x36, 0x37, 0x38, 0x39, 0x3A, 0xA9, 0xBC]},
+        **{x: 3 for x in [0x11, 0x13, 0x14, 0x84] + list(range(0x99, 0xA8)) + [0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xBB, 0xBD, 0xC0, 0xC1]},
+        **{x: 4 for x in [0xC5]},
+        **{x: 5 for x in [0xB9, 0xBA, 0xC8, 0xC9]},
+    }
+    return fixed.get(op, 1)
+
+
+def _method_descriptor_return_type(descriptor: str) -> str:
+    if not descriptor or ")" not in descriptor:
+        return ""
+    return descriptor.rsplit(")", 1)[-1]
+
+
+def _indy_return_category(descriptor: str) -> str:
+    ret = _method_descriptor_return_type(descriptor)
+    if ret == "Ljava/lang/String;":
+        return "string"
+    if ret == "[B":
+        return "byte_array"
+    if ret == "Ljava/lang/Class;":
+        return "class"
+    if ret in {"Ljava/lang/Object;", "Ljava/lang/invoke/MethodHandle;", "Ljava/lang/invoke/CallSite;"}:
+        return "dynamic_object"
+    if ret.startswith("Lme/mioclient/") or ret.startswith("L") or ret.startswith("[L"):
+        return "object"
+    if ret in {"I", "J", "Z", "D", "F", "S", "B", "C"}:
+        return "primitive"
+    if ret == "V":
+        return "void"
+    if ret.startswith("["):
+        return "array"
+    return "unknown"
+
+
+def produce_invokedynamic_bootstrap_map(root: Path, show_progress: bool, progress_console=None) -> dict:
+    class_files = list((root / ".java_triage_classes").rglob("*.class")) if (root / ".java_triage_classes").is_dir() else list(iter_class_files(root))
+    class_entries: list[dict] = []
+    bootstrap_owner_counts: dict[str, int] = {}
+    suspicious_bootstraps: list[dict] = []
+    protected_class_pairs: list[dict] = []
+    return_category_counts: dict[str, int] = {}
+    high_value_sites: list[dict] = []
+    invokedynamic_total = 0
+    bootstrap_total = 0
+
+    for class_path in class_files:
+        try:
+            rel = str(class_path.relative_to(root))
+            parsed = _parse_classfile_static(class_path.read_bytes())
+        except Exception:
+            continue
+        if not parsed:
+            continue
+        if parsed.get("error"):
+            class_entries.append({"source": rel, "error": parsed.get("error")})
+            continue
+        bms = parsed.get("bootstrap_methods") or []
+        indys = parsed.get("invokedynamic_constants") or []
+        indy_ins = parsed.get("invokedynamic_instructions") or []
+        if not bms and not indys and not indy_ins:
+            continue
+        invokedynamic_total += len(indy_ins) or len(indys)
+        bootstrap_total += len(bms)
+
+        slim_bms: list[dict] = []
+        for bm in bms:
+            mh = bm.get("method_handle") or {}
+            owner = str(mh.get("owner") or "")
+            name = str(mh.get("name") or "")
+            descriptor = str(mh.get("descriptor") or "")
+            owner_key = f"{owner}.{name}{descriptor}" if owner or name else "<unknown>"
+            bootstrap_owner_counts[owner_key] = bootstrap_owner_counts.get(owner_key, 0) + 1
+            suspicious = bool(owner and not owner.startswith(("java/", "javax/", "sun/", "jdk/")))
+            slim = {
+                "index": bm.get("index"),
+                "owner": owner,
+                "name": name,
+                "descriptor": descriptor,
+                "reference_kind": mh.get("reference_kind"),
+                "arguments_count": bm.get("arguments_count"),
+                "arguments": bm.get("arguments", [])[:12],
+                "suspicious_non_jdk_owner": suspicious,
+            }
+            slim_bms.append(slim)
+            if suspicious:
+                suspicious_bootstraps.append({"source": rel, **slim})
+                protected_class_pairs.append(
+                    {
+                        "protected_class": parsed.get("class_name"),
+                        "source": rel,
+                        "bootstrap_owner": owner,
+                        "bootstrap_name": name,
+                        "bootstrap_descriptor": descriptor,
+                    }
+                )
+
+        for site in indy_ins:
+            descriptor = str(site.get("descriptor") or "")
+            category = _indy_return_category(descriptor)
+            return_category_counts[category] = return_category_counts.get(category, 0) + 1
+            if category in {"string", "byte_array", "class", "dynamic_object"}:
+                high_value_sites.append(
+                    {
+                        "source": rel,
+                        "class_name": parsed.get("class_name"),
+                        "method": site.get("method"),
+                        "bytecode_offset": site.get("bytecode_offset"),
+                        "bootstrap_method_attr_index": site.get("bootstrap_method_attr_index"),
+                        "name": site.get("name"),
+                        "descriptor": descriptor,
+                        "return_category": category,
+                    }
+                )
+
+        class_entries.append(
+            {
+                "source": rel,
+                "class_name": parsed.get("class_name"),
+                "bootstrap_methods": slim_bms[:200],
+                "bootstrap_methods_count": len(bms),
+                "invokedynamic_constants": indys[:500],
+                "invokedynamic_constants_count": len(indys),
+                "invokedynamic_instructions": indy_ins[:1000],
+                "invokedynamic_instructions_count": len(indy_ins),
+            }
+        )
+
+    top_bootstrap_owners = sorted(bootstrap_owner_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:50]
+    payload = {
+        "root": str(root),
+        "class_files_count": len(class_files),
+        "classes_with_invokedynamic_or_bootstrap": len(class_entries),
+        "bootstrap_methods_count": bootstrap_total,
+        "invokedynamic_sites_count": invokedynamic_total,
+        "top_bootstrap_owners": [{"owner": owner, "count": count} for owner, count in top_bootstrap_owners],
+        "return_category_counts": dict(sorted(return_category_counts.items())),
+        "protected_class_pairs": protected_class_pairs[:1000],
+        "high_value_sites_count": len(high_value_sites),
+        "high_value_sites": high_value_sites[:2000],
+        "suspicious_bootstraps_count": len(suspicious_bootstraps),
+        "suspicious_bootstraps": suspicious_bootstraps[:1000],
+        "classes": class_entries[:1000],
+        "truncated": len(class_entries) > 1000,
+    }
+    json_path = root / ".java_triage_indy_bootstrap_map.json"
+    try:
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return {
+            "class_files_count": len(class_files),
+            "bootstrap_methods_count": bootstrap_total,
+            "invokedynamic_sites_count": invokedynamic_total,
+            "error": str(exc),
+        }
+    progress(
+        show_progress,
+        f"invokedynamic bootstrap map ready: {json_path.name} indy_sites={invokedynamic_total} suspicious_bootstraps={len(suspicious_bootstraps)}",
+        progress_console,
+    )
+    return {
+        "class_files_count": len(class_files),
+        "bootstrap_methods_count": bootstrap_total,
+        "invokedynamic_sites_count": invokedynamic_total,
+        "suspicious_bootstraps_count": len(suspicious_bootstraps),
+        "high_value_sites_count": len(high_value_sites),
+        "json": str(json_path),
+    }
 
 
 def scan_class_constant_pool(path: Path, root: Path, max_hits: int = 180) -> List[Finding]:
@@ -2791,6 +3369,165 @@ def scan_class_constant_pool(path: Path, root: Path, max_hits: int = 180) -> Lis
             )
         )
     return out
+
+
+def _is_printable_string_dump_value(s: str) -> bool:
+    if len(s) < 4 or len(s) > 5000:
+        return False
+    printable = sum(1 for ch in s if ch in "\t\r\n" or 32 <= ord(ch) <= 126)
+    return printable / max(1, len(s)) >= 0.80
+
+
+def _aes_candidate_kind(s: str) -> str:
+    raw = s.strip()
+    low = raw.lower()
+    common_non_keys = {
+        "bootstrapmethods",
+        "findstaticgetter",
+        "findstaticsetter",
+        "nosuchmethodexception in",
+        "longbitstodouble",
+    }
+    if raw in common_non_keys or low in common_non_keys:
+        return ""
+    if raw.startswith(("java/", "javax/", "sun/", "jdk/", "org/", "com/")):
+        return ""
+    if any(tok in raw for tok in (";", "(", ")", "<", ">", ".class")):
+        return ""
+
+    def plausible_key_material(value: str) -> bool:
+        if len(set(value)) < 8:
+            return False
+        # Avoid ordinary identifiers while allowing punctuation-heavy obfuscated keys.
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.$-]*", value):
+            return False
+        freq = {}
+        for ch in value:
+            freq[ch] = freq.get(ch, 0) + 1
+        entropy = 0.0
+        for count in freq.values():
+            p = count / len(value)
+            entropy -= p * math.log2(p)
+        return entropy >= 3.2
+
+    if len(raw) in {16, 24, 32} and _is_printable_string_dump_value(raw):
+        # Avoid flagging obvious class names/descriptors as keys.
+        if not any(tok in raw for tok in ("/", "\\", "java", "class")) and plausible_key_material(raw):
+            return f"raw_{len(raw)}_byte_candidate"
+    if re.fullmatch(r"[A-Fa-f0-9]{32}|[A-Fa-f0-9]{48}|[A-Fa-f0-9]{64}", raw):
+        return f"hex_{len(raw)//2}_byte_candidate"
+    if re.fullmatch(r"[A-Za-z0-9+/]{22,44}={0,2}", raw):
+        if "/" in raw and raw.startswith(("java/", "javax/", "org/", "com/")):
+            return ""
+        try:
+            decoded = base64.b64decode(raw, validate=True)
+            if len(decoded) in {16, 24, 32}:
+                return f"base64_{len(decoded)}_byte_candidate"
+        except Exception:
+            pass
+    return ""
+
+
+def produce_post_deobf_string_dump(root: Path, show_progress: bool, progress_console=None) -> dict:
+    """Write a post-prep string dump for hostile samples.
+
+    The dump intentionally favors normalized/extracted class constants over
+    giant decompiler output. This catches hardcoded AES material even when CFR
+    source is too hostile to scan deeply.
+    """
+    entries: List[dict] = []
+    aes_candidates: List[dict] = []
+    seen: set[tuple[str, str]] = set()
+    class_files = list((root / ".java_triage_classes").rglob("*.class")) if (root / ".java_triage_classes").is_dir() else list(iter_class_files(root))
+    for class_path in class_files:
+        try:
+            rel = str(class_path.relative_to(root))
+            raw = class_path.read_bytes()
+        except Exception:
+            continue
+        for value in _extract_class_utf8_constants(raw, max_items=12000):
+            value = value.strip()
+            if not _is_printable_string_dump_value(value):
+                continue
+            key = (rel, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            item = {"source": rel, "kind": "class_constant", "value": value}
+            entries.append(item)
+            cand = _aes_candidate_kind(value)
+            low = value.lower()
+            if cand or "aes" in low or "secretkeyspec" in low or "cipher" in low:
+                aes_item = dict(item)
+                aes_item["candidate"] = cand or "crypto_context_string"
+                aes_candidates.append(aes_item)
+
+    for java_path in iter_java_files(root):
+        if _source_pathology(java_path).get("pathological"):
+            continue
+        try:
+            rel = str(java_path.relative_to(root))
+            text = java_path.read_text(encoding="utf-8", errors="replace")
+            starts = build_line_starts(text)
+        except Exception:
+            continue
+        for m in STRING_ANY_LITERAL_RE.finditer(text):
+            value = _unescape_java_literal(m.group(1)).strip()
+            if not _is_printable_string_dump_value(value):
+                continue
+            key = (rel, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            item = {
+                "source": rel,
+                "kind": "java_literal",
+                "line": offset_to_line(starts, m.start()),
+                "value": value,
+            }
+            entries.append(item)
+            cand = _aes_candidate_kind(value)
+            low = value.lower()
+            if cand or "aes" in low or "secretkeyspec" in low or "cipher" in low:
+                aes_item = dict(item)
+                aes_item["candidate"] = cand or "crypto_context_string"
+                aes_candidates.append(aes_item)
+
+    entries.sort(key=lambda x: (x.get("source", ""), x.get("kind", ""), x.get("value", "")))
+    aes_candidates.sort(key=lambda x: (x.get("source", ""), x.get("candidate", ""), x.get("value", "")))
+    payload = {
+        "root": str(root),
+        "strings_count": len(entries),
+        "aes_candidates_count": len(aes_candidates),
+        "aes_candidates": aes_candidates[:500],
+        "strings": entries[:50000],
+        "truncated": len(entries) > 50000,
+    }
+    json_path = root / ".java_triage_string_dump.json"
+    txt_path = root / ".java_triage_string_dump.txt"
+    try:
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8", errors="replace")
+        with txt_path.open("w", encoding="utf-8", errors="replace") as fh:
+            fh.write(f"# strings={len(entries)} aes_candidates={len(aes_candidates)}\n")
+            fh.write("# AES candidates\n")
+            for item in aes_candidates[:500]:
+                fh.write(f"{item.get('candidate')} {item.get('source')} :: {item.get('value')}\n")
+            fh.write("\n# All strings\n")
+            for item in entries[:50000]:
+                fh.write(f"{item.get('kind')} {item.get('source')} :: {item.get('value')}\n")
+    except Exception as exc:
+        return {"strings_count": len(entries), "aes_candidates_count": len(aes_candidates), "error": str(exc)}
+    progress(
+        show_progress,
+        f"string dump ready: {json_path.name} strings={len(entries)} aes_candidates={len(aes_candidates)}",
+        progress_console,
+    )
+    return {
+        "strings_count": len(entries),
+        "aes_candidates_count": len(aes_candidates),
+        "json": str(json_path),
+        "txt": str(txt_path),
+    }
 
 
 def assess_auto_decrypt_need(root: Path) -> dict:
@@ -3013,6 +3750,298 @@ def _find_cfr_jar(cwd: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _jar_static_profile(jar_path: Path) -> dict:
+    app_prefixes = _dominant_app_prefixes(jar_path)
+    out = {
+        "malformed_class_dirs": 0,
+        "space_class_names": 0,
+        "class_count": 0,
+        "app_class_count": 0,
+        "eskid_marker": False,
+        "manifest_main_class": "",
+        "app_prefixes": list(app_prefixes),
+        "notes": [],
+    }
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            infos = zf.infolist()
+            for info in infos:
+                name = info.filename
+                norm = name[:-1] if name.endswith(".class/") else name
+                if name.endswith(".class/"):
+                    out["malformed_class_dirs"] += 1
+                if norm.endswith(".class"):
+                    out["class_count"] += 1
+                    if any(norm.startswith(pfx) for pfx in app_prefixes):
+                        out["app_class_count"] += 1
+                    stem = Path(norm).name
+                    if stem.strip() in {".class", ""} or (stem.endswith(".class") and len(stem) > 240):
+                        out["space_class_names"] += 1
+                if name.upper() == "META-INF/MANIFEST.MF":
+                    try:
+                        mf = zf.read(info).decode("utf-8", errors="replace")
+                        m = re.search(r"(?im)^Main-Class:\s*(.+?)\s*$", mf)
+                        if m:
+                            out["manifest_main_class"] = m.group(1).strip()
+                    except Exception:
+                        pass
+            for info in infos:
+                name = info.filename
+                norm = name[:-1] if name.endswith(".class/") else name
+                if not norm.endswith(".class"):
+                    continue
+                try:
+                    raw = zf.read(info)
+                except Exception:
+                    continue
+                if b"protected_by_eskid" in raw:
+                    out["eskid_marker"] = True
+                    break
+    except Exception as exc:
+        out["notes"].append(f"profile_error:{exc}")
+    if out["malformed_class_dirs"]:
+        out["notes"].append("class_entries_have_trailing_slash")
+    if out["space_class_names"]:
+        out["notes"].append("decompiler_hostile_space_class_name")
+    if out["eskid_marker"]:
+        out["notes"].append("protected_by_eskid")
+    return out
+
+
+def _rewrite_jar_entries(
+    src: Path,
+    dst: Path,
+    *,
+    strip_class_slash: bool = True,
+    app_only: bool = False,
+    app_prefixes: tuple[str, ...] = ("me/mioclient/installer/",),
+) -> tuple[bool, dict]:
+    stats = {"entries": 0, "renamed_class_entries": 0, "skipped_duplicates": 0, "written": 0}
+    try:
+        with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            seen: set[str] = set()
+            for info in zin.infolist():
+                name = info.filename
+                newname = name[:-1] if strip_class_slash and name.endswith(".class/") else name
+                if newname != name:
+                    stats["renamed_class_entries"] += 1
+                keep = newname.upper() == "META-INF/MANIFEST.MF" or any(newname.startswith(pfx) for pfx in app_prefixes)
+                if app_only and not keep:
+                    continue
+                if newname in seen:
+                    stats["skipped_duplicates"] += 1
+                    continue
+                seen.add(newname)
+                try:
+                    data = zin.read(info)
+                except Exception:
+                    continue
+                zi = zipfile.ZipInfo(newname, info.date_time)
+                zi.comment = info.comment
+                zi.extra = info.extra
+                zi.create_system = info.create_system
+                zi.external_attr = info.external_attr
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zout.writestr(zi, data)
+                stats["written"] += 1
+            stats["entries"] = len(seen)
+        return True, stats
+    except Exception as exc:
+        stats["error"] = str(exc)
+        return False, stats
+
+
+def _dominant_app_prefixes(jar_path: Path) -> tuple[str, ...]:
+    """Infer likely first-party package roots for app-only decompilation.
+
+    This keeps bundled libraries/decoys out of CFR while still handling samples
+    whose package is not the Mio installer package.
+    """
+    counts: dict[str, int] = {}
+    library_roots = (
+        "com/google/",
+        "org/json/",
+        "org/slf4j/",
+        "org/objectweb/",
+        "kotlin/",
+        "META-INF/",
+    )
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            for info in zf.infolist():
+                name = info.filename[:-1] if info.filename.endswith(".class/") else info.filename
+                if not name.endswith(".class"):
+                    continue
+                if any(name.startswith(root) for root in library_roots):
+                    continue
+                parts = name.split("/")[:-1]
+                if len(parts) >= 3:
+                    prefix = "/".join(parts[:3]) + "/"
+                elif len(parts) >= 2:
+                    prefix = "/".join(parts[:2]) + "/"
+                elif len(parts) == 1:
+                    prefix = parts[0] + "/"
+                else:
+                    continue
+                counts[prefix] = counts.get(prefix, 0) + 1
+    except Exception:
+        return ("me/mioclient/installer/",)
+    if not counts:
+        return ("me/mioclient/installer/", "me/mioclient/loader/")
+    total = sum(counts.values())
+    selected = [
+        prefix for prefix, count in sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+        if count >= 3 and (count / max(1, total)) >= 0.10
+    ]
+    return tuple(selected[:4] or [max(counts, key=counts.get)])
+
+
+def _extract_class_files_from_jar(jar_path: Path, out_root: Path) -> int:
+    class_root = out_root / ".java_triage_classes"
+    count = 0
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            for info in zf.infolist():
+                name = info.filename[:-1] if info.filename.endswith(".class/") else info.filename
+                if not name.endswith(".class"):
+                    continue
+                # Avoid writing deliberately impossible Windows filenames.
+                if Path(name).name.strip() in {".class", ""} or len(Path(name).name) > 240:
+                    continue
+                dest = class_root / Path(name)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(zf.read(info))
+                count += 1
+    except Exception:
+        return count
+    return count
+
+
+def _prepare_single_jar_scan_root(
+    selected: Path,
+    cwd: Path,
+    cfr: Path,
+    show_progress: bool,
+    progress_console=None,
+) -> Path:
+    selected = selected.resolve()
+    profile = _jar_static_profile(selected)
+    work_jar = selected
+    if profile.get("malformed_class_dirs") or profile.get("space_class_names"):
+        normalized = cwd / f"{selected.stem}.java_triage.normalized.jar"
+        ok, stats = _rewrite_jar_entries(selected, normalized, strip_class_slash=True, app_only=False)
+        if ok:
+            progress(
+                show_progress,
+                f"jar normalized: {normalized.name} class_slash_fixed={stats.get('renamed_class_entries', 0)}",
+                progress_console,
+            )
+            work_jar = normalized
+            profile = _jar_static_profile(work_jar)
+        else:
+            progress(show_progress, f"jar normalization failed: {stats.get('error', 'unknown error')}", progress_console)
+
+    decompile_jar = work_jar
+    fallback_class_jar = work_jar
+    if profile.get("eskid_marker") and profile.get("app_class_count"):
+        app_jar = cwd / f"{selected.stem}.java_triage.app-only.jar"
+        app_prefixes = tuple(profile.get("app_prefixes") or _dominant_app_prefixes(work_jar))
+        ok, stats = _rewrite_jar_entries(work_jar, app_jar, strip_class_slash=True, app_only=True, app_prefixes=app_prefixes)
+        if ok and stats.get("written", 0):
+            progress(
+                show_progress,
+                f"eSkid marker detected; using app-only decompile jar: {app_jar.name} prefixes={','.join(app_prefixes)}",
+                progress_console,
+            )
+            decompile_jar = app_jar
+
+    out_dir = (cwd / selected.stem).resolve()
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            print(f"error: output path exists and is not a directory: {out_dir}", file=sys.stderr)
+            return cwd
+        prepared_marker = out_dir / ".java_triage_jar_static_profile.json"
+        if (profile.get("eskid_marker") or profile.get("malformed_class_dirs") or profile.get("space_class_names")) and not prepared_marker.is_file():
+            out_dir = _resolve_unique_dir(cwd / f"{selected.stem}_triage").resolve()
+            progress(
+                show_progress,
+                f"existing decompile lacks hostile-jar prep metadata; using fresh directory: {out_dir.name}",
+                progress_console,
+            )
+        if sys.stdin.isatty():
+            if out_dir.exists():
+                reuse = _prompt_reuse_decompiled_dir(selected, out_dir, progress_console)
+                if reuse:
+                    progress(
+                        show_progress,
+                        f"reusing existing extracted directory for {selected.name}: {_display_report_path(out_dir, cwd)}",
+                        progress_console,
+                    )
+                    return out_dir
+                progress(show_progress, f"removing existing directory to re-decompile: {out_dir.name}", progress_console)
+                shutil.rmtree(out_dir)
+        else:
+            if out_dir.exists() and prepared_marker.is_file():
+                progress(
+                    show_progress,
+                    f"reusing existing extracted directory for {selected.name}: {_display_report_path(out_dir, cwd)}",
+                    progress_console,
+                )
+                return out_dir
+            if out_dir.exists():
+                out_dir = _resolve_unique_dir(cwd / f"{selected.stem}_triage").resolve()
+                progress(
+                    show_progress,
+                    f"existing decompile lacks hostile-jar prep metadata; using fresh directory: {out_dir.name}",
+                    progress_console,
+                )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    class_count = int(profile.get("class_count") or 0)
+    app_count = int(profile.get("app_class_count") or 0)
+    if profile.get("eskid_marker") and class_count >= 80 and app_count / max(1, class_count) >= 0.80:
+        extracted_classes = _extract_class_files_from_jar(fallback_class_jar, out_dir)
+        progress(
+            show_progress,
+            f"eSkid class-only fast path: skipped CFR decompile, extracted {extracted_classes} class file(s)",
+            progress_console,
+        )
+        _write_source_jar_metadata(out_dir, selected)
+        try:
+            profile["cfr_skipped"] = True
+            profile["cfr_skip_reason"] = "eskid_all_first_party_decompile_hostile"
+            (out_dir / ".java_triage_jar_static_profile.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return out_dir
+
+    cp = _run_subprocess_with_progress(
+        ["java", "-jar", str(cfr), str(decompile_jar), "--outputdir", str(out_dir), "--renameillegalidents", "true", "--renamedupmembers", "true"],
+        f"CFR decompiling {decompile_jar.name}",
+        show_progress,
+        progress_console,
+    )
+    if cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or "").strip()
+        print(f"error: CFR decompilation failed for {decompile_jar.name}", file=sys.stderr)
+        if err:
+            print(err, file=sys.stderr)
+        return cwd
+
+    extracted_classes = _extract_class_files_from_jar(fallback_class_jar, out_dir)
+    if extracted_classes:
+        progress(show_progress, f"extracted {extracted_classes} class file(s) for constant-pool fallback", progress_console)
+    if not any(out_dir.rglob("*.java")) and extracted_classes == 0:
+        print(f"error: CFR did not produce Java source or fallback classes in {out_dir}", file=sys.stderr)
+        return cwd
+    _write_source_jar_metadata(out_dir, selected)
+    try:
+        (out_dir / ".java_triage_jar_static_profile.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return out_dir
+
+
 def _decompile_jar_with_cfr(
     jar_path: Path,
     out_dir: Path,
@@ -3021,18 +4050,67 @@ def _decompile_jar_with_cfr(
     progress_console=None,
 ) -> tuple[bool, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    original_jar = jar_path
+    work_jar = jar_path
+    fallback_class_jar = jar_path
+    profile = _jar_static_profile(jar_path)
+    if profile.get("malformed_class_dirs") or profile.get("space_class_names"):
+        normalized = out_dir.parent / f"{jar_path.stem}.java_triage.normalized.jar"
+        ok, stats = _rewrite_jar_entries(jar_path, normalized, strip_class_slash=True, app_only=False)
+        if ok:
+            progress(
+                show_progress,
+                f"jar normalized: {normalized.name} class_slash_fixed={stats.get('renamed_class_entries', 0)}",
+                progress_console,
+            )
+            work_jar = normalized
+            fallback_class_jar = normalized
+            profile = _jar_static_profile(work_jar)
+    if profile.get("eskid_marker") and profile.get("app_class_count"):
+        app_jar = out_dir.parent / f"{jar_path.stem}.java_triage.app-only.jar"
+        app_prefixes = tuple(profile.get("app_prefixes") or _dominant_app_prefixes(work_jar))
+        ok, stats = _rewrite_jar_entries(work_jar, app_jar, strip_class_slash=True, app_only=True, app_prefixes=app_prefixes)
+        if ok and stats.get("written", 0):
+            progress(
+                show_progress,
+                f"eSkid marker detected; using app-only decompile jar: {app_jar.name} prefixes={','.join(app_prefixes)}",
+                progress_console,
+            )
+            work_jar = app_jar
+    class_count = int(profile.get("class_count") or 0)
+    app_count = int(profile.get("app_class_count") or 0)
+    if profile.get("eskid_marker") and class_count >= 80 and app_count / max(1, class_count) >= 0.80:
+        extracted_classes = _extract_class_files_from_jar(fallback_class_jar, out_dir)
+        _write_source_jar_metadata(out_dir, original_jar)
+        try:
+            profile["cfr_skipped"] = True
+            profile["cfr_skip_reason"] = "eskid_all_first_party_decompile_hostile"
+            (out_dir / ".java_triage_jar_static_profile.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        progress(
+            show_progress,
+            f"eSkid class-only fast path: skipped CFR decompile, extracted {extracted_classes} class file(s)",
+            progress_console,
+        )
+        return extracted_classes > 0, "" if extracted_classes > 0 else "No class files extracted for eSkid class-only fallback"
     cp = _run_subprocess_with_progress(
-        ["java", "-jar", str(cfr_path), str(jar_path), "--outputdir", str(out_dir)],
-        f"CFR decompiling {jar_path.name}",
+        ["java", "-jar", str(cfr_path), str(work_jar), "--outputdir", str(out_dir), "--renameillegalidents", "true", "--renamedupmembers", "true"],
+        f"CFR decompiling {work_jar.name}",
         show_progress,
         progress_console,
     )
     if cp.returncode != 0:
         err = (cp.stderr or cp.stdout or "").strip()
-        return False, f"CFR failed for {jar_path.name}: {err}" if err else f"CFR failed for {jar_path.name}"
-    if not any(out_dir.rglob("*.java")):
-        return False, f"CFR produced no Java sources for {jar_path.name}"
-    _write_source_jar_metadata(out_dir, jar_path)
+        return False, f"CFR failed for {work_jar.name}: {err}" if err else f"CFR failed for {work_jar.name}"
+    extracted_classes = _extract_class_files_from_jar(fallback_class_jar, out_dir)
+    if not any(out_dir.rglob("*.java")) and extracted_classes == 0:
+        return False, f"CFR produced no Java sources or fallback classes for {work_jar.name}"
+    _write_source_jar_metadata(out_dir, original_jar)
+    try:
+        (out_dir / ".java_triage_jar_static_profile.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     return True, ""
 
 
@@ -3371,6 +4449,26 @@ def prepare_embedded_base32_archive_roots(scan_root: Path, show_progress: bool, 
 
 
 def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
+    pathology = _source_pathology(path)
+    if pathology.get("pathological"):
+        try:
+            rel = str(path.relative_to(root))
+        except Exception:
+            rel = str(path)
+        reason = str(pathology.get("reason") or "pathological_source")
+        marker_note = " marker=protected_by_eskid" if pathology.get("eskid_marker") else ""
+        return [
+            BehaviorFinding(
+                file=rel,
+                line=1,
+                behavior="decompiler_failure_or_heavy_obfuscation",
+                evidence=(
+                    "Skipped expensive source behavior scan for decompiler-hostile source "
+                    f"({reason}, size={int(pathology.get('size') or 0)}, "
+                    f"max_line={int(pathology.get('max_line') or 0)}{marker_note})"
+                ),
+            )
+        ]
     text = path.read_text(encoding="utf-8", errors="replace")
     low = text.lower()
     rel = str(path.relative_to(root))
@@ -7471,6 +8569,9 @@ def scan_file(
     decrypt_profile: Optional[DecryptProfile] = None,
     include_all_literals: bool = False,
 ) -> List[Finding]:
+    pathology = _source_pathology(path)
+    if pathology.get("pathological"):
+        return [_pathology_finding(path, root, pathology)]
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     decls = find_method_declarations(lines)
@@ -9450,6 +10551,12 @@ def _prompt_reuse_decompiled_dir(jar: Path, out_dir: Path, console=None) -> bool
 def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, progress_console=None) -> Path:
     cwd = Path.cwd().resolve()
     if initial_root != cwd:
+        if initial_root.is_file() and initial_root.suffix.lower() in {".jar", ".zip"}:
+            cfr = _find_cfr_jar(cwd)
+            if cfr is None:
+                progress(show_progress, "CFR jar not found; cannot decompile direct JAR target", progress_console)
+                return initial_root
+            return _prepare_single_jar_scan_root(initial_root, cwd, cfr, show_progress, progress_console)
         return initial_root
 
     cfr = _find_cfr_jar(cwd)
@@ -9523,55 +10630,7 @@ def maybe_prepare_cwd_jar_scan_root(initial_root: Path, show_progress: bool, pro
             print("JAR selection cancelled. Continuing with current target.", file=sys.stderr)
             return initial_root
 
-    out_dir = (cwd / selected.stem).resolve()
-    if out_dir.exists():
-        if not out_dir.is_dir():
-            print(f"error: output path exists and is not a directory: {out_dir}", file=sys.stderr)
-            return initial_root
-        if sys.stdin.isatty():
-            reuse = _prompt_reuse_decompiled_dir(selected, out_dir, progress_console)
-            if reuse:
-                progress(
-                    show_progress,
-                    f"reusing existing extracted directory for {selected.name}: {_display_report_path(out_dir, cwd)}",
-                    progress_console,
-                )
-                return out_dir
-            # User chose re-decompile — remove old directory
-            progress(
-                show_progress,
-                f"removing existing directory to re-decompile: {out_dir.name}",
-                progress_console,
-            )
-            shutil.rmtree(out_dir)
-        else:
-            progress(
-                show_progress,
-                f"reusing existing extracted directory for {selected.name}: {_display_report_path(out_dir, cwd)}",
-                progress_console,
-            )
-            return out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    cp = _run_subprocess_with_progress(
-        ["java", "-jar", str(cfr), str(selected), "--outputdir", str(out_dir)],
-        f"CFR decompiling {selected.name}",
-        show_progress,
-        progress_console,
-    )
-    if cp.returncode != 0:
-        err = (cp.stderr or cp.stdout or "").strip()
-        print(f"error: CFR decompilation failed for {selected.name}", file=sys.stderr)
-        if err:
-            print(err, file=sys.stderr)
-        return initial_root
-
-    if not any(out_dir.rglob("*.java")):
-        print(f"error: CFR did not produce Java source in {out_dir}", file=sys.stderr)
-        return initial_root
-    _write_source_jar_metadata(out_dir, selected)
-
-    return out_dir
+    return _prepare_single_jar_scan_root(selected, cwd, cfr, show_progress, progress_console)
 
 
 def resolve_jlab_upload_target(initial_target: Path, scan_root: Path, target_metadata: dict) -> tuple[Path | None, str]:
@@ -9723,10 +10782,17 @@ def print_banner(console=None, to_stderr: bool = False) -> None:
     width = _triage_ui_width(console)
     rendered = _gradient_banner_text(width)
     if RICH_AVAILABLE and console is not None:
-        console.print(Text.from_ansi(rendered), highlight=False)
+        try:
+            console.print(Text.from_ansi(rendered), highlight=False)
+        except UnicodeEncodeError:
+            stream = sys.stderr if to_stderr else sys.stdout
+            print("Java Triage - https://github.com/cev-api/Java-Triage", file=stream)
     else:
         stream = sys.stderr if to_stderr else sys.stdout
-        print(rendered, file=stream)
+        try:
+            print(rendered, file=stream)
+        except UnicodeEncodeError:
+            print("Java Triage - https://github.com/cev-api/Java-Triage", file=stream)
 
 
 def _unlink_existing_result(path: Path | None, show_progress: bool, progress_console=None) -> None:
@@ -11062,8 +12128,12 @@ def main() -> int:
     initial_target = root
     show_progress = not args.no_progress
     pref_width = max(80, int(args.rich_width))
-    progress_console = Console(stderr=False, width=pref_width) if RICH_AVAILABLE else None
-    report_console = Console(width=pref_width) if RICH_AVAILABLE else None
+    stdout_encoding = (getattr(sys.stdout, "encoding", None) or "").lower()
+    stderr_encoding = (getattr(sys.stderr, "encoding", None) or "").lower()
+    stdout_unicode_ok = "utf" in stdout_encoding
+    stderr_unicode_ok = "utf" in stderr_encoding or not stderr_encoding
+    progress_console = Console(stderr=False, width=pref_width) if (RICH_AVAILABLE and stdout_unicode_ok) else None
+    report_console = Console(width=pref_width) if (RICH_AVAILABLE and stdout_unicode_ok) else None
     rich_progress_mode = bool(RICH_AVAILABLE and progress_console is not None and show_progress)
     phase_logs = show_progress
 
@@ -11082,7 +12152,7 @@ def main() -> int:
     if not root.exists():
         print(f"error: target does not exist: {root}", file=sys.stderr)
         return 2
-    if not root.is_dir():
+    if not root.is_dir() and root.suffix.lower() not in {".jar", ".zip"}:
         print(f"error: target is not a directory: {root}", file=sys.stderr)
         return 2
 
@@ -11272,6 +12342,13 @@ def main() -> int:
     deciphered_root: Path | None = None
     decipher_stats: dict | None = None
     scan_targets: List[tuple[Path, str]] = [(scan_root, "")]
+    eskid_root = _scan_root_has_eskid_profile(scan_root)
+    if eskid_root:
+        progress(
+            phase_logs,
+            "eSkid/protected_by_eskid profile detected; enabling guarded source scan + class constant-pool fallback",
+            progress_console,
+        )
     seen_target_roots = {str(scan_root.resolve())}
     for target_root, prefix in extra_scan_roots:
         key = str(target_root.resolve())
@@ -11290,18 +12367,30 @@ def main() -> int:
     target_finding_counts: dict[str, int] = {}
     target_scan_mode: dict[str, str] = {}
     for target_root, prefix in scan_targets:
-        java_list = list(iter_java_files(target_root))
+        java_list = list(iter_java_files(target_root, include_pathological=True))
         class_list = list(iter_class_files(target_root))
         root_key = str(target_root.resolve())
         target_java_counts[root_key] = len(java_list)
         target_class_counts[root_key] = len(class_list)
         target_finding_counts[root_key] = 0
-        target_scan_mode[root_key] = "java" if java_list else ("class_constant_pool_fallback" if class_list else "none")
+        fallback_class_list = [p for p in class_list if _is_fallback_class_path(p)]
+        if java_list and fallback_class_list:
+            target_scan_mode[root_key] = "java_guarded_plus_class_constant_pool"
+        else:
+            target_scan_mode[root_key] = "java" if java_list else ("class_constant_pool_fallback" if class_list else "none")
         for file_path in java_list:
             file_jobs.append((file_path, target_root, prefix))
-        if not java_list and class_list:
+        if fallback_class_list:
+            for class_path in fallback_class_list:
+                class_jobs.append((class_path, target_root, prefix))
+        elif not java_list and class_list:
             for class_path in class_list:
                 class_jobs.append((class_path, target_root, prefix))
+
+    progress(phase_logs, "dumping post-prep strings and AES candidates", progress_console)
+    string_dump_stats = produce_post_deobf_string_dump(scan_root, show_progress, progress_console)
+    progress(phase_logs, "mapping invokedynamic bootstrap methods", progress_console)
+    invokedynamic_bootstrap_stats = produce_invokedynamic_bootstrap_map(scan_root, show_progress, progress_console)
 
     # ── Produce and add deciphered copy if requested ──
     # Auto-decipher is ON by default when no explicit flags override it
@@ -11310,6 +12399,7 @@ def main() -> int:
         and (not user_decrypt_mode)
         and (not args.no_auto_decrypt)
         and (not args.no_rescan_after_decrypt)
+        and (not eskid_root)
     )
     _do_decipher = bool(args.decipher_codebase or _auto_decipher)
     if _do_decipher and not args.no_rescan_after_decrypt:
@@ -11324,7 +12414,7 @@ def main() -> int:
                 progress_console,
             )
             # Add as scan target — use resolved path for consistent keying
-            d_java = list(iter_java_files(deciphered_root))
+            d_java = list(iter_java_files(deciphered_root, include_pathological=True))
             d_class = list(iter_class_files(deciphered_root))
             d_key = str(deciphered_root.resolve())
             target_java_counts[d_key] = len(d_java)
@@ -11653,6 +12743,8 @@ def main() -> int:
                 "scan_mode": "post_decryption_only" if decrypt_mode else "standard",
                 "deobfuscation": deobf_stats if deobf_stats else {},
                 "decipher": decipher_stats if decipher_stats else {},
+                "string_dump": string_dump_stats,
+                "invokedynamic_bootstrap": invokedynamic_bootstrap_stats,
                 "summary": summary,
                 "assessment_summary": summarize_assessments(behavior_findings),
                 "verdict_tiers": summarize_verdict_tiers(behavior_findings),
@@ -11758,6 +12850,8 @@ def main() -> int:
             "scan_mode": "post_decryption_only" if decrypt_mode else "standard",
             "deobfuscation": deobf_stats if deobf_stats else {},
             "decipher": decipher_stats if decipher_stats else {},
+            "string_dump": string_dump_stats,
+            "invokedynamic_bootstrap": invokedynamic_bootstrap_stats,
             "summary": summary,
             "assessment_summary": summarize_assessments(behavior_findings),
             "verdict_tiers": summarize_verdict_tiers(behavior_findings),
@@ -11868,7 +12962,14 @@ def main() -> int:
             infra_probe,
         )
     else:
-        print(text_output_with_banner)
+        try:
+            print(text_output_with_banner)
+        except UnicodeEncodeError:
+            safe_text = text_output_with_banner.encode(
+                getattr(sys.stdout, "encoding", None) or "utf-8",
+                errors="replace",
+            ).decode(getattr(sys.stdout, "encoding", None) or "utf-8", errors="replace")
+            print(safe_text)
     progress(show_progress, "done", progress_console)
 
     # ── Interactive follow-up prompt ──
