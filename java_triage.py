@@ -339,6 +339,13 @@ VENDOR_HOST_ALLOWLIST = {
     "discordapp.com",
     "github.com",
     "api.github.com",
+    # Minecraft avatar / skin CDNs (used by mods for RPC, not exfiltration)
+    "crafthead.net",
+    "crafatar.com",
+    "minotar.net",
+    "mc-heads.net",
+    "visage.surgeplay.com",
+    "mcapi.ca",
 }
 KNOWN_LIBRARY_PREFIXES = {
     "raphimc_minecraftauth": ["net/raphimc/minecraftauth/"],
@@ -428,13 +435,38 @@ RATTERSCANNER_HASH_URL = "https://api.ratterscanner.com/hash/"
 JLAB_STATIC_SCAN_URL = "https://jlab.threat.rip/api/public/static-scan"
 JLAB_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 OPENAI_EXEC_SUMMARY_INSTRUCTION = (
-    "Parse the JSON and create an executive summary of the result detailing the flow of the malware "
-    "or application (if clean) and its capabilities, risks, goal. Keep it technical but understandable "
+    "Parse the JSON and create an executive summary. Keep it technical but understandable "
     "for both layman and professional. Max 500 words. Output must be plain text optimized for terminal "
     "display. Do NOT use markdown headings, bold/italic markers, tables, code fences, horizontal rules, "
-    "or backticks. Use short section labels and simple bullet lines prefixed with '- '. Prioritize "
-    "confirmed_behavior proof chains over generic suspicious indicators. Explicitly include caveats from "
-    "contradiction_notes and avoid overstating automatic exfiltration when only exposure is proven."
+    "or backticks. Use short section labels and simple bullet lines prefixed with '- '.\n\n"
+
+    "CRITICAL RULES — VIOLATING THESE MAKES THE REPORT UNUSABLE:\n"
+    "1. NEVER speculate. Only describe behavior that has CONCRETE evidence in the JSON. "
+    "If there's no webhook URL, no JSON payload construction, no exfil endpoint — do NOT say "
+    "'could exfiltrate' or 'could send data'. You are a reporter of FACTS, not a fiction writer.\n"
+    "2. Session/token/username/UUID access is only normal when it is isolated to local auth or "
+    "account functionality. If the JSON also shows a resolved C2 domain, exfil endpoint, payload "
+    "endpoint, staged download, or token/credential flow to a network sink, treat it as credential "
+    "harvesting or exfiltration evidence, not benign mod behavior.\n"
+    "3. Account switchers, alt managers, and session utilities handle tokens for LOCAL use. "
+    "They are NOT stealers. Do NOT conflate account management with credential theft.\n"
+    "4. Analytics, auto-updaters, and API clients (OpenAI, Ollama, Google Translate) "
+    "are legitimate mod features. They make outbound connections but are NOT C2 channels.\n"
+    "5. If the only behavior findings are 'obfuscated class names' and 'environment variable access' "
+    "alongside detected mod modules, the verdict is: BENIGN Minecraft mod/client. No threats found.\n"
+    "6. Use the contradiction_notes field. If the tool said there's no proof of exfiltration, "
+    "echo that. Do not bury it.\n"
+    "7. Cheat/hack modules do not reduce malware severity when the JSON also shows confirmed C2, "
+    "staged payload delivery, persistence, or exfiltration. If those are present, the verdict is "
+    "Malicious, not just Cheat Client.\n"
+    "8. A failed live probe (403, DNS failure, no download) does not negate confirmed infrastructure. "
+    "If the scan resolved a C2 domain, assembled exfil/payload endpoints, or found proof-grade "
+    "behavior, say so plainly.\n\n"
+
+    "STRUCTURE: Start with VERDICT: [Clean / Cheat Client / Suspicious / Malicious]. "
+    "Then MODULES (if detected), then LEGITIMATE FEATURES, then CONFIRMED FINDINGS (only proven), "
+    "then CAVEATS (from contradiction_notes). DO NOT invent a RISK PROFILE section — that is "
+    "speculation. Only report what IS in the data, not what MIGHT be."
 )
 
 
@@ -5629,14 +5661,23 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
 
     # Identity exfiltration: username/UUID present with outbound HTTP usage in same file.
+    # Only flag if the HTTP destinations are NOT exclusively vendor-allowlisted hosts.
     outbound_http_present = bool(http_hosts or ("HttpClient" in text and "send(" in text) or ("OkHttpClient" in text and ".newCall(" in text) or ("HttpURLConnection" in text))
-    if outbound_http_present and (has_username_access_signal or has_uuid_access_signal):
+    # Check if ALL HTTP hosts in this file are known-safe (vendor-allowlisted).
+    # If all hosts are vendor-trusted, identity access is expected (e.g., Discord RPC, skin fetchers).
+    all_hosts_vendor = False
+    if http_hosts:
+        all_hosts_vendor = all(
+            h in VENDOR_HOST_ALLOWLIST or any(h.endswith("." + d) for d in VENDOR_HOST_ALLOWLIST)
+            for h in http_hosts
+        )
+    if outbound_http_present and (has_username_access_signal or has_uuid_access_signal) and not all_hosts_vendor:
         out.append(
             BehaviorFinding(
                 file=rel,
                 line=(find_line(text, ".getUsername()") if has_username_access_signal else find_line(text, ".getUuid()")),
                 behavior="possible_minecraft_identity_exfiltration",
-                evidence="Username/UUID read present alongside outbound HTTP activity",
+                evidence="Username/UUID read present alongside outbound HTTP activity to non-vendor hosts",
             )
         )
 
@@ -5989,17 +6030,31 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
 
     # ── Coordinate exfiltration: player position → Discord/webhook ──
     if not is_vendor_lib:
+        # Only flag Minecraft-specific coordinate types — NOT generic .getX()/.getY() from
+        # font renderers, UI code, or geometry helpers.  Require BlockPos, Vec3d, or the
+        # coordinate methods appearing with Minecraft player/entity context.
         has_coordinate_read = any(
             p in text for p in [
-                ".getX()", ".getY()", ".getZ()",
                 ".xCoord", ".yCoord", ".zCoord",
                 ".posX", ".posY", ".posZ",
                 "getBlockPos()", "getPosition()",
                 ".getPosition()", ".getPos()",
                 "BlockPos", "Vec3d", "Vec3",
-                ".x", ".y", ".z",
             ]
         )
+        # Generic .getX()/.getY()/.getZ() is too broad (font renderers, UI, etc.) —
+        # only count it if there's also a Minecraft entity/player reference nearby.
+        has_generic_xyz = any(p in text for p in [".getX()", ".getY()", ".getZ()", ".x", ".y", ".z"])
+        has_mc_context = any(
+            p in text for p in [
+                "class_746", "class_1297", "Entity", "PlayerEntity",
+                "field_1724", "field_3937", "field_3944", "field_3951",
+                "player", "entity", "LivingEntity", "ClientPlayerEntity",
+            ]
+        )
+        if has_generic_xyz and not has_coordinate_read and not has_mc_context:
+            # Generic x/y/z in a non-Minecraft context — likely font/UI/graphics code
+            has_coordinate_read = False
         # Broader detection via decoded strings as well
         coord_in_obf = any(
             kw in decoded_low_blob for kw in [
@@ -6024,7 +6079,7 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             "HttpURLConnection" in text
             or "HttpClient" in text
             or "OkHttpClient" in text
-            or ("OutputStream" in text and ".write(" in text)
+            or ("OutputStream" in text and ".write(" in text and "ByteArrayOutputStream" not in text and "FileOutputStream" not in text)
             or "setRequestMethod" in text
         )
 
@@ -7367,6 +7422,155 @@ def detect_persistence_relaunch_chains(root: Path) -> List[BehaviorFinding]:
                 )
             )
             break
+
+    return out
+
+
+# ── Minecraft module/hack detection ────────────────────────────────────────────
+
+_MODULE_SUPER_CALL_RE = re.compile(
+    r'super\s*\(\s*"(?P<name>[^"]+)"\s*,\s*"(?P<desc>[^"]*)"\s*,\s*\w+\s*,\s*(?P<cat>[A-Za-z_.]+)\s*\s*\)',
+    re.DOTALL,
+)
+_ADDMODULE_CALL_RE = re.compile(r'addModule\s*\(\s*(?P<cls>[A-Za-z_$][\w$.]*)\s*\.class\s*\)')
+# Wurst-style: extends Hack, category set via setCategory(Category.XXX)
+_WURST_EXTENDS_HACK_RE = re.compile(r'extends\s+Hack\b')
+_WURST_SUPER_NAME_RE = re.compile(r'super\s*\(\s*"(?P<name>[^"]+)"\s*\)')
+_WURST_SETCATEGORY_RE = re.compile(r'setCategory\s*\(\s*(?:Category\.)?(?P<cat>[A-Za-z_]+)\s*\)')
+_WURST_HACK_FIELD_RE = re.compile(
+    r'public\s+final\s+(?P<cls>[A-Za-z_$][\w$]*Hack)\s+\w+\s*=\s*new\s+\1\s*\(\s*\)\s*;'
+)
+
+
+def detect_minecraft_modules(root: Path) -> dict:
+    """Detect Minecraft utility/cheat client modules by scanning for module
+    registration patterns (addModule(XX.class)) and cross-referencing with
+    module source files to extract names, descriptions, and categories.
+
+    Returns a dict with 'detected' bool and 'modules' list of {name, description, category, file}.
+    """
+    out: dict = {"detected": False, "module_count": 0, "modules": []}
+    idx = _build_source_index(root)
+    texts: dict[str, str] = idx["texts"]
+    simple_to_rel: dict[str, list[str]] = idx["simple_to_rel"]
+
+    # Step 1: Find the module manager (file with multiple addModule() calls)
+    best_mm_rel = ""
+    best_mm_count = 0
+    for rel, text in texts.items():
+        if _is_known_library_relpath(rel):
+            continue
+        count = len(_ADDMODULE_CALL_RE.findall(text))
+        if count > best_mm_count:
+            best_mm_count = count
+            best_mm_rel = rel
+
+    if best_mm_count < 4:
+        # No addModule() style modules found; skip to Phase 2 (Wurst) detection
+        seen_modules: set[str] = set()
+    else:
+        seen_modules: set[str] = set()
+        mm_text = texts.get(best_mm_rel, "")
+
+        # Step 2: Extract class names from addModule() calls
+        registered_classes: set[str] = set()
+        for m in _ADDMODULE_CALL_RE.finditer(mm_text):
+            cls_full = m.group("cls")
+            simple_name = cls_full.rsplit(".", 1)[-1]
+            registered_classes.add(simple_name)
+
+        # Step 3: For each registered class, find its source file and extract super() call
+        for simple_name in sorted(registered_classes):
+            if simple_name in seen_modules:
+                continue
+            candidates = [
+                r for r in simple_to_rel.get(simple_name, [])
+                if not _is_known_library_relpath(r)
+            ]
+            if not candidates:
+                continue
+            module_text = ""
+            for c in candidates:
+                t = texts.get(c, "")
+                if 'super(' in t or 'extends M' in t or 'extends Module' in t:
+                    module_text = t
+                    break
+            if not module_text:
+                module_text = texts.get(candidates[0], "")
+
+            sm = _MODULE_SUPER_CALL_RE.search(module_text)
+            if sm:
+                name = sm.group("name")
+                desc = sm.group("desc")
+                cat_raw = sm.group("cat")
+                category = cat_raw.rsplit(".", 1)[-1]
+                seen_modules.add(simple_name)
+                out["modules"].append({
+                    "name": name,
+                    "description": desc,
+                    "category": category.upper(),
+                    "file": candidates[0] if candidates else simple_name,
+                })
+
+    out["module_count"] = len(out["modules"])
+    out["detected"] = out["module_count"] >= 4
+
+    # ── Phase 2: Wurst-style hack detection ──
+    # Wurst registers hacks via public final *Hack fieldName = new *Hack() in HackList.java,
+    # with category set via this.setCategory(Category.XXX) in the constructor.
+    if out["module_count"] < 4:
+        # Find HackList.java-style files: lots of public final *Hack field declarations
+        for rel, text in texts.items():
+            if _is_known_library_relpath(rel):
+                continue
+            hack_fields = _WURST_HACK_FIELD_RE.findall(text)
+            if len(hack_fields) < 10:
+                continue
+
+            # Extract Hack class names from field declarations
+            wurst_classes: set[str] = set(hack_fields)
+            for cls_name in sorted(wurst_classes):
+                if cls_name in seen_modules:
+                    continue
+                candidates = [
+                    r for r in simple_to_rel.get(cls_name, [])
+                    if not _is_known_library_relpath(r)
+                ]
+                if not candidates:
+                    continue
+                hack_text = ""
+                for c in candidates:
+                    t = texts.get(c, "")
+                    if _WURST_EXTENDS_HACK_RE.search(t):
+                        hack_text = t
+                        break
+                if not hack_text:
+                    hack_text = texts.get(candidates[0], "")
+
+                # Extract super("Name") and setCategory(Category.XXX)
+                sm = _WURST_SUPER_NAME_RE.search(hack_text)
+                cm = _WURST_SETCATEGORY_RE.search(hack_text)
+                if sm:
+                    name = sm.group("name")
+                    category = cm.group("cat").upper() if cm else "OTHER"
+                    # Derive description from class name if not available
+                    desc = cls_name.replace("Hack", "").replace("_", " ")
+                    seen_modules.add(cls_name)
+                    out["modules"].append({
+                        "name": name,
+                        "description": desc,
+                        "category": category,
+                        "file": candidates[0],
+                    })
+
+    out["module_count"] = len(out["modules"])
+    out["detected"] = out["module_count"] >= 4
+
+    # Also detect module categories present
+    cats: dict[str, int] = {}
+    for m in out["modules"]:
+        cats[m["category"]] = cats.get(m["category"], 0) + 1
+    out["categories"] = dict(sorted(cats.items()))
 
     return out
 
@@ -9095,6 +9299,7 @@ def render_text(
     variant_detections: dict | None = None,
     raw_string_detections: List[dict] | None = None,
     heuristic_detections: List[dict] | None = None,
+    minecraft_modules: dict | None = None,
 ) -> str:
     out = []
     blockchain = extract_blockchain_indicators(findings)
@@ -9286,6 +9491,22 @@ def render_text(
     out.append(f"Matches: {len(hd)}")
     for item in hd[:30]:
         out.append(f"- {item.get('file_path','')}: {item.get('description','')} (w={item.get('weight',0)})")
+
+    mm = minecraft_modules or {}
+    if mm.get("detected"):
+        out.append("")
+        out.append("== Detected Minecraft Modules ==")
+        out.append(f"Total modules: {mm.get('module_count', 0)}")
+        cats = mm.get("categories", {})
+        if cats:
+            out.append(f"Categories: {', '.join(f'{k}({v})' for k, v in sorted(cats.items()))}")
+        current_cat = ""
+        for m in mm.get("modules", []):
+            cat = m.get("category", "OTHER")
+            if cat != current_cat:
+                current_cat = cat
+                out.append(f"  [{cat}]")
+            out.append(f"    - {m['name']}: {m['description'] or '(no description)'}")
 
     rs = ratter_scanner or {}
     if rs.get("attempted"):
@@ -9538,6 +9759,7 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     variant_detections = payload.get("variant_detections", {}) or {}
     raw_string_detections = payload.get("raw_string_detections", []) or []
     heuristic_detections = payload.get("heuristic_detections", []) or []
+    minecraft_modules = payload.get("minecraft_modules", {}) or {}
     jar_info = target_meta.get("jar_info", {}) or {}
     bundle_info = target_meta.get("bundle_info", {}) or {}
     library_fingerprints = target_meta.get("library_fingerprints", {}) or {}
@@ -10213,6 +10435,20 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
       + ("<div class='table-wrap'><table class='smart-table'><thead><tr><th>Variant</th><th class='tight'>Confidence</th><th class='tight'>Matches</th></tr></thead><tbody>" + "".join(rows_variant) + "</tbody></table></div>" if rows_variant else "")
       + ("<div class='table-wrap' style='margin-top:.7rem;'><table class='smart-table'><thead><tr><th>Variant</th><th>Kind</th><th>Description</th><th>File</th><th class='tight'>Weight</th></tr></thead><tbody>" + "".join(rows_variant_matches) + "</tbody></table></div>" if rows_variant_matches else "")
       + "</div>") if (rows_variant or rows_variant_matches) else ""}
+    {("<div class='card'><h2 class='triage-title'>Detected Minecraft Modules</h2>"
+      + ("<p style='margin:.4rem 0'>Total modules: <strong>" + _h(minecraft_modules.get('module_count', 0)) + "</strong></p>" if minecraft_modules.get("detected") else "")
+      + ("<p style='margin:.4rem 0'>Categories: " + _h(', '.join(f'{k}({v})' for k, v in sorted((minecraft_modules.get('categories', {}) or {}).items()))) + "</p>" if minecraft_modules.get("categories") else "")
+      + ("<div class='table-wrap'><table class='smart-table'><thead><tr><th>Category</th><th>Name</th><th>Description</th></tr></thead><tbody>"
+         + "".join(
+             "<tr>"
+             f"<td class='tight'><span class='cat-pill cat-neutral'>{_h(m.get('category', '?'))}</span></td>"
+             f"<td>{_h(m.get('name', '?'))}</td>"
+             f"<td>{_h(m.get('description', ''))}</td>"
+             "</tr>"
+             for m in minecraft_modules.get('modules', [])
+         )
+         + "</tbody></table></div>" if minecraft_modules.get("modules") else "")
+      + "</div>") if minecraft_modules.get("detected") else ""}
     {("<div class='card'><h2 class='triage-title'>Raw String Detections</h2>"
       "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Weight</th><th class='tight'>File</th><th>Description</th></tr></thead><tbody>"
       + "".join(rows_raw) + "</tbody></table></div>"
@@ -10879,6 +11115,7 @@ def render_rich(
     executive_summary: str = "",
     url_assembly: dict | None = None,
     infra_probe: dict | None = None,
+    minecraft_modules: dict | None = None,
 ) -> None:
     def short(s: str, n: int = 220) -> str:
         return s if len(s) <= n else s[: n - 1] + "…"
@@ -11130,6 +11367,21 @@ def render_rich(
     else:
         hdt.add_row("0", "-", "none")
     console.print(hdt)
+
+    mm = minecraft_modules or {}
+    if mm.get("detected"):
+        _print_section(console, "Detected Minecraft Modules")
+        console.print(f"Total modules: [cyan]{mm.get('module_count', 0)}[/cyan]")
+        cats = mm.get("categories", {})
+        if cats:
+            console.print(f"Categories: [yellow]{', '.join(f'{k}({v})' for k, v in sorted(cats.items()))}[/yellow]")
+        mm_table = Table(show_header=True, box=box.SIMPLE, expand=True)
+        mm_table.add_column("Category", style="magenta", no_wrap=True)
+        mm_table.add_column("Name", style="bold white")
+        mm_table.add_column("Description", style="green", overflow="fold")
+        for m_item in mm.get("modules", []):
+            mm_table.add_row(m_item.get("category", "?"), m_item.get("name", "?"), m_item.get("description", ""))
+        console.print(mm_table)
 
     rs = ratter_scanner or {}
     if rs.get("attempted"):
@@ -11488,6 +11740,144 @@ def _friendly_network_error(exc: Exception) -> str:
     return f"Connection failed: {msg or exc.__class__.__name__}"
 
 
+def _executive_summary_high_confidence_context(triage_payload: dict[str, Any]) -> str:
+    summary = triage_payload.get("summary", {}) or {}
+    runtime_c2 = triage_payload.get("runtime_c2", {}) or {}
+    stage2 = triage_payload.get("stage2_analysis", {}) or {}
+    assessments = triage_payload.get("assessment_summary", {}) or {}
+    behaviors = triage_payload.get("behavior_findings", []) or []
+
+    lines: List[str] = []
+    vt = summary.get("verdict_tiers", {}) or {}
+    lines.append(
+        "Verdict tiers: confirmed_behavior={0} exposed_capability={1} suspicious_capability={2} library_noise={3}".format(
+            vt.get("confirmed_behavior", 0),
+            vt.get("exposed_capability", 0),
+            vt.get("suspicious_capability", 0),
+            vt.get("library_noise", 0),
+        )
+    )
+
+    if runtime_c2.get("resolved"):
+        lines.append(f"Resolved C2 domain: {runtime_c2.get('c2_base_url', '')}")
+        if runtime_c2.get("exfil_endpoint"):
+            lines.append(f"Exfil endpoint: {runtime_c2.get('exfil_endpoint')}")
+        if runtime_c2.get("payload_endpoint"):
+            lines.append(f"Payload endpoint: {runtime_c2.get('payload_endpoint')}")
+
+    if stage2.get("enabled") or stage2.get("payload_url_resolved"):
+        if stage2.get("payload_url_resolved"):
+            lines.append(f"Stage-2 payload URL: {stage2.get('payload_url_resolved')}")
+        if stage2.get("static_only_no_execution"):
+            lines.append("Stage-2 analysis is static-only; no code execution was performed.")
+
+    if assessments.get("counts"):
+        counts = assessments.get("counts", {}) or {}
+        lines.append(
+            "Assessment counts: benign={0} needs_review={1} suspicious={2}".format(
+                counts.get("benign", 0),
+                counts.get("needs_review", 0),
+                counts.get("suspicious", 0),
+            )
+        )
+
+    high_confidence = []
+    for item in behaviors:
+        if not isinstance(item, dict):
+            continue
+        behavior = str(item.get("behavior", ""))
+        if behavior.startswith("proof_") or behavior in {
+            "two_payload_exfil_architecture",
+            "multi_path_exfil_breakdown",
+            "blockchain_dns_c2_resolver",
+            "credential_exfiltration_post",
+            "exfil_endpoint_prefiremc",
+            "exfil_endpoint_submit_log",
+            "payload_download_endpoint",
+            "embedded_native_payload_loader",
+            "staged_remote_jar_execution",
+        }:
+            high_confidence.append(item)
+
+    if high_confidence:
+        lines.append("High-confidence behaviors:")
+        for item in sorted(
+            high_confidence,
+            key=lambda x: (str(x.get("severity", "")), str(x.get("behavior", "")), str(x.get("file", "")), int(x.get("line", 0) or 0)),
+        )[:10]:
+            lines.append(
+                f"- [{item.get('severity', 'info')}] {item.get('behavior', '')}: {item.get('evidence', '')}"
+            )
+
+    caveats = triage_payload.get("contradiction_notes", []) or []
+    if caveats:
+        lines.append("Caveats:")
+        for note in caveats[:5]:
+            lines.append(f"- {note}")
+
+    return "\n".join(lines)
+
+
+def _force_malicious_verdict(triage_payload: dict[str, Any]) -> bool:
+    summary = triage_payload.get("summary", {}) or {}
+    runtime_c2 = triage_payload.get("runtime_c2", {}) or {}
+    stage2 = triage_payload.get("stage2_analysis", {}) or {}
+    behaviors = triage_payload.get("behavior_findings", []) or []
+    behavior_names = {str(b.get("behavior", "")) for b in behaviors if isinstance(b, dict)}
+
+    confirmed = int((summary.get("verdict_tiers", {}) or {}).get("confirmed_behavior", 0) or 0)
+    if confirmed <= 0:
+        return False
+
+    if runtime_c2.get("resolved") and (runtime_c2.get("exfil_endpoint") or runtime_c2.get("payload_endpoint")):
+        if behavior_names & {
+            "two_payload_exfil_architecture",
+            "multi_path_exfil_breakdown",
+            "blockchain_dns_c2_resolver",
+            "credential_exfiltration_post",
+            "exfil_endpoint_prefiremc",
+            "exfil_endpoint_submit_log",
+            "payload_download_endpoint",
+            "embedded_native_payload_loader",
+            "staged_remote_jar_execution",
+        }:
+            return True
+
+    if stage2.get("payload_url_resolved") and behavior_names & {
+        "payload_download_endpoint",
+        "embedded_native_payload_loader",
+        "staged_remote_jar_execution",
+    }:
+        return True
+
+    return False
+
+
+def _reinforce_executive_summary_text(text: str, triage_payload: dict[str, Any]) -> str:
+    normalized = _normalize_executive_summary_text(text)
+    if not normalized:
+        return ""
+    if not _force_malicious_verdict(triage_payload):
+        return normalized
+
+    lines = normalized.splitlines()
+    if lines:
+        if lines[0].lower().startswith("verdict:"):
+            lines[0] = "VERDICT: Malicious"
+        else:
+            lines.insert(0, "VERDICT: Malicious")
+    else:
+        lines = ["VERDICT: Malicious"]
+
+    if any("cheat client" in line.lower() for line in lines[1:]):
+        lines.insert(
+            1,
+            "- Cheat-client modules are present, but the resolved C2, staged payload path, and exfiltration architecture make this malware.",
+        )
+
+    return "\n".join(lines).strip()
+
+
 def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -11498,6 +11888,8 @@ def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
         compact_json = compact_json[:max_chars] + "...<truncated>"
     user_text = (
         OPENAI_EXEC_SUMMARY_INSTRUCTION
+        + "\n\nHIGH-CONFIDENCE FACTS:\n"
+        + _executive_summary_high_confidence_context(triage_payload)
         + "\n\nTriage JSON (truncated where necessary):\n"
         + compact_json
     )
@@ -11524,7 +11916,7 @@ def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return ""
-    return _normalize_executive_summary_text(_extract_chat_completions_output_text(data))
+    return _reinforce_executive_summary_text(_extract_chat_completions_output_text(data), triage_payload)
 
 
 def _extract_chat_completions_output_text(payload: dict[str, Any]) -> str:
@@ -11578,6 +11970,8 @@ def build_deepseek_executive_summary(triage_payload: dict[str, Any]) -> str:
         compact_json = compact_json[:max_chars] + "...<truncated>"
     user_text = (
         OPENAI_EXEC_SUMMARY_INSTRUCTION
+        + "\n\nHIGH-CONFIDENCE FACTS:\n"
+        + _executive_summary_high_confidence_context(triage_payload)
         + "\n\nTriage JSON (truncated where necessary):\n"
         + compact_json
     )
@@ -11606,7 +12000,7 @@ def build_deepseek_executive_summary(triage_payload: dict[str, Any]) -> str:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return ""
-    return _normalize_executive_summary_text(_extract_chat_completions_output_text(data))
+    return _reinforce_executive_summary_text(_extract_chat_completions_output_text(data), triage_payload)
 
 
 def build_executive_summary(triage_payload: dict[str, Any]) -> str:
@@ -12488,6 +12882,7 @@ def main() -> int:
         key=lambda x: (x.file, x.line, x.decoded, x.category),
     )
     behavior_findings.extend(detect_decoded_finding_behaviors(all_findings))
+    mc_modules = detect_minecraft_modules(scan_root)
 
     progress(show_progress, "Scan Complete; Finalizing Findings", progress_console)
 
@@ -12575,6 +12970,72 @@ def main() -> int:
         {(b.file, b.line, b.behavior, b.evidence): b for b in behavior_findings}.values(),
         key=lambda x: (x.file, x.line, x.behavior),
     )
+
+    # ── Post-processing: when Minecraft hack modules are detected, suppress
+    #     benign identity-access findings that are expected in any client mod
+    #     (session/username/UUID/token reads are normal mod behavior, not malware).
+    if mc_modules.get("detected"):
+        _BENIGN_IDENTITY_BEHAVIORS = {
+            "minecraft_username_access",
+            "minecraft_uuid_access",
+            "minecraft_session_access",
+            "minecraft_gameprofile_access",
+            "minecraft_access_token_access",
+            "minecraft_session_id_access",
+            "token_field_getter_passthrough",
+            "capability_token_access",
+            "minecraft_session_file_access",
+        }
+        _BENIGN_MODULE_CONTEXT_BEHAVIORS = {
+            # These behaviors look suspicious in isolation, but in the context of
+            # a client mod (especially one with account managers, API integrations,
+            # analytics), they are expected functionality.
+            "possible_minecraft_identity_exfiltration",
+            "proof_token_source_to_network_sink",
+            "dataflow_token_to_network_sink",
+            "possible_access_token_exfiltration",
+            "assessment_needs_review_access_token_read_without_destination",
+            "assessment_suspicious_possible_credential_exfiltration",
+        }
+        before_count = len(behavior_findings)
+        behavior_findings = [
+            b for b in behavior_findings
+            if b.behavior not in _BENIGN_IDENTITY_BEHAVIORS
+            and b.behavior not in _BENIGN_MODULE_CONTEXT_BEHAVIORS
+        ]
+        progress(
+            show_progress,
+            f"suppressed {before_count - len(behavior_findings)} benign identity-access findings "
+            f"(detected {mc_modules['module_count']} hack modules — these are expected in a client mod)",
+            progress_console,
+        )
+
+    # Initialize runtime C2 state before any downstream classification uses it.
+    runtime_c2 = {"attempted": False, "resolved": False}
+    behavior_names = {b.behavior for b in behavior_findings}
+    if (
+        runtime_c2.get("resolved")
+        and runtime_c2.get("exfil_endpoint")
+        and runtime_c2.get("payload_endpoint")
+        and behavior_names & {"two_payload_exfil_architecture", "multi_path_exfil_breakdown", "blockchain_dns_c2_resolver"}
+    ):
+        behavior_findings.append(
+            BehaviorFinding(
+                file=".",
+                line=1,
+                behavior="proof_staged_blockchain_c2_exfil_chain",
+                evidence=(
+                    f"Resolved blockchain-backed C2 domain {runtime_c2.get('c2_base_url')} and assembled staged "
+                    f"endpoints ({runtime_c2.get('exfil_endpoint')} + {runtime_c2.get('payload_endpoint')}); "
+                    "paired with tiered exfiltration behavior this is a confirmed malware delivery chain."
+                ),
+            )
+        )
+        behavior_findings = sorted(
+            {(b.file, b.line, b.behavior, b.evidence): b for b in behavior_findings}.values(),
+            key=lambda x: (x.file, x.line, x.behavior),
+        )
+
     network_endpoint_assessment = assess_network_endpoints(all_findings)
     progress(show_progress, "Running Variant Signature Detections", progress_console)
     variant_detections = detect_variant_signatures(scan_root)
@@ -12597,7 +13058,6 @@ def main() -> int:
         key=lambda x: x.path,
     )
     progress(show_progress, f"Detected {len(artifact_findings)} Artifact Indicator(s)", progress_console)
-    runtime_c2 = {"attempted": False, "resolved": False}
     url_assembly: dict = {"c2_domain": "", "assembled_urls": [], "endpoints": []}
     infra_probe: dict = {"probed": False, "results": []}
     ratter_scanner = {"attempted": False, "error": "", "results": []}
@@ -12769,6 +13229,7 @@ def main() -> int:
                 "variant_detections": variant_detections,
                 "raw_string_detections": raw_string_detections,
                 "heuristic_detections": heuristic_detections,
+                "minecraft_modules": mc_modules,
                 "stage2_analysis": stage2_analysis,
                 "stage2_manual_payload_url": runtime_c2.get("payload_endpoint", ""),
                 "blockchain_indicators": blockchain,
@@ -12803,6 +13264,7 @@ def main() -> int:
                 variant_detections,
                 raw_string_detections,
                 heuristic_detections,
+                minecraft_modules=mc_modules,
             )
             if executive_summary:
                 text_output = f"== Executive Summary ==\n{executive_summary}\n\n{text_output}"
@@ -12874,6 +13336,7 @@ def main() -> int:
             "variant_detections": variant_detections,
             "raw_string_detections": raw_string_detections,
             "heuristic_detections": heuristic_detections,
+            "minecraft_modules": mc_modules,
             "stage2_analysis": stage2_analysis,
             "stage2_manual_payload_url": runtime_c2.get("payload_endpoint", ""),
             "blockchain_indicators": blockchain,
@@ -12904,6 +13367,7 @@ def main() -> int:
             variant_detections,
             raw_string_detections,
             heuristic_detections,
+            minecraft_modules=mc_modules,
         )
         if executive_summary:
             text_output = f"== Executive Summary ==\n{executive_summary}\n\n{text_output}"
@@ -12960,6 +13424,7 @@ def main() -> int:
             executive_summary,
             url_assembly,
             infra_probe,
+            minecraft_modules=mc_modules,
         )
     else:
         try:
