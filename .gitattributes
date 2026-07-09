@@ -1,0 +1,14 @@
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.jar binary
+*.rar binary
+*.zip binary
+*.7z binary
+*.bin binary
+*.class binary

@@ -1,0 +1,125 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Test, coverage, and build output
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+site/
+*.egg-info/
+*.egg
+
+# IDE and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local malware/sample corpus and extracted scan trees
+MALWARE/
+samples/
+sample/
+fixtures/private/
+corpus/
+quarantine/
+infected/
+malware/
+payloads/
+stage2_payload*
+*.bin
+*.blob
+*.payload
+*.dump
+
+# Java/decompiler tooling and generated Java artifacts
+*.jar
+*.jar_
+*.class
+*.war
+*.ear
+*.jmod
+*.java_triage.normalized.jar
+*.java_triage.app-only.jar
+*_droppedjar/
+*_droppedjar.jar
+*_stage2_triage/
+*_stage2_triage_*/
+*_deciphered/
+*_deciphered_*/
+*_triage/
+.java_triage_classes/
+.java_triage_*.json
+.java_triage_*.txt
+
+# Archives and local backups
+*.rar
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.bz2
+*.xz
+*.txt
+
+# Reports and scan outputs
+/*.html
+/*.json
+!/.vscode/*.json
+!/package.json
+!/package-lock.json
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.download
+*.part
+tmp/
+temp/
+.cache/
+
+# Local API/key material
+openai_key*
+deepseek_key*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Decompiled scans and local work folders must never be uploaded for obvious reasons.
+/*/
+!/modules/
+
+# Keep source and docs visible
+!java_triage.py
+!modules/
+!modules/**/*.py
+!README.md
+!BEGINNER_GUIDE.md
+!.gitignore
