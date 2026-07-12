@@ -37,6 +37,10 @@ from .minecraft import *
 from .behaviors import *
 from .reporting import *
 
+# JLab has temporarily shut down. Keep the integration code in place for a
+# future restoration, but never invoke its upload endpoint.
+JLAB_STATIC_SCAN_ENABLED = False
+
 def _is_sha256_hex(value: str) -> bool:
     return bool(re.fullmatch(r"[a-fA-F0-9]{64}", (value or "").strip()))
 
@@ -676,14 +680,14 @@ def main() -> int:
     p.add_argument(
         "--jlab-static-scan",
         action="store_true",
-        default=True,
-        help="Upload source JAR/ZIP to JLab public static scan API and include matched signature results (default: enabled)",
+        default=False,
+        help="Temporarily unavailable: JLab public static scan uploads are disabled",
     )
     p.add_argument(
         "--no-jlab-static-scan",
         dest="jlab_static_scan",
         action="store_false",
-        help="Disable JLab public static scan lookup",
+        help="JLab public static scan uploads are currently disabled",
     )
     p.add_argument(
         "--analyze-stage2",
@@ -1358,7 +1362,9 @@ def main() -> int:
                     progress_console,
                 )
 
-    if args.jlab_static_scan:
+    # Temporarily disabled while JLab is offline.  Leave the implementation
+    # above intact so it can be restored by setting JLAB_STATIC_SCAN_ENABLED.
+    if JLAB_STATIC_SCAN_ENABLED and args.jlab_static_scan:
         if args.no_network:
             jlab_static_scan["error"] = "JLab static scan requires network access; rerun without --no-network"
         else:

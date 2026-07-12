@@ -151,7 +151,7 @@ That disables live network lookups.
 Other useful safety choices:
 
 - `--no-analyze-stage2` stops the tool from trying to fetch a second-stage payload
-- `--no-jlab-static-scan` disables the external JLab upload
+- JLab static-scan uploads are temporarily disabled while the service is offline
 - `--no-auto-decrypt` disables automatic rewrite/decrypt behavior
 
 For the most cautious first pass, start with `--no-network`.

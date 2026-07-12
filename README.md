@@ -47,7 +47,7 @@ Under the hood, it combines bytecode-aware decompilation, constant-pool fallback
 - Resolves runtime C2 from on-chain Ethereum/Polygon `eth_call` data.
 - Assembles full C2 URLs from decoded fragments and probes endpoints without downloading payloads.
 - Supports optional stage-2 static-only analysis and an interactive download/decrypt prompt.
-- Enriches results with RatterScanner and JLab public static scan when network access is allowed.
+- Enriches results with RatterScanner when network access is allowed. JLab public static scan uploads are temporarily disabled while the service is offline.
 - Extracts blockchain indicators, custom header fingerprints, and payload/persistence endpoint clues.
 
 ### Reporting & UX
@@ -72,7 +72,7 @@ will:
 3. Run a quick obfuscation-density probe on the scan root.
 4. If supported obfuscated call patterns are detected, copy the target to a deobfuscated working folder and rewrite supported string calls there.
 5. Scan the resulting source tree.
-6. Optionally resolve runtime C2 hints, perform stage-2 static analysis, and enrich results with RatterScanner and JLab static scan.
+6. Optionally resolve runtime C2 hints, perform stage-2 static analysis, and enrich results with RatterScanner.
 7. Render the Rich console report and write JSON and HTML reports by default.
 
 If the probe does **not** detect any supported obfuscated call patterns, no deobfuscated copy is created and the source tree is scanned directly.
@@ -158,14 +158,15 @@ This data is also exposed in JSON under `minecraft_modules`, and the HTML/Rich r
 
 ## JLab Static Scan Enrichment
 
+> **Temporarily disabled:** JLab has shut down, so Java Triage will not upload files to its static-scan API. The integration is retained in the codebase for re-enablement when the service returns.
+
 When enabled, Java Triage will attempt to upload the original source JAR/ZIP to:
 
 - `https://jlab.threat.rip/api/public/static-scan`
 
 Behavior details:
 
-- Enabled by default (`--jlab-static-scan`)
-- Can be disabled with `--no-jlab-static-scan`
+- Temporarily disabled, including when `--jlab-static-scan` is supplied
 - Requires network access (disabled by `--no-network`)
 - Upload target priority:
   - source JAR metadata path/name fallback for directory scans that originated from a JAR
@@ -273,8 +274,8 @@ python java_triage.py ./sample_project --no-network
 # Disable stage-2 static analysis
 python java_triage.py ./sample_project --no-analyze-stage2
 
-# Disable JLab static scan enrichment
-python java_triage.py ./sample_project --no-jlab-static-scan
+# JLab static scan uploads are currently disabled
+python java_triage.py ./sample_project
 
 # Wider rich output
 python java_triage.py ./sample_project --rich-width 220
@@ -297,8 +298,8 @@ python java_triage.py ./sample_project --decipher-codebase
 - `--html-out <path>`: write HTML report to a custom file
 - `--no-progress`: disable progress messages
 - `--no-network`: disable runtime C2 resolution and related network lookups
-- `--jlab-static-scan`: upload source JAR/ZIP to JLab public static scan API and include matched signature results (enabled by default)
-- `--no-jlab-static-scan`: disable JLab public static scan lookup
+- `--jlab-static-scan`: reserved for JLab public static scan uploads; currently disabled while JLab is offline
+- `--no-jlab-static-scan`: disable JLab public static scan lookup (the default while the service is offline)
 - `--analyze-stage2`: after resolving a runtime payload endpoint, download the stage-2 JAR and perform static-only analysis (enabled by default)
 - `--no-analyze-stage2`: disable stage-2 static analysis
 - `--rich-width <int>`: preferred Rich console width for progress and final report rendering
