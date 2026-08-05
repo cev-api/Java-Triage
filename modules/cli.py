@@ -1118,6 +1118,31 @@ def main() -> int:
         {(f.file, f.line, f.function, f.decoded, f.category, f.note): f for f in all_findings}.values(),
         key=lambda x: (x.file, x.line, x.decoded, x.category),
     )
+
+    # ── Post-dedup: drop class constant-pool findings that merely duplicate a
+    #    .java finding for the same logical source (lower fidelity, same string).
+    _class_to_java: dict[str, str] = {}
+    for f in all_findings:
+        if str(f.file).lower().endswith(".class"):
+            rel = str(f.file).replace("\\", "/")
+            base = rel[len(".java_triage_classes/") :] if rel.startswith(".java_triage_classes/") else rel
+            if base.endswith(".class"):
+                base = base[: -len(".class")]
+            _class_to_java[f.file] = base.split("$", 1)[0] + ".java"
+    _java_sigs: dict[str, set] = {}
+    for f in all_findings:
+        if str(f.file).lower().endswith(".java"):
+            # Normalize to forward slashes so keys match the class→java mapping.
+            _java_sigs.setdefault(str(f.file).replace("\\", "/"), set()).add((f.decoded, f.category))
+    _deduped_findings = []
+    for f in all_findings:
+        if str(f.file).lower().endswith(".class"):
+            jf = _class_to_java.get(f.file)
+            if jf and jf in _java_sigs and (f.decoded, f.category) in _java_sigs[jf]:
+                continue
+        _deduped_findings.append(f)
+    all_findings = _deduped_findings
+
     behavior_findings.extend(detect_decoded_finding_behaviors(all_findings))
     mc_modules = detect_minecraft_modules(scan_root)
 
@@ -1279,6 +1304,17 @@ def main() -> int:
     progress(show_progress, f"Detected {variant_detections.get('detected_count', 0)} Signature Variant(s)", progress_console)
     progress(show_progress, "Running Raw String Scanner", progress_console)
     raw_string_detections = run_raw_string_scanner(scan_root)
+    if mc_modules.get("detected"):
+        # Yarn-mapped Minecraft mods contain method_XXXX/field_XXXX accessor
+        # names in every class constant pool; they are not IOCs by themselves.
+        _ACCESSOR_TOK_RE = re.compile(r"^(?:method|func|field)_\w+$")
+        raw_string_detections = [
+            r for r in raw_string_detections
+            if not (
+                _ACCESSOR_TOK_RE.match(str(r.get("pattern", "")))
+                and "MC " in str(r.get("description", ""))
+            )
+        ]
     progress(show_progress, f"Raw String Detections: {len(raw_string_detections)}", progress_console)
     progress(show_progress, "Running Cross-Variant Heuristic Scorer", progress_console)
     heuristic_detections = run_cross_variant_heuristics(scan_root)

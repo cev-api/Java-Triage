@@ -322,6 +322,11 @@ BEHAVIOR_SEVERITY_MAP = {
     "multi_path_exfil_breakdown": "critical",
     "sensitive_game_data_comment": "medium",
     "inline_xor_string_decoder": "medium",
+    "usn_journal_flood": "high",
+    "file_timestamp_forgery": "high",
+    "self_jar_overwrite_downloader": "high",
+    "in_memory_forensic_wipe": "medium",
+    "dataflow_coordinates_to_network_sink": "high",
 }
 
 MINECRAFT_AUTH_HOSTS = {

@@ -73,6 +73,12 @@ def _trace_minecraft_data_flow(
         (r'Session\.getUuid\(\)', 'minecraft_uuid_access'),
         (r'func_148254_d\(\)', 'minecraft_access_token_access'),
         (r'func_111285_a\(\)', 'minecraft_username_access'),
+        # Yarn 1.21+ obfuscated accessors seen in decompiled client mods
+        (r'method_23317\(\)', 'minecraft_player_x_access'),
+        (r'method_23318\(\)', 'minecraft_player_y_access'),
+        (r'method_23321\(\)', 'minecraft_player_z_access'),
+        (r'method_5477\(\)', 'minecraft_player_name_access'),
+        (r'method_1558\(\)', 'minecraft_server_entry_access'),
     ]
 
     # Sink markers: network I/O, exfiltration primitives
@@ -184,6 +190,19 @@ def _trace_minecraft_data_flow(
                 line=find_line(text, "getUuid()") if "getUuid()" in text else find_line(text, "method_44717()"),
                 behavior="dataflow_uuid_to_network_sink",
                 evidence="Minecraft UUID flows to network sink(s) — identity collection for exfiltration",
+            )
+        )
+
+    if any(
+        src in source_hits
+        for src in ("minecraft_player_x_access", "minecraft_player_y_access", "minecraft_player_z_access")
+    ):
+        out.append(
+            BehaviorFinding(
+                file=rel,
+                line=find_line(text, "method_23317()") if "method_23317()" in text else find_line(text, "HttpURLConnection"),
+                behavior="dataflow_coordinates_to_network_sink",
+                evidence="Player coordinate accessors (Yarn method_23317/23318/23321) present alongside network/write sink(s) — coordinate collection for exfiltration",
             )
         )
 

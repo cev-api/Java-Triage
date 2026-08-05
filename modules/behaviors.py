@@ -532,13 +532,27 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
             )
         )
 
-    if any(k in low for k in ["proguard", "allatori", "stringer", "zelix", "dasho", "yguard", "r8"]):
+    # Only confident, unambiguous obfuscator/packer signatures — never bare
+    # substrings (e.g. "r8", "stringer") which appear inside decompiled names,
+    # render helpers, or comments and cause false positives.
+    _OBFUSCATOR_MARKER_PATTERNS = [
+        (r"\ballatorixdemo\b", "Allatori"),
+        (r"\bzelixklassmaster\b", "Zelix KlassMaster"),
+        (r"\bdasho\b", "DashO"),
+        (r"\byguard\b", "yGuard"),
+        (r"\bproguard\b", "ProGuard"),
+        (r"\bstringer\b", "Stringer"),
+        (r"-libraryjars", "ProGuard config"),
+        (r"-keepattributes", "ProGuard config"),
+    ]
+    obf_markers = [name for pat, name in _OBFUSCATOR_MARKER_PATTERNS if re.search(pat, low)]
+    if obf_markers:
         out.append(
             BehaviorFinding(
                 file=rel,
                 line=1,
                 behavior="obfuscator_or_packer_marker",
-                evidence="Contains explicit obfuscator/packer marker strings (e.g., ProGuard/Allatori/Stringer/Zelix/DashO/R8)",
+                evidence="Contains explicit obfuscator/packer marker strings: " + ", ".join(obf_markers),
             )
         )
 
@@ -619,6 +633,7 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
         "method_1676()" in text
         or ".getName()" in text
         or ".getUsername()" in text
+        or "method_5477()" in text
         or "func_111285_a()" in text
         or "username" in text
         or "field_1982" in text
@@ -917,13 +932,19 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 evidence="Generates callable accessors via LambdaMetafactory for indirect token/session reads",
             )
         )
-    if ("new String[]" in text or "new Method[" in text or "new Object[" in text) and ("dispatch" in low or "index" in low):
+    # Only real method-dispatch arrays (Method/MethodHandle/Class) that are then
+    # invoked reflectively count.  "new Object[]" / "new String[]" are ordinary
+    # varargs (String.format, printf) and "index" is a common loop counter.
+    if (
+        ("new Method[" in text or "new MethodHandle[" in text or "MethodHandle[]" in text or "new Class[]" in text)
+        and (".invoke(" in text or ".getMethod(" in text or ".getDeclaredMethod(" in text)
+    ):
         out.append(
             BehaviorFinding(
                 file=rel,
-                line=find_line(text, "new String[]") if "new String[]" in text else find_line(text, "new Method["),
+                line=find_line(text, "new Method["),
                 behavior="obf_array_indirect_dispatch_token_access",
-                evidence="Uses array-indexed indirection for method/field dispatch to obscure call targets",
+                evidence="Uses a Method/MethodHandle/Class dispatch array invoked reflectively to obscure call targets",
             )
         )
     if ("StringBuilder" in text and ".append(" in text and ("Class.forName(" in text or "getDeclaredMethod(" in text)):
@@ -1602,6 +1623,8 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                 "getBlockPos()", "getPosition()",
                 ".getPosition()", ".getPos()",
                 "BlockPos", "Vec3d", "Vec3",
+                # Yarn 1.21+ obfuscated player-position accessors (Entity.getX/getY/getZ)
+                "method_23317()", "method_23318()", "method_23321()",
             ]
         )
         # Generic .getX()/.getY()/.getZ() is too broad (font renderers, UI, etc.) —
@@ -1710,6 +1733,68 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
                         "The full webhook URL is likely assembled at runtime from these fragments, "
                         "indicating exfiltration to a Discord webhook."
                     ),
+                )
+            )
+
+    # ── Anti-forensics / self-tamper primitives ──
+    if not is_vendor_lib:
+        # NTFS USN journal flood: mass metadata churn on temp files via a worker
+        # pool (setLastModifiedTime + dos:archive toggles) to bury forensic
+        # evidence of file activity (e.g. self-replacing a cheat/mod JAR).
+        if (
+            "Files.setLastModifiedTime(" in text
+            and "dos:archive" in text
+            and "Files.createTempFile(" in text
+            and any(p in text for p in ["newWorkStealingPool", "newFixedThreadPool", "newCachedThreadPool"])
+            and "awaitTermination(" in text
+        ):
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "Files.setLastModifiedTime("),
+                    behavior="usn_journal_flood",
+                    evidence="Floods the NTFS USN journal by repeatedly rewriting timestamps and dos:archive attributes on temp files — anti-forensics to hide file modifications",
+                )
+            )
+
+        # File timestamp forgery: restoring/setting lastModified on a file
+        # derived from the running JAR path (covers up self-replacement / drops).
+        if "setLastModified(" in text and any(p in text for p in ["getCodeSource", "getProtectionDomain", "getLocation"]):
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "setLastModified("),
+                    behavior="file_timestamp_forgery",
+                    evidence="Restores/sets the lastModified timestamp of a file derived from the running JAR path — timestamp forgery to hide file modification",
+                )
+            )
+
+        # Self-overwrite downloader: HTTP download written back over the
+        # currently-running JAR path (self-replacement to cover the mod's tracks).
+        if (
+            ("HttpURLConnection" in text or "URLConnection" in text or "openConnection(" in text)
+            and ("getInputStream(" in text or "openStream(" in text)
+            and "FileOutputStream(" in text
+            and any(p in text for p in ["getCodeSource", "getProtectionDomain", "getCurrentJarPath", "getCurrentJar"])
+        ):
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, "FileOutputStream("),
+                    behavior="self_jar_overwrite_downloader",
+                    evidence="Downloads remote bytes and writes them over the running JAR path (getCodeSource/getProtectionDomain) — self-replacement/self-overwrite evasion",
+                )
+            )
+
+        # In-memory forensic wipe: clearing module/setting identity fields so a
+        # captured memory dump no longer shows the client's fingerprints.
+        if ".setName(null)" in text and ".setDescription(null)" in text and ".getSettings().clear()" in text:
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=find_line(text, ".setName(null)"),
+                    behavior="in_memory_forensic_wipe",
+                    evidence="Wipes module/setting name/description fields and clears settings in memory — reduces forensic residue in memory dumps",
                 )
             )
 
@@ -3535,11 +3620,20 @@ def run_cross_variant_heuristics(root: Path) -> List[dict]:
             add("Calls defineClass (in-memory class loading)", 20)
         if "jarinputstream" in low and "bytearrayinputstream" in low:
             add("In-memory JAR loading (JarInputStream + ByteArrayInputStream)", 20)
-        if any(x in low for x in ["method_1674", "method_1676", "method_44717"]):
-            add("MC session theft indicators (accessToken/username/uuid refs)", 25)
-        if ("getmethod(" in low or "getdeclaredmethod(" in low) and ".invoke(" in low and any(
-            x in low for x in ["method_1548", "method_1674", "method_1676"]
-        ):
+        has_mc_token = any(x in low for x in ["method_1674", "getaccesstoken", "func_148254_d", "field_1983", "field_148258_c"])
+        has_mc_identity = any(x in low for x in ["method_1676", "method_1673", "method_44717"])
+        # "socket(" (a constructor call) instead of bare "socket" avoids import noise.
+        has_net_sink = any(
+            x in low
+            for x in ["httpurlconnection", "httpclient", "okhttpclient", "getoutputstream", "url.openconnection", "socket("]
+        )
+        if has_mc_token and has_net_sink:
+            add("MC access token reference alongside network sink — verify exfiltration", 25)
+        elif has_mc_identity and has_net_sink:
+            add("MC username/UUID referenced alongside network activity — verify destination", 15)
+        if ("getmethod(" in low or "getdeclaredmethod(" in low) and ".invoke(" in low and (
+            has_mc_token or "method_1548" in low
+        ) and has_net_sink:
             add("MC session theft via reflection", 30)
         if "processbuilder" in low:
             add("ProcessBuilder usage (command execution)", 10)
@@ -3547,8 +3641,10 @@ def run_cross_variant_heuristics(root: Path) -> List[dict]:
             "readallbytes(" in low or "tobytearray(" in low
         ):
             add("HTTP download to byte array", 10)
-        if (not is_vendor_lib) and "base64" in low:
-            add("Base64 encoding/decoding", 10)
+        if (not is_vendor_lib) and any(
+            x in low for x in ["base64.getdecoder", "base64.getencoder", "getdecoder().decode", "getencoder().encodetostring"]
+        ):
+            add("Base64 encoding/decoding (actual decoder/encoder usage)", 10)
         if any(x in low for x in ["hkey_", "software\\microsoft", "reg add"]):
             add("Windows registry access", 15)
         if "powershell" in low or "pwsh" in low:
@@ -3577,7 +3673,9 @@ def run_cross_variant_heuristics(root: Path) -> List[dict]:
             add("WMI system information extraction", 15)
         if "com/sun/jna/" in low:
             add("JNA usage for native API calls", 10)
-        if any(x in low for x in ["ncrypt", "cryptunprotectdata", "ncryptopenstorageprovider"]):
+        # \\bncrypt requires a word boundary, so "encryptedstring" does NOT match
+        # (the substring "ncrypt" inside a longer identifier never matches \\bncrypt).
+        if re.search(r"\\bncrypt", low) or any(x in low for x in ["cryptunprotectdata", "cryptprotectdata", "crypt32util", "dpapi"]):
             add("Windows crypto API usage (NCrypt/DPAPI)", 20)
         if (not is_vendor_lib) and "java/net/socket" in low and "getinputstream" in low and "getoutputstream" in low:
             add("Raw socket communication (potential C2 channel)", 10)
@@ -4289,7 +4387,12 @@ def scan_file(
                 category = "dynamic_execution"
                 signal = f"{source_kind}_runtime_reflection_token"
             elif any(k in low for k in SUSPICIOUS_STRING_KEYWORDS):
-                category = "credential_or_identity_field" if any(k in low for k in ("token", "authorization", "api_key", "bearer ")) else "string"
+                if any(k in low for k in ("token", "authorization", "api_key", "bearer ")):
+                    category = "credential_or_identity_field"
+                elif any(k in low for k in ("webhook", "discord", "telegram", "api.telegram.org", "pastebin", "ngrok")):
+                    category = "comms_indicator"
+                else:
+                    category = "string"
                 signal = f"{source_kind}_keyword_hit"
             # Catch decoded strings that fall through the specific classifier
             # but are still meaningful — Windows paths, env vars, persistence targets, etc.
@@ -4472,6 +4575,9 @@ def behavior_verdict_tier(behavior: str) -> str:
         "persistence_filesystem_copy_relaunch_chain",
         "credential_handoff_to_dynamic_stage",
         "staged_remote_jar_execution",
+        "usn_journal_flood",
+        "file_timestamp_forgery",
+        "self_jar_overwrite_downloader",
     }:
         return "confirmed_behavior"
     if behavior.startswith("capability_") or behavior in {
@@ -4483,6 +4589,8 @@ def behavior_verdict_tier(behavior: str) -> str:
         "audio_capture_capability",
         "audio_playback_capability",
         "minecraft_coordinate_exfiltration",
+        "in_memory_forensic_wipe",
+        "dataflow_coordinates_to_network_sink",
     }:
         return "exposed_capability"
     if behavior.startswith("assessment_suspicious_") or behavior.startswith("assessment_needs_review_"):
@@ -4675,7 +4783,10 @@ def _extract_windows_artifacts(findings: List[Finding], behaviors: List[Behavior
         confirmed.append("detached payload execution")
     if "detached_process_runtime_indicator" in behavior_ids:
         confirmed.append("detached process runtime tracking")
-    if any("self-overwrite" in (getattr(b, "behavior", "")) for b in behaviors):
+    if any(
+        ("self-overwrite" in (getattr(b, "behavior", ""))) or b.behavior in {"self_jar_overwrite_downloader"}
+        for b in behaviors
+    ):
         confirmed.append("self-overwrite/update capability")
 
     # Check JLab signatures for timestamp spoofing
@@ -6112,6 +6223,9 @@ def _prepare_single_jar_scan_root(
     progress_console=None,
 ) -> Path:
     selected = selected.resolve()
+    # Deferred import: these prompt/report helpers live in reporting.py, which
+    # itself imports this module — resolve at call time to avoid an import cycle.
+    from .reporting import _prompt_reuse_decompiled_dir, _display_report_path
     profile = _jar_static_profile(selected)
     work_jar = selected
     if profile.get("malformed_class_dirs") or profile.get("space_class_names"):
@@ -6426,6 +6540,9 @@ def _apply_prefix_artifacts(items: List[ArtifactFinding], prefix: str) -> List[A
 def _prompt_select_nested_jars(jar_candidates: List[Path], scan_root: Path, console=None) -> List[int]:
     """Ask the user which nested JARs to process. Returns a list of 0-based indices
     into jar_candidates, or empty to skip all."""
+    # Deferred import: _triage_ui_width lives in reporting.py (which imports this
+    # module); resolve at call time to avoid an import cycle.
+    from .reporting import _triage_ui_width
     if RICH_AVAILABLE:
         ui_console = console or Console(stderr=True, width=_triage_ui_width())
         width = _triage_ui_width(ui_console)

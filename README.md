@@ -34,6 +34,7 @@ Under the hood, it combines bytecode-aware decompilation, constant-pool fallback
 - Detects Discord, Telegram, webhook, and cryptocurrency indicators.
 - Traces Minecraft session, username, UUID, and access-token reads into network/write sinks.
 - Flags multi-payload exfiltration, self-copy + detached re-launch persistence, and staged dropper behavior.
+- Detects anti-forensics primitives: NTFS USN journal flooding, file timestamp forgery, self-JAR overwrite downloaders, and in-memory forensic wiping.
 - Classifies findings and behaviors into severity and verdict tiers, while suppressing obvious bundled-library noise.
 - Emits methodology behaviors for obfuscation patterns, token-harvest vectors, and decompiler-failure diagnostics.
 
@@ -135,6 +136,11 @@ Expanded alias coverage includes:
 - Username access: `method_1676()`, `getName()`, `getUsername()`
 - UUID access: `method_44717()`, `getProfileId()`, `getUuid()`, `GameProfile.getId()`
 - Token access: `method_1674()`, `getAccessToken()`, `session.getAccessToken()`
+- Player coordinate access: `method_23317()`, `method_23318()`, `method_23321()` (Yarn `Entity.getX/getY/getZ`)
+- Player name access: `method_5477()` (Yarn `Entity.getName`)
+- Server entry access: `method_1558()` (`getCurrentServerEntry`)
+
+When a Minecraft client module pack is detected, benign identity/session reads and Yarn `method_XXXX`/`field_XXXX` accessor hits (normal in any Yarn-mapped mod) are suppressed, and class constant-pool findings that duplicate a `.java` finding for the same source are collapsed to reduce noise.
 
 ## Minecraft Client Module Coverage
 
@@ -340,6 +346,7 @@ The following behavior IDs were added for explicit methodology coverage and can 
 - `dataflow_token_to_network_sink`
 - `dataflow_username_to_network_sink`
 - `dataflow_uuid_to_network_sink`
+- `dataflow_coordinates_to_network_sink`
 - `token_bootstrap_constructor_capture`
 - `token_authlib_deep_hook_access`
 - `token_connection_authorization_header_probe`
@@ -351,6 +358,10 @@ The following behavior IDs were added for explicit methodology coverage and can 
 - `two_payload_exfil_architecture`
 - `persistence_filesystem_copy_relaunch_chain`
 - `persistence_detached_process_relaunch`
+- `usn_journal_flood`
+- `file_timestamp_forgery`
+- `self_jar_overwrite_downloader`
+- `in_memory_forensic_wipe`
 - `c2_fallback_domain`
 - `payload_download_endpoint`
 - `persistence_install_directory`
