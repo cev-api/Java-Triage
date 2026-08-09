@@ -237,6 +237,7 @@ BEHAVIOR_SEVERITY_MAP = {
     "sandbox_escape_primitive_usage": "high",
     "dynamic_urlclassloader_usage": "medium",
     "obfuscator_or_packer_marker": "medium",
+    "aes_string_constant_encryption": "medium",
     "binary_payload_download": "medium",
     "dynamic_class_execution": "medium",
     "stealth_relaunch": "medium",

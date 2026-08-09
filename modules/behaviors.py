@@ -3077,6 +3077,23 @@ def detect_persistence_relaunch_chains(root: Path) -> List[BehaviorFinding]:
 
 def detect_decoded_finding_behaviors(findings: List[Finding]) -> List[BehaviorFinding]:
     out: List[BehaviorFinding] = []
+    # AES string-constant encryption methodology — recovered statically from
+    # key+iv+ciphertext embedded in literals (e.g. cgganoee.o4Z8d7("...")).
+    aes_findings = [f for f in findings if "source=aes_scanner" in str(f.note)]
+    if aes_findings:
+        samples = sorted({str(f.decoded) for f in aes_findings if str(f.decoded).strip()}, key=len, reverse=True)[:6]
+        out.append(
+            BehaviorFinding(
+                file=".", line=1,
+                behavior="aes_string_constant_encryption",
+                evidence=(
+                    f"Recovered {len(aes_findings)} AES-encrypted string constants statically "
+                    "(16-byte key + 16-byte IV + ciphertext embedded in each literal). "
+                    "Recovered material includes C2/endpoint/path content that is otherwise invisible. "
+                    f"sample={' | '.join(samples)}"
+                ),
+            )
+        )
     rpc_urls = sorted([
         f
         for f in findings
@@ -4344,6 +4361,9 @@ def scan_file(
         obf_literal_entries.extend(_extract_full_xor_decoded_strings(text, starts))
         # Inline first-byte-key XOR decode: Skidfuscator-style byte[]/char[] inline patterns
         obf_literal_entries.extend(_extract_inline_xor_decoded_strings(text, starts))
+        # AES string-constant recovery: key+iv+ciphertext embedded in the literal
+        # (e.g. cgganoee.o4Z8d7("...") used by the Radium_Client / hUvPFYp family).
+        obf_literal_entries.extend(extract_aes_decrypted_literals(text, starts))
         seen_obf = set()
         for decoded, line, item_count, source_kind in obf_literal_entries:
             key = (decoded, line, source_kind)
@@ -5695,6 +5715,8 @@ def assess_auto_decrypt_need(root: Path) -> dict:
     stringdecrypt_calls = 0
     load_calls = 0
     files_with_calls = 0
+    aes_decryptable_literals = 0
+    aes_files = 0
 
     for p in files:
         try:
@@ -5707,6 +5729,13 @@ def assess_auto_decrypt_need(root: Path) -> dict:
             files_with_calls += 1
             stringdecrypt_calls += sd_calls
             load_calls += load_sd_calls
+        # AES string-constant obfuscation (e.g. cgganoee.o4Z8d7("...")). These
+        # are handled by the deciphered-copy rewrite, not the StringDecrypt path,
+        # so they are reported here for the probe stats without forcing that path.
+        aes_n = aes_decryptable_literal_count(text)
+        if aes_n:
+            aes_files += 1
+            aes_decryptable_literals += aes_n
 
     total_obf_calls = stringdecrypt_calls + load_calls
     files_ratio = float(files_with_calls) / max(1, java_files)
@@ -5732,6 +5761,8 @@ def assess_auto_decrypt_need(root: Path) -> dict:
         "stringdecrypt_calls": stringdecrypt_calls,
         "load_calls": load_calls,
         "total_obfuscated_calls": total_obf_calls,
+        "aes_decryptable_literals": aes_decryptable_literals,
+        "aes_files": aes_files,
         "thresholds": {
             "min_calls": AUTO_DECRYPT_TRIGGER_MIN_CALLS,
             "min_file_ratio": AUTO_DECRYPT_TRIGGER_MIN_FILE_RATIO,

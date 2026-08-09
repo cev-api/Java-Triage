@@ -73,6 +73,10 @@ def _reconstruct_split_string_arrays(text: str) -> List[tuple[str, str, int, int
         if len(parts_raw) < 8:
             continue
         parts = [_decode_java_string_literal_fragment(p) for p in parts_raw]
+        # Arrays whose members are already full URLs are URL *lists*, not split
+        # fragments of a single URL — joining them produces a bogus merged URL.
+        if any(p.startswith(("http://", "https://")) for p in parts):
+            continue
         joined = "".join(parts).strip()
         if len(joined) < 12:
             continue
@@ -347,6 +351,152 @@ def aes_cbc_nopadding_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes
     return padded[:-pad_len]
 
 
+# ── AES string-constant recovery (embedded key+iv+ciphertext literals) ──
+# Some obfuscators (the "hUvPFYp"/Radium_Client family and similar) encrypt
+# every string as AES/CBC/PKCS5 where the Java string literal itself is the
+# concatenation 16-byte key + 16-byte IV + ciphertext. The decryptor is a
+# static helper such as cgganoee.o4Z8d7("...").
+#
+# These literals are invisible to the XOR / byte-array scanners, which is why
+# samples using them were previously reported with "no C2 domain / 0 URLs".
+
+_AES_LITERAL_CANDIDATE_RE = re.compile(r'"((?:\\.|[^"\\\r\n]){32,})"', re.DOTALL)
+_AES_LITERAL_MIN_BYTES = 32  # 16-byte key + 16-byte IV
+
+
+def _aes_literal_to_bytes(raw_literal: str) -> bytes | None:
+    """Convert a Java string literal to raw bytes under ISO-8859-1 semantics
+    (each 0-255 char is one byte). Returns None if any char exceeds 0xFF."""
+    try:
+        vals = _java_literal_to_codepoints(raw_literal)
+    except Exception:
+        return None
+    if not vals or any(v > 0xFF for v in vals):
+        return None
+    return bytes(vals)
+
+
+def aes_cbc_pkcs5_literal_decrypt(raw_literal: str) -> str | None:
+    """Decrypt a Java string literal that stores an AES/CBC/PKCS5 blob.
+    Layout: key = bytes[0:16], iv = bytes[16:32], ciphertext = bytes[32:].
+    Returns the plaintext only when it decrypts cleanly AND is printable, so
+    coincidental matches are effectively impossible. Static — no execution."""
+    b = _aes_literal_to_bytes(raw_literal)
+    if b is None or len(b) < _AES_LITERAL_MIN_BYTES:
+        return None
+    ct = b[32:]
+    if not ct or len(ct) % 16 != 0:
+        return None
+    try:
+        from Crypto.Cipher import AES as _AES
+        cipher = _AES.new(b[0:16], _AES.MODE_CBC, iv=b[16:32])
+        padded = cipher.decrypt(ct)
+    except Exception:
+        return None
+    if not padded:
+        return None
+    pad = padded[-1]
+    if pad < 1 or pad > 16 or padded[-pad:] != bytes([pad]) * pad:
+        return None
+    pt = padded[:-pad]
+    if not all((32 <= x < 127) or x in (9, 10, 13) for x in pt):
+        return None
+    try:
+        return pt.decode("utf-8")
+    except Exception:
+        return None
+
+
+def aes_decryptable_literal_count(text: str) -> int:
+    """Count AES-encrypted string constants in a source file (probe helper)."""
+    n = 0
+    for m in _AES_LITERAL_CANDIDATE_RE.finditer(text):
+        if aes_cbc_pkcs5_literal_decrypt(m.group(1)) is not None:
+            n += 1
+    return n
+
+
+def extract_aes_decrypted_literals(
+    text: str,
+    starts: Optional[List[int]] = None,
+    max_hits: int = 800,
+) -> List[tuple[str, int, int, str]]:
+    """Extract AES-encrypted string constants from a .java source file.
+
+    Returns (decoded, line, literal_char_count, "aes") tuples in the same
+    shape as the XOR extractors so callers can feed them through the shared
+    classification chain."""
+    out: List[tuple[str, int, int, str]] = []
+    seen: set[tuple[str, int]] = set()
+    starts = starts or build_line_starts(text)
+    for m in _AES_LITERAL_CANDIDATE_RE.finditer(text):
+        if len(out) >= max_hits:
+            break
+        raw = m.group(1)
+        dec = aes_cbc_pkcs5_literal_decrypt(raw)
+        if dec is None:
+            continue
+        line = offset_to_line(starts, m.start())
+        key = (dec, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((dec, line, len(raw), "aes"))
+    return out
+
+
+def _aes_rewrite_spans(java_source: str) -> list[tuple[int, int, str]]:
+    """Compute replacement spans for AES-encrypted string constants.
+
+    Prefers to replace the whole `Receiver.method("blob")` call expression;
+    otherwise replaces the bare `"blob"` literal. All spans are gated on
+    successful + printable decryption."""
+    spans: list[tuple[int, int, str]] = []
+    for m in _AES_LITERAL_CANDIDATE_RE.finditer(java_source):
+        raw = m.group(1)
+        dec = aes_cbc_pkcs5_literal_decrypt(raw)
+        if dec is None:
+            continue
+        new_lit = _java_string_literal_escape(dec)
+        lit_start, lit_end = m.start(), m.end()
+        # Extend end past the closing parenthesis of a call expression if present.
+        end = lit_end
+        probe = java_source[lit_end:]
+        tail_ws = len(probe) - len(probe.lstrip(" \t"))
+        if tail_ws < len(probe) and probe[tail_ws] == ")":
+            end = lit_end + tail_ws + 1
+        # Walk back to the call boundary: `[Class .] method ( "literal" )`
+        prefix = java_source[:lit_start]
+        boundary = max(prefix.rfind(ch) for ch in (";", "=", ",", "{", "}", "\n"))
+        tail = prefix[boundary + 1:]
+        m_call = re.search(r"(?:[A-Za-z_$][\w$]*\s*\.\s*)?([A-Za-z_$][\w$]*)\s*\(\s*$", tail)
+        if m_call:
+            start = boundary + 1 + m_call.start()
+        else:
+            start = lit_start
+        # Drop overlapping spans (earlier spans win).
+        if any(not (end <= s or start >= e) for s, e, _ in spans):
+            continue
+        spans.append((start, end, new_lit))
+    return spans
+
+
+def _rewrite_aes_string_decrypt_calls(java_source: str) -> tuple[str, int, int]:
+    """Rewrite AES-encrypted string constants in a .java source to plaintext.
+    Returns (rewritten_source, replaced_count, failed_count)."""
+    spans = _aes_rewrite_spans(java_source)
+    result = java_source
+    replaced = 0
+    failed = 0
+    for start, end, new_text in sorted(spans, key=lambda x: x[0], reverse=True):
+        if start <= len(result) and end <= len(result) and start < end:
+            result = result[:start] + new_text + result[end:]
+            replaced += 1
+        else:
+            failed += 1
+    return result, replaced, failed
+
+
 # ── Clean .java copy: rewrite XOR strings in place ──
 
 _GETBYTES_CALL_RE = re.compile(
@@ -467,6 +617,8 @@ def produce_deciphered_copy(
     java_files = list(out_root.rglob("*.java"))
     total_replaced = 0
     total_failed = 0
+    total_aes_replaced = 0
+    total_aes_failed = 0
     files_changed = 0
     total_java = len(java_files)
     for idx, path in enumerate(java_files, start=1):
@@ -475,19 +627,28 @@ def produce_deciphered_copy(
         except Exception:
             continue
         new_text, repl, fail = _rewrite_xor_strings_in_java_source(text)
-        if repl > 0:
+        aes_text, aes_repl, aes_fail = _rewrite_aes_string_decrypt_calls(new_text)
+        if repl + aes_repl > 0:
             try:
-                path.write_text(new_text, encoding="utf-8")
+                path.write_text(aes_text, encoding="utf-8")
                 files_changed += 1
                 total_replaced += repl
                 total_failed += fail
+                total_aes_replaced += aes_repl
+                total_aes_failed += aes_fail
             except Exception:
                 total_failed += repl
+                total_aes_failed += aes_repl
         if show_progress and (idx == 1 or idx % 50 == 0 or idx == total_java):
-            progress(show_progress, f"deciphering {idx}/{total_java} replaced={total_replaced} files_changed={files_changed}", progress_console)
+            progress(show_progress, f"deciphering {idx}/{total_java} replaced={total_replaced} aes={total_aes_replaced} files_changed={files_changed}", progress_console)
     stats = {
         "java_files": total_java, "files_changed": files_changed,
-        "strings_replaced": total_replaced, "strings_failed": total_failed,
+        "strings_replaced": total_replaced + total_aes_replaced,
+        "strings_failed": total_failed + total_aes_failed,
+        "xor_strings_replaced": total_replaced,
+        "xor_strings_failed": total_failed,
+        "aes_strings_replaced": total_aes_replaced,
+        "aes_strings_failed": total_aes_failed,
         "output_root": str(out_root),
     }
     return out_root, stats

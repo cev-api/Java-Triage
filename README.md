@@ -27,6 +27,7 @@ Under the hood, it combines bytecode-aware decompilation, constant-pool fallback
 - Supports deterministic XOR-stream decoding used by common obfuscators.
 - Deciphers XOR-obfuscated `getBytes("ISO-8859-1")` and `toCharArray()` strings in whole-codebase or single-file mode.
 - Recovers split strings, printable byte/char arrays, reversed `StringBuilder` literals, and inline Skidfuscator-style XOR patterns.
+- **AES string-constant recovery** (e.g. the `cgganoee.o4Z8d7("...")` / hUvPFYp / Radium_Client family): string literals that embed `16-byte key + 16-byte IV + AES/CBC/PKCS5 ciphertext` are decrypted statically in the deciphered copy and in the per-file scanner. Recovered URLs, C2 domains, endpoints, paths, and CLI-arg chains flow through the normal classification pipeline, so previously "no C2 domain / 0 URLs" samples now report full infrastructure. The AES key itself (a non-multiple-of-16 blob) is never mis-rewritten.
 - Tracks replace counts, unresolved values, pass counts, and family breakdowns.
 
 ### Detection Coverage

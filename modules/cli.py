@@ -758,6 +758,14 @@ def main() -> int:
     stdout_unicode_ok = "utf" in stdout_encoding
     stderr_unicode_ok = "utf" in stderr_encoding or not stderr_encoding
     progress_console = Console(stderr=False, width=pref_width) if (RICH_AVAILABLE and stdout_unicode_ok) else None
+    # Never crash on non-UTF-8 consoles (cp1252 etc.) when printing unicode or
+    # box-drawing characters (e.g. the post-scan interactive prompt).
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(errors="replace")
+            except Exception:
+                pass
     report_console = Console(width=pref_width) if (RICH_AVAILABLE and stdout_unicode_ok) else None
     rich_progress_mode = bool(RICH_AVAILABLE and progress_console is not None and show_progress)
     phase_logs = show_progress
@@ -1456,7 +1464,12 @@ def main() -> int:
                 if decipher_stats:
                     summary["xor_decrypted_count"] = max(
                         summary["xor_decrypted_count"],
-                        int(decipher_stats.get("strings_replaced", 0)),
+                        int(decipher_stats.get("xor_strings_replaced", 0)),
+                    )
+                    summary["aes_decrypted_count"] = max(
+                        int(summary.get("aes_decrypted_count", 0)),
+                        int(decipher_stats.get("aes_strings_replaced", 0)),
+                        sum(1 for f in all_findings if "source=aes_scanner" in (f.note or "")),
                     )
                 build_prog.advance(build_task)
 
@@ -1566,7 +1579,12 @@ def main() -> int:
         if decipher_stats:
             summary["xor_decrypted_count"] = max(
                 summary["xor_decrypted_count"],
-                int(decipher_stats.get("strings_replaced", 0)),
+                int(decipher_stats.get("xor_strings_replaced", 0)),
+            )
+            summary["aes_decrypted_count"] = max(
+                int(summary.get("aes_decrypted_count", 0)),
+                int(decipher_stats.get("aes_strings_replaced", 0)),
+                sum(1 for f in all_findings if "source=aes_scanner" in (f.note or "")),
             )
 
         blockchain = extract_blockchain_indicators(all_findings)
