@@ -50,10 +50,15 @@ Under the hood, it combines bytecode-aware decompilation, constant-pool fallback
 ### Infrastructure & Enrichment
 - Resolves runtime C2 from on-chain Ethereum/Polygon `eth_call` data.
 - Assembles full C2 URLs from decoded fragments and probes endpoints without downloading payloads.
-- Supports optional stage-2 static-only analysis and an interactive encrypted-blob download/decrypt prompt. No downloaded code is executed.
 - Uses `proxies.txt` for runtime C2, stage-2 downloads, endpoint probes, and external lookups when the file is present. Proxy attempts are randomized and bounded; blocked proxies are retried with other entries.
 - Enriches results with RatterScanner when network access is allowed. JLab public static scan uploads are temporarily disabled while the service is offline.
 - Extracts blockchain indicators, custom header fingerprints, and payload/persistence endpoint clues.
+
+### Post-Scan Stage-2 Analysis
+
+![Example](https://i.imgur.com/5udA4DM.png)
+
+After the main scan completes, Java Triage can prompt to download and decrypt a resolved encrypted stage-2 payload. The decrypted payload is inspected using static-only analysis; downloaded code is never executed. Use `--analyze-stage2` to enable this workflow, or `--no-analyze-stage2` to disable it.
 
 ### Reporting & UX
 - Produces Rich console output, JSON, and standalone HTML reports.
@@ -193,7 +198,7 @@ Returned data is stored under `jlab_static_scan` in JSON and rendered in Rich/HT
 
 ## Executive Summary
 
-![Example](https://i.imgur.com/lLOMDbl.png)
+![Example](https://i.imgur.com/vTRsANX.png)
 
 The tool can generate an AI executive summary using either OpenAI or DeepSeek.
 
@@ -316,7 +321,7 @@ python java_triage.py ./sample_project --decipher-codebase
 - `--no-network`: disable runtime C2 resolution and related network lookups
 - `--jlab-static-scan`: reserved for JLab public static scan uploads; currently disabled while JLab is offline
 - `--no-jlab-static-scan`: disable JLab public static scan lookup (the default while the service is offline)
-- `--analyze-stage2`: enable stage-2 static-only handling after resolving a payload endpoint (the interactive prompt downloads the encrypted blob; enabled by default)
+- `--analyze-stage2`: after scanning and resolving a payload endpoint, enable the post-scan prompt to download and decrypt the encrypted stage-2 blob for static-only analysis (enabled by default)
 - `--no-analyze-stage2`: disable stage-2 static analysis
 - `--rich-width <int>`: preferred Rich console width for progress and final report rendering
 
@@ -411,9 +416,10 @@ The following behavior IDs were added for explicit methodology coverage and can 
 
 The `decipher` section in JSON reports contains counts of XOR strings replaced and files changed when `--decipher-codebase` is used (enabled by default).
 
-## Output
+## Output/HTML Reporting
 
-![Example](https://i.imgur.com/oCghAjf.png)
+![CLI](https://i.imgur.com/cIJqJxJ.png)
+![HTML](https://i.imgur.com/oCghAjf.png)
 
 Text and Rich output include:
 - Basic Properties, JAR Info, and Bundle Info
@@ -475,6 +481,7 @@ HTML output is a standalone styled report and includes:
 - click any detection line number to reveal five deciphered source lines before and after it; the code expands across the full table width
 - Behavior Indicators, Decoded Findings, Reconstructed Strings, and AES key locations all support the same five-line dropdown
 - terminal/console output remains compact and does not print the source-code windows
+- stage-2 download/decryption status and results after the scan
 - omission of categories that are completely empty
 
 ## Notes and Limits
