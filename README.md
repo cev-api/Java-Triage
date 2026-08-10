@@ -4,7 +4,7 @@
 
 `java_triage.py` is a static triage tool for suspicious Java codebases, decompiled JARs, and Minecraft mods.
 
-It can decompile JARs with CFR (including hostile/eSkid-protected samples), rewrite supported obfuscated string patterns, produce deciphered copies with XOR strings replaced, scan suspicious strings and behaviors, identify suspicious artifacts, resolve runtime C2 hints from on-chain config data, assemble full C2 URLs from decoded fragments, optionally inspect a resolved stage-2 JAR in static-only mode (including AES decryption of encrypted blobs), probe live infrastructure, query external enrichment APIs (RatterScanner and JLab static scan), and produce Rich console, JSON, and HTML reports.
+It can decompile JARs with CFR (including hostile/eSkid-protected samples), rewrite supported obfuscated string patterns, produce deciphered copies with XOR strings replaced, scan suspicious strings and behaviors, identify suspicious artifacts, resolve runtime C2 hints from on-chain config data, assemble full C2 URLs from decoded fragments, optionally download and decrypt a resolved encrypted stage-2 blob for static-only analysis, probe live infrastructure, use an optional rotating HTTP/SOCKS5 proxy list, query external enrichment APIs (RatterScanner and JLab static scan), and produce Rich console, JSON, and HTML reports.
 
 Under the hood, it combines bytecode-aware decompilation, constant-pool fallback scanning, `invokedynamic` / `BootstrapMethods` mapping, heuristic string recovery, and behavior classification into one triage pass.
 
@@ -28,6 +28,8 @@ Under the hood, it combines bytecode-aware decompilation, constant-pool fallback
 - Deciphers XOR-obfuscated `getBytes("ISO-8859-1")` and `toCharArray()` strings in whole-codebase or single-file mode.
 - Recovers split strings, printable byte/char arrays, reversed `StringBuilder` literals, and inline Skidfuscator-style XOR patterns.
 - **AES string-constant recovery** (e.g. the `cgganoee.o4Z8d7("...")` / hUvPFYp / Radium_Client family): string literals that embed `16-byte key + 16-byte IV + AES/CBC/PKCS5 ciphertext` are decrypted statically in the deciphered copy and in the per-file scanner. Recovered URLs, C2 domains, endpoints, paths, and CLI-arg chains flow through the normal classification pipeline, so previously "no C2 domain / 0 URLs" samples now report full infrastructure. The AES key itself (a non-multiple-of-16 blob) is never mis-rewritten.
+- Reports explicitly display recovered AES key material in Base64 and hexadecimal form.
+- High-signal findings retain larger numbered source windows. When an auto-generated `deciphered/` copy exists, snippets prefer that readable copy instead of the original obfuscated source.
 - Tracks replace counts, unresolved values, pass counts, and family breakdowns.
 
 ### Detection Coverage
@@ -48,7 +50,8 @@ Under the hood, it combines bytecode-aware decompilation, constant-pool fallback
 ### Infrastructure & Enrichment
 - Resolves runtime C2 from on-chain Ethereum/Polygon `eth_call` data.
 - Assembles full C2 URLs from decoded fragments and probes endpoints without downloading payloads.
-- Supports optional stage-2 static-only analysis and an interactive download/decrypt prompt.
+- Supports optional stage-2 static-only analysis and an interactive encrypted-blob download/decrypt prompt. No downloaded code is executed.
+- Uses `proxies.txt` for runtime C2, stage-2 downloads, endpoint probes, and external lookups when the file is present. Proxy attempts are randomized and bounded; blocked proxies are retried with other entries.
 - Enriches results with RatterScanner when network access is allowed. JLab public static scan uploads are temporarily disabled while the service is offline.
 - Extracts blockchain indicators, custom header fingerprints, and payload/persistence endpoint clues.
 
@@ -190,6 +193,8 @@ Returned data is stored under `jlab_static_scan` in JSON and rendered in Rich/HT
 
 ## Executive Summary
 
+![Example](https://i.imgur.com/lLOMDbl.png)
+
 The tool can generate an AI executive summary using either OpenAI or DeepSeek.
 
 - `OPENAI_API_KEY`: enables OpenAI Chat Completions
@@ -209,6 +214,7 @@ If neither API key is present, the tool behaves as if this feature does not exis
 
 - Python 3.10+ recommended
 - Optional: [`rich`](https://pypi.org/project/rich/) for enhanced terminal output
+- Optional: [`PySocks`](https://pypi.org/project/PySocks/) for SOCKS5 proxy support
 - Optional CLI tools for metadata enrichment: `ssdeep`, `tlsh`, `trid`, `vhash`
 - Optional Python package for metadata enrichment: [`magika`](https://pypi.org/project/magika/)
 
@@ -222,6 +228,9 @@ pip install rich
 
 # optional, for magika metadata enrichment
 pip install magika
+
+# optional, for SOCKS5 proxies listed in proxies.txt
+pip install PySocks
 ```
 
 ## Usage
@@ -307,9 +316,10 @@ python java_triage.py ./sample_project --decipher-codebase
 - `--no-network`: disable runtime C2 resolution and related network lookups
 - `--jlab-static-scan`: reserved for JLab public static scan uploads; currently disabled while JLab is offline
 - `--no-jlab-static-scan`: disable JLab public static scan lookup (the default while the service is offline)
-- `--analyze-stage2`: after resolving a runtime payload endpoint, download the stage-2 JAR and perform static-only analysis (enabled by default)
+- `--analyze-stage2`: enable stage-2 static-only handling after resolving a payload endpoint (the interactive prompt downloads the encrypted blob; enabled by default)
 - `--no-analyze-stage2`: disable stage-2 static analysis
 - `--rich-width <int>`: preferred Rich console width for progress and final report rendering
+
 - `--decrypt-codebase-in-place`: rewrite supported encrypted string calls in the target tree directly
 - `--decrypt-codebase-out <path>`: copy the tree to `<path>`, rewrite there, then scan that rewritten tree
 - `--no-rescan-after-decrypt`: perform rewrite only and exit
@@ -317,6 +327,27 @@ python java_triage.py ./sample_project --decipher-codebase
 - `--decipher-codebase`: produce a deciphered copy of the target with all XOR-obfuscated `getBytes`/`toCharArray` strings replaced by decoded literals, then scan both copies (enabled by default; disable with `--no-auto-decrypt` or `--no-rescan-after-decrypt`)
 - `--decipher-only <path>`: decipher a single `.java` file and write decoded strings to JSON (no scan)
 - `--rich-width <int>`: preferred Rich console width for progress and final report rendering
+
+## Proxy Support
+
+Network operations automatically read `proxies.txt` from the current working directory when it exists. Each valid line is eligible for randomized use. Supported forms are:
+
+```text
+1.2.3.4:8080
+1.2.3.4:8080:username:password
+http://1.2.3.4:8080
+socks5://1.2.3.4:1080:username:password
+```
+
+Unprefixed entries are tried as HTTP and then SOCKS5. Explicit `http://`, `https://`, `socks5://`, or `socks5h://` prefixes remove ambiguity. Up to three proxy attempts are made per request, and runtime C2 resolution has a hard overall timeout so failed proxy pools do not stall the scan indefinitely. When `proxies.txt` is present, the tool does not silently fall back to a direct connection.
+
+Install SOCKS5 support with:
+
+```powershell
+pip install PySocks
+```
+
+Keep proxy credentials out of version control. `proxies.txt` is local configuration and may contain sensitive information.
 
 ## Methodology Behavior IDs
 
@@ -382,6 +413,8 @@ The `decipher` section in JSON reports contains counts of XOR strings replaced a
 
 ## Output
 
+![Example](https://i.imgur.com/oCghAjf.png)
+
 Text and Rich output include:
 - Basic Properties, JAR Info, and Bundle Info
 - Cryptocurrency Addresses
@@ -393,6 +426,8 @@ Text and Rich output include:
 - Artifact findings
 - Network Endpoint Assessment
 - Runtime C2 Resolution
+- Recovered AES keys (Base64 and hex)
+- Reconstructed Strings section resolving literal concatenation, `.concat(...)`, split arrays, and literal `StringBuilder.append(...)` sequences
 - Assembled C2 URLs
 - Infrastructure Probe Results
 - Blockchain Indicators
@@ -424,6 +459,7 @@ JSON output includes the full scan payload, including:
 - `string_dump` (post-prep string dump stats)
 - `invokedynamic_bootstrap` (indy/bootstrap mapping stats)
 - `findings`
+- `findings[*].context` (numbered source snippet for high-signal findings)
 - `behavior_findings`
 - `artifact_findings`
 - `reconstructed_strings` (StringBuilder-reassembled XOR strings)
@@ -435,6 +471,10 @@ HTML output is a standalone styled report and includes:
 - executive summary, when available
 - expanded metadata and enrichment sections
 - clickable column headers for sorting tables
+- expandable deciphered source windows under line-based detections, including AES key recovery rows
+- click any detection line number to reveal five deciphered source lines before and after it; the code expands across the full table width
+- Behavior Indicators, Decoded Findings, Reconstructed Strings, and AES key locations all support the same five-line dropdown
+- terminal/console output remains compact and does not print the source-code windows
 - omission of categories that are completely empty
 
 ## Notes and Limits

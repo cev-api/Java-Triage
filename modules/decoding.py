@@ -85,6 +85,54 @@ def _reconstruct_split_string_arrays(text: str) -> List[tuple[str, str, int, int
     return out
 
 
+def extract_literal_string_reconstructions(
+    text: str,
+    max_hits: int = 250,
+) -> List[tuple[str, int, int, str]]:
+    """Resolve simple literal concatenations, concat calls, and StringBuilder blocks."""
+    out: List[tuple[str, int, int, str]] = []
+    seen: set[tuple[str, int, str]] = set()
+    literal = r'"(?:\\.|[^"\\\r\n])*"'
+
+    # "part-a" + "part-b" and "part-a".concat("part-b") forms.
+    concat_re = re.compile(
+        rf'(?P<expr>{literal}(?:(?:\s*\+\s*{literal})|(?:\s*\.concat\(\s*{literal}\s*\)))+)'
+    )
+    for m in concat_re.finditer(text):
+        pieces = [_decode_java_string_literal_fragment(x[1:-1]) for x in re.findall(literal, m.group("expr"))]
+        rebuilt = "".join(pieces).strip()
+        if len(pieces) < 2 or len(rebuilt) < 4:
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        key = (rebuilt, line, "literal_concat")
+        if key not in seen:
+            seen.add(key)
+            out.append((rebuilt, line, len(pieces), "literal_concat"))
+
+    # StringBuilder with literal append calls ending in toString().
+    builder_re = re.compile(
+        r'\bStringBuilder\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*new\s+StringBuilder\(\)\s*;',
+    )
+    for idx, decl in enumerate(builder_re.finditer(text)):
+        end = min(len(text), decl.end() + 8000)
+        block = text[decl.end():end]
+        if not re.search(rf'\b{re.escape(decl.group("name"))}\.toString\(\)', block):
+            continue
+        append_re = re.compile(rf'\b{re.escape(decl.group("name"))}\.append\(\s*({literal})\s*\)')
+        pieces = [_decode_java_string_literal_fragment(m.group(1)[1:-1]) for m in append_re.finditer(block)]
+        rebuilt = "".join(pieces).strip()
+        if len(pieces) < 2 or len(rebuilt) < 4:
+            continue
+        line = text.count("\n", 0, decl.start()) + 1
+        key = (rebuilt, line, "stringbuilder")
+        if key not in seen:
+            seen.add(key)
+            out.append((rebuilt, line, len(pieces), "stringbuilder"))
+        if len(out) >= max_hits:
+            break
+    return out[:max_hits]
+
+
 def _extract_printable_byte_array_strings(
     text: str,
     max_arrays: int = 120,
@@ -1651,6 +1699,34 @@ def classify_stringdecrypt_decoded(decoded: str, decode_note: str) -> str:
     return "decrypted_string"
 
 
+_LARGE_CONTEXT_MARKERS = (
+    "mcusername", "mc_user", "mcuuid", "mc_uuid", "prefireid",
+    "accesstoken", "executionenvironment", "stealer spawned",
+    "detached log", "detached process", "oninitialize",
+)
+
+
+def source_context(text: str, line: int, before: int = 8, after: int = 12, limit: int = 2600) -> str:
+    """Return a numbered, bounded source window around a finding line."""
+    lines = text.splitlines()
+    if not lines or line < 1:
+        return ""
+    start = max(1, line - before)
+    end = min(len(lines), line + after)
+    rendered = [f"{idx:>6}: {lines[idx - 1]}" for idx in range(start, end + 1)]
+    result = "\n".join(rendered)
+    if len(result) > limit:
+        result = result[: limit - 1].rstrip() + "…"
+    return result
+
+
+def wants_large_context(decoded: str, category: str) -> bool:
+    low = str(decoded or "").lower()
+    return category in {"credential_or_identity_field", "dynamic_execution"} or any(
+        marker in low for marker in _LARGE_CONTEXT_MARKERS
+    )
+
+
 def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tuple[int, str]], max_hits: int = 40) -> List[Finding]:
     out: List[Finding] = []
     seen = set()
@@ -1722,6 +1798,14 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
         elif len(compact) >= 32 and HEX_BLOB_RE.match(compact):
             category = "string"
             signal = "literal_hex_blob"
+        elif any(marker in low for marker in _LARGE_CONTEXT_MARKERS):
+            # These fields are often emitted as tiny JSON fragments by an
+            # obfuscated stealer.  Keep them as individual findings, but also
+            # attach the surrounding code so their data flow is reviewable.
+            category = "credential_or_identity_field" if any(
+                marker in low for marker in ("mcusername", "mcuuid", "accesstoken", "prefireid")
+            ) else "string"
+            signal = "suspicious_context_marker"
         elif any(k in low for k in SUSPICIOUS_STRING_KEYWORDS):
             category = "credential_or_identity_field" if any(k in low for k in ("token", "authorization", "api_key", "bearer ")) else "string"
             signal = "literal_keyword_hit"
@@ -1756,6 +1840,7 @@ def scan_string_literals(text: str, rel: str, starts: List[int], decls: List[tup
                 decoded=decoded,
                 category=category,
                 note=f"source=string_scanner signal={signal}{extra_note}",
+                context=source_context(text, line) if wants_large_context(decoded, category) else "",
             )
         )
         if not discord_kind and not endpoint_kind:

@@ -42,6 +42,120 @@ from .models import *
 from .decoding import *
 from .minecraft import _trace_minecraft_data_flow, detect_minecraft_modules
 
+
+# AES key material: base64/hex literals that decode to a valid AES key size
+# (16/24/32 bytes) when the file also uses AES crypto primitives.
+_AES_KEY_LITERAL_RE = re.compile(r'"((?:[A-Za-z0-9+/=_-]){16,64})"')
+
+
+# Obfuscator dead-code guards (self-comparisons / System.out checks / XOR
+# self-XORs) whose blocks end with `throw null`. Key-shaped junk lives inside
+# these blocks. All patterns are literal-vs-literal (always constant-folded),
+# so they cannot match legitimate variable comparisons.
+_DEAD_CODE_GUARD_RES = [
+    re.compile(r"if\s*\(\s*System\.out\s*(==|!=)\s*null\s*\)"),
+    re.compile(r"if\s*\(\s*(?:0x[0-9a-fA-F]+|-?\d+[lL]?)\s*(?:!=|==)\s*(?:0x[0-9a-fA-F]+|-?\d+[lL]?)\s*\)"),
+    re.compile(r"if\s*\(\s*\(0x[0-9a-fA-F]+\s*\^\s*0x[0-9a-fA-F]+\)\s*!=\s*0\s*\)"),
+    re.compile(r"if\s*\(\s*(?:-?\d+)\s*-\s*(?:-?\d+)\s*!=\s*0\s*\)"),
+    re.compile(r"if\s*\([^)]*new\s+Object\(\)\s*instanceof\s+Object\s*\)"),
+    re.compile(r"if\s*\([^)]*[A-Za-z_$][\w$]*\.class\s*==\s*null\s*\)"),
+]
+
+
+def _is_in_dead_code(text: str, pos: int) -> bool:
+    """Return True if `pos` sits inside an obfuscator dead-code block: a block
+    opened by a self-comparison / System.out guard that ends with `throw null`."""
+    depth = 0
+    open_pos = -1
+    for i in range(pos - 1, -1, -1):
+        c = text[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                open_pos = i
+                break
+            depth -= 1
+    if open_pos == -1:
+        return False
+    # The guard (`if (X != X)`, `if (System.out == null)`, ...) sits immediately
+    # before the opening brace, so scan a window that includes it.
+    head = text[max(0, open_pos - 200):pos]
+    if not any(r.search(head) for r in _DEAD_CODE_GUARD_RES):
+        return False
+    # Find the matching closing brace and require `throw null` in the block.
+    depth = 0
+    end = len(text)
+    for i in range(open_pos, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    return "throw null" in text[open_pos:end]
+
+
+def _extract_aes_key_candidates_from_text(text: str) -> List[dict]:
+    """Find base64/hex literals that decode to a valid AES key size and appear
+    alongside AES crypto usage (Cipher/SecretKeySpec/AES modes). Filters out
+    obfuscator dead-code junk. Returns dicts with key_size, encoding, value,
+    decoded_hex, line."""
+    low = text.lower()
+    has_aes_ctx = any(k in low for k in (
+        "cipher.getinstance(", "secretkeyspec", "ivparameterspec",
+        "cipher.dofinal", "aes/cbc", "aes/gcm", "aes/ecb", "aes/ctr",
+    ))
+    if not has_aes_ctx:
+        return []
+    out: List[dict] = []
+    seen: set[str] = set()
+    for m in _AES_KEY_LITERAL_RE.finditer(text):
+        d = m.group(1)
+        # Skip pure-binary obfuscator junk.
+        if re.fullmatch(r"[01]{16,}", d):
+            continue
+        # Skip candidates inside dead-code guard blocks.
+        if _is_in_dead_code(text, m.start()):
+            continue
+        decoded = None
+        enc = ""
+        if re.fullmatch(r"[A-Za-z0-9+/=]{16,64}", d) and "=" in d:
+            try:
+                decoded = base64.b64decode(d, validate=True)
+                enc = "base64"
+            except Exception:
+                decoded = None
+        if decoded is None:
+            try:
+                decoded = base64.urlsafe_b64decode(d + "=" * ((4 - len(d) % 4) % 4))
+                enc = "base64url"
+            except Exception:
+                decoded = None
+        if decoded is None and re.fullmatch(r"[0-9a-fA-F]{32,64}", d):
+            try:
+                decoded = bytes.fromhex(d)
+                enc = "hex"
+            except Exception:
+                decoded = None
+        if decoded is None or len(decoded) not in (16, 24, 32):
+            continue
+        key_hex = decoded.hex()
+        if key_hex in seen:
+            continue
+        seen.add(key_hex)
+        out.append({
+            "key_size": len(decoded) * 8,
+            "encoding": enc,
+            "value": d,
+            "decoded_hex": key_hex,
+            "line": text.count("\n", 0, m.start()) + 1,
+        })
+    return out
+
+
 def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     pathology = _source_pathology(path)
     if pathology.get("pathological"):
@@ -1802,6 +1916,21 @@ def scan_behavior(path: Path, root: Path) -> List[BehaviorFinding]:
     if not is_vendor_lib:
         out.extend(_trace_minecraft_data_flow(text, rel, obfuscated_values))
 
+    # ── Recovered AES key material (e.g. embedded Fernet/AES keys) ──
+    if not is_vendor_lib:
+        for keyinfo in _extract_aes_key_candidates_from_text(text):
+            out.append(
+                BehaviorFinding(
+                    file=rel,
+                    line=keyinfo["line"],
+                    behavior="aes_key_recovered",
+                    evidence=(
+                        f"Recovered AES-{keyinfo['key_size']} key ({keyinfo['encoding']}): "
+                        f"{keyinfo['value']} (decoded hex: {keyinfo['decoded_hex']})"
+                    ),
+                )
+            )
+
     return out
 
 
@@ -2496,6 +2625,9 @@ def analyze_runtime_payload(decoded: str, layers: List[tuple[str, str, str]], ab
 
 
 def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
+    # Bound the whole resolver. Proxy failover must not turn eight RPC URLs
+    # into an unbounded wait when a proxy pool is stale or blocked.
+    deadline = time.monotonic() + max(30.0, min(45.0, timeout * 3.0))
     rpc_urls = sorted([
         f.decoded
         for f in findings
@@ -2513,6 +2645,7 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
     out = {
         "attempted": False,
         "resolved": False,
+        "onchain_decoy": False,
         "rpc_used": "",
         "decoded_response": "",
         "decoded_response_layers": [],
@@ -2547,7 +2680,11 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
     payload = json.dumps(body).encode("utf-8")
     out["attempted"] = True
 
+    errors: list[str] = []
     for rpc in rpc_urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             req = request.Request(
                 rpc,
@@ -2555,7 +2692,8 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with request.urlopen(req, timeout=timeout) as resp:
+            request_timeout = max(1, min(timeout, 6, int(remaining)))
+            with urlopen_with_proxy(req, timeout=request_timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
             result_hex = data.get("result", "")
             if not isinstance(result_hex, str) or not result_hex.startswith("0x"):
@@ -2570,6 +2708,8 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
             out["resolved"] = True
             out["rpc_used"] = rpc
             out["decoded_response"] = decoded
+            _onchain_cand = decoded.split("|", 1)[0].strip() if decoded and not decoded.startswith("<binary ") else ""
+            out["onchain_decoy"] = _is_decoy_domain(_onchain_cand)
             layered = decode_encoded_fragments(decoded.strip()) if not decoded.startswith("<binary ") else []
             out["decoded_response_layers"] = [
                 {"category": cat, "decoded": dec, "note": note} for cat, dec, note in layered
@@ -2608,9 +2748,14 @@ def resolve_runtime_c2(findings: List[Finding], timeout: int = 12) -> dict:
             return out
         except Exception as exc:
             out["error"] = _friendly_network_error(exc)
+            errors.append(f"{urlparse(rpc).netloc}: {out['error']}")
             continue
     if not out["resolved"] and not out["error"]:
         out["error"] = "unable to decode runtime c2 response"
+    if not out["resolved"] and time.monotonic() >= deadline:
+        out["error"] = "runtime C2 resolution timed out; continuing with static findings"
+    elif not out["resolved"] and errors:
+        out["error"] = f"all runtime C2 RPC attempts failed ({len(errors)}); continuing with static findings"
     return out
 
 
@@ -3783,7 +3928,7 @@ def analyze_stage2_payload(payload_url: str, timeout: int = 20) -> dict:
         base_dir = Path(tempfile.mkdtemp(prefix="java_triage_stage2_")).resolve()
         jar_path = base_dir / "stage2_payload.jar"
         req = request.Request(payload_url, headers={"User-Agent": "java-triage/1.0"}, method="GET")
-        with request.urlopen(req, timeout=timeout) as resp, jar_path.open("wb") as f:
+        with urlopen_with_proxy(req, timeout=timeout) as resp, jar_path.open("wb") as f:
             shutil.copyfileobj(resp, f, length=1024 * 1024)
         out["downloaded"] = True
         out["download_path"] = str(jar_path)
@@ -3819,6 +3964,28 @@ def analyze_stage2_payload(payload_url: str, timeout: int = 20) -> dict:
 
 # ── URL assembly from decoded fragments ──────────────────────────────────────
 
+# Operator-controlled on-chain C2 values are sometimes set to anti-analysis
+# decoys to mock analysts (e.g. "thisisafalsepositive.st"). Detect the common
+# patterns so the scan can prefer the hardcoded fallback domain.
+_DECOY_DOMAIN_MARKERS = (
+    "falsepositive", "false-positive", "false_positive",
+    "notmalware", "not-a-malware", "not_malware",
+    "definitelynot", "definitely-not", "definitely_not",
+    "honeypot", "decoy", "benign", "innocent", "trustme", "trust-me",
+    "thisisnot", "this-is-not", "this_is_not", "totallylegit",
+    "totally-legit", "fakedomain", "fake-domain", "troll", "lol", "kek",
+)
+
+
+def _is_decoy_domain(value: str) -> bool:
+    if not value:
+        return False
+    low = value.lower()
+    if low == "thisisafalsepositive.st":
+        return True
+    return any(m in low for m in _DECOY_DOMAIN_MARKERS)
+
+
 def assemble_c2_urls(findings: List[Finding], runtime_c2: dict) -> dict:
     """Assemble full C2 URLs from decoded path fragments and the resolved
     blockchain C2 domain (or fallback domain).
@@ -3830,6 +3997,9 @@ def assemble_c2_urls(findings: List[Finding], runtime_c2: dict) -> dict:
         "c2_domain": "",
         "c2_domain_source": "",
         "fallback_domain": "",
+        "dynamic_c2_domain": "",
+        "dynamic_c2_domain_source": "",
+        "dynamic_c2_domain_decoy": False,
         "cdn_path": "",
         "endpoints": [],
         "assembled_urls": [],
@@ -3837,38 +4007,62 @@ def assemble_c2_urls(findings: List[Finding], runtime_c2: dict) -> dict:
         "note": "",
     }
 
-    # 1. Get the C2 domain from runtime resolution or fallback
-    c2_domain = (
-        runtime_c2.get("decoded_response", "")
-        if runtime_c2.get("resolved")
-        else ""
-    )
-    if c2_domain and URL_RE.match(f"https://{c2_domain}"):
-        result["c2_domain"] = c2_domain
-        result["c2_domain_source"] = "blockchain_eth_call"
-    else:
-        # Try fallback domain from findings
+    # 1. Determine the C2 domain.
+    #
+    # The hardcoded fallback domain in the sample (e.g. sltnnt.ru) is the most
+    # reliable, STATIC IOC — it comes straight out of the decrypted strings.
+    # The on-chain eth_call value is operator-controlled and can be a decoy /
+    # anti-analysis marker (e.g. thisisafalsepositive.st), so the static
+    # fallback takes priority and the dynamic value is reported separately.
+    fallback_domain = ""
+    fallback_source = ""
+    for f in findings:
+        d = str(f.decoded).strip()
+        low = d.lower()
+        if not DOMAIN_NAME_RE.match(d):
+            continue
+        if any(kw in low for kw in ("sltnnt", "fallback", "backup")):
+            fallback_domain = d
+            fallback_source = "fallback_domain_string"
+            break
+    if not fallback_domain:
         for f in findings:
-            low = str(f.decoded).lower()
-            if DOMAIN_NAME_RE.match(str(f.decoded)) and any(
-                kw in low for kw in ("sltnnt", "fallback", "backup")
+            d = str(f.decoded).strip()
+            low = d.lower()
+            if DOMAIN_NAME_RE.match(d) and (
+                low.endswith(".ru") or low.endswith(".su") or low.endswith(".st")
             ):
-                result["c2_domain"] = str(f.decoded).strip()
-                result["c2_domain_source"] = "fallback_domain_string"
-                break
-        if not result["c2_domain"]:
-            # Try .ru/.su domains
-            for f in findings:
-                d = str(f.decoded).strip()
-                low = d.lower()
-                if DOMAIN_NAME_RE.match(d) and (
-                    low.endswith(".ru") or low.endswith(".su") or low.endswith(".st")
-                ):
-                    # Exclude library/vendor hosts
-                    if not any(v in low for v in VENDOR_HOST_ALLOWLIST):
-                        result["c2_domain"] = d
-                        result["c2_domain_source"] = "suspicious_domain_string"
-                        break
+                # Exclude library/vendor hosts
+                if not any(v in low for v in VENDOR_HOST_ALLOWLIST):
+                    fallback_domain = d
+                    fallback_source = "suspicious_domain_string"
+                    break
+
+    onchain_domain = ""
+    if runtime_c2.get("resolved"):
+        cand = str(runtime_c2.get("decoded_response", "")).split("|", 1)[0].strip()
+        if "//" in cand:
+            cand = cand.split("//", 1)[1].split("/", 1)[0]
+        if DOMAIN_NAME_RE.match(cand):
+            onchain_domain = cand
+    onchain_decoy = _is_decoy_domain(onchain_domain)
+
+    result["fallback_domain"] = fallback_domain
+    if fallback_domain:
+        # Real, static C2 domain from the sample wins.
+        result["c2_domain"] = fallback_domain
+        result["c2_domain_source"] = fallback_source
+        if onchain_domain and onchain_domain != fallback_domain:
+            result["dynamic_c2_domain"] = onchain_domain
+            result["dynamic_c2_domain_source"] = "blockchain_eth_call"
+            result["dynamic_c2_domain_decoy"] = onchain_decoy
+    elif onchain_domain:
+        # No hardcoded fallback — use the on-chain value (note decoys clearly).
+        result["c2_domain"] = onchain_domain
+        result["c2_domain_source"] = "blockchain_eth_call_decoy" if onchain_decoy else "blockchain_eth_call"
+        result["dynamic_c2_domain"] = onchain_domain
+        result["dynamic_c2_domain_source"] = "blockchain_eth_call"
+        result["dynamic_c2_domain_decoy"] = onchain_decoy
 
     # 2. Collect path fragments
     path_fragments = sorted(
@@ -3985,16 +4179,22 @@ def probe_live_endpoints(assembled_urls: list[dict], timeout: int = 10) -> dict:
             "status": "unknown",
         }
 
-        # DNS
-        try:
-            probe["dns_ip"] = _socket.gethostbyname(probe["host"])
+        # DNS is intentionally skipped when proxies.txt exists: resolving
+        # locally can fail even though the proxy can reach the host, and it
+        # needlessly leaks the IOC to the local resolver.
+        if load_proxies():
+            probe["dns_ip"] = "via proxy"
             probe["dns_resolved"] = True
-        except Exception:
-            probe["status"] = "dead"
-            probe["error"] = "DNS resolution failed"
-            result["results"].append(probe)
-            result["summary"]["dead"] += 1
-            continue
+        else:
+            try:
+                probe["dns_ip"] = _socket.gethostbyname(probe["host"])
+                probe["dns_resolved"] = True
+            except Exception:
+                probe["status"] = "dead"
+                probe["error"] = "DNS resolution failed"
+                result["results"].append(probe)
+                result["summary"]["dead"] += 1
+                continue
 
         # HTTP — HEAD for most, Range request for CDN paths
         try:
@@ -4014,7 +4214,7 @@ def probe_live_endpoints(assembled_urls: list[dict], timeout: int = 10) -> dict:
                     headers={"User-Agent": "java-triage/1.0 (infra-probe)"},
                     method="HEAD",
                 )
-            with request.urlopen(req, timeout=timeout) as resp:
+            with urlopen_with_proxy(req, timeout=timeout) as resp:
                 probe["http_reachable"] = True
                 probe["http_status"] = resp.status
                 probe["http_reason"] = resp.reason
@@ -4557,6 +4757,21 @@ def scan_file(
                     decoded=rebuilt,
                     category="url",
                     note=f"source=split_string_array name={name} parts={parts}",
+                )
+            )
+        for rebuilt, line, parts, kind in extract_literal_string_reconstructions(text):
+            key = (rebuilt, line, kind)
+            if key in seen_reconstructed:
+                continue
+            seen_reconstructed.add(key)
+            findings.append(
+                Finding(
+                    file=rel,
+                    line=line,
+                    function=nearest_method(decls, line),
+                    decoded=rebuilt,
+                    category="reconstructed_string",
+                    note=f"source=string_reconstruction kind={kind} parts={parts}",
                 )
             )
         # Scan Java comments for sensitive indicators
@@ -5997,7 +6212,7 @@ def _latest_vineflower_download() -> tuple[str, str]:
     api_url = "https://api.github.com/repos/Vineflower/vineflower/releases/latest"
     try:
         req = request.Request(api_url, headers={"User-Agent": "java-triage/1.0"})
-        with request.urlopen(req, timeout=20) as resp:
+        with urlopen_with_proxy(req, timeout=20) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         for asset in payload.get("assets", []) or []:
             name = str(asset.get("name", ""))
@@ -6015,7 +6230,7 @@ def _download_file(url: str, dest: Path, show_progress: bool, progress_console=N
     tmp = dest.with_suffix(dest.suffix + ".download")
     try:
         req = request.Request(url, headers={"User-Agent": "java-triage/1.0"})
-        with request.urlopen(req, timeout=60) as resp:
+        with urlopen_with_proxy(req, timeout=60) as resp:
             total = int(resp.headers.get("Content-Length") or 0)
             got = 0
             with tmp.open("wb") as fh:

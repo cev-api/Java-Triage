@@ -136,10 +136,24 @@ def render_text(
     if findings:
         out.append("")
         out.append("== Decode + String Findings ==")
-        _cat_prio2 = {"url": 1, "credential_or_identity_field": 2, "dynamic_execution": 3, "cryptocurrency_address": 4, "discord_indicator": 5, "rpc_template": 6, "path": 7, "http_header": 8, "comms_indicator": 9, "sensitive_game_data": 10, "hex_or_contract": 11, "string": 12, "base64_blob": 13, "hex_decoded_binary": 14, "base64_decoded_binary": 15}
+        _cat_prio2 = {"url": 1, "credential_or_identity_field": 2, "dynamic_execution": 3, "reconstructed_string": 4, "cryptocurrency_address": 5, "discord_indicator": 6, "rpc_template": 7, "path": 8, "http_header": 9, "comms_indicator": 10, "sensitive_game_data": 11, "hex_or_contract": 12, "string": 13, "base64_blob": 14, "hex_decoded_binary": 15, "base64_decoded_binary": 16}
         for f in sorted(findings, key=lambda x: (_cat_prio2.get(x.category, 99), x.category, (x.decoded or "").lower())):
+            if f.category == "reconstructed_string":
+                continue
             note = f" [{f.note}]" if f.note else ""
             out.append(f"[{f.category}] {f.file}:{f.line} ({f.function}) -> {f.decoded}{note}")
+
+    aes_keys = [b for b in behaviors if str(b.behavior) == "aes_key_recovered"]
+    if aes_keys:
+        out.append("")
+        out.append("== AES Keys Recovered ==")
+        seen_aes = set()
+        for b in aes_keys:
+            key = (b.file, b.line, b.evidence)
+            if key in seen_aes:
+                continue
+            seen_aes.add(key)
+            out.append(f"- {b.file}:{b.line} -> {b.evidence}")
 
     has_assessment_rows = any(assessment["findings"][label] for label in ["benign", "needs_review", "suspicious"])
     if has_assessment_rows:
@@ -205,8 +219,9 @@ def render_text(
         out.append("")
         out.append("== Runtime C2 Resolution ==")
         if runtime_c2.get("resolved"):
+            decoy_note = " [DECOY / anti-analysis marker]" if runtime_c2.get("onchain_decoy") else ""
             out.append(f"Resolved: yes via {runtime_c2.get('rpc_used')}")
-            out.append(f"C2 base URL: {runtime_c2.get('c2_base_url')}")
+            out.append(f"On-chain C2 base URL: {runtime_c2.get('c2_base_url')}{decoy_note}")
             out.append(f"Exfil endpoint: {runtime_c2.get('exfil_endpoint')}")
             out.append(f"Payload endpoint: {runtime_c2.get('payload_endpoint')}")
             out.append(f"Raw decoded response: {runtime_c2.get('decoded_response')}")
@@ -591,24 +606,87 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     artifact_limit = 200
 
     # ── Sort keys for HTML tables ──
-    _html_cat_prio = {"url": 1, "credential_or_identity_field": 2, "dynamic_execution": 3, "cryptocurrency_address": 4, "discord_indicator": 5, "rpc_template": 6, "path": 7, "http_header": 8, "comms_indicator": 9, "sensitive_game_data": 10, "hex_or_contract": 11, "string": 12, "base64_blob": 13, "hex_decoded_binary": 14, "base64_decoded_binary": 15}
+    _html_cat_prio = {"url": 1, "credential_or_identity_field": 2, "dynamic_execution": 3, "reconstructed_string": 4, "cryptocurrency_address": 5, "discord_indicator": 6, "rpc_template": 7, "path": 8, "http_header": 9, "comms_indicator": 10, "sensitive_game_data": 11, "hex_or_contract": 12, "string": 13, "base64_blob": 14, "hex_decoded_binary": 15, "base64_decoded_binary": 16}
     _html_sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+    def line_context_cell(row: dict, label: Any = None) -> str:
+        """Render a compact line label for secondary indicator tables."""
+        return _h(row.get("line", "") if label is None else label)
 
     rows_find = []
     for r in sorted(findings[:2000], key=lambda x: (_html_cat_prio.get(str(x.get("category","")), 99), str(x.get("category","")), (str(x.get("decoded","")) or "").lower())):
         idx = len(rows_find)
         cat = str(r.get("category", ""))
+        if cat == "reconstructed_string":
+            continue
         row_class = "row-high" if cat_class(cat) == "cat-danger" else ""
         decoded_class = "decoded-high" if cat_class(cat) == "cat-danger" else ""
         hidden_attr = " style='display:none' data-findings-extra='1'" if idx >= findings_limit else ""
+        context_id = f"finding-context-{idx}"
+        context = str(r.get("context", "") or "")
+        toggle = (
+            f"<button type='button' class='context-toggle' data-context-target='{context_id}' "
+            f"aria-expanded='false'>▶ {_h(r.get('line', ''))}</button>"
+            if context else _h(r.get("line", ""))
+        )
         rows_find.append(
             f"<tr class='{row_class}'{hidden_attr}>"
             f"<td class='tight'>{_h(r.get('file', ''))}</td>"
-            f"<td class='tight'>{_h(r.get('line', ''))}</td>"
+            f"<td class='tight'>{toggle}</td>"
             f"<td class='func-col'>{_h(r.get('function', ''))}</td>"
             f"<td class='cat-col'><span class='cat-pill {cat_class(cat)}'>{_h(cat)}</span></td>"
             f"<td class='{decoded_class}'>{_h(r.get('decoded', ''))}</td>"
             "</tr>"
+            + (
+                f"<tr id='{context_id}' class='source-context-row' style='display:none'>"
+                f"<td colspan='5'><pre>{_h(context)}</pre></td></tr>"
+                if context else ""
+            )
+        )
+    rows_aes = []
+    seen_aes = set()
+    for aes_idx, r in enumerate(behaviors):
+        if str(r.get("behavior", "")) != "aes_key_recovered":
+            continue
+        key = (r.get("file", ""), r.get("line", ""), r.get("evidence", ""))
+        if key in seen_aes:
+            continue
+        seen_aes.add(key)
+        context = str(r.get("context", "") or "")
+        context_id = f"aes-context-{aes_idx}"
+        toggle = (
+            f"<button type='button' class='context-toggle' data-context-target='{context_id}' aria-expanded='false'>▶ {_h(r.get('line', ''))}</button>"
+            if context else _h(r.get("line", ""))
+        )
+        rows_aes.append(
+            f"<tr><td class='location-col'>{_h(r.get('file', ''))}:{toggle}</td>"
+            f"<td class='key-col'>{_h(r.get('evidence', ''))}</td></tr>"
+            + (
+                f"<tr id='{context_id}' class='source-context-row' style='display:none'><td colspan='2'><pre>{_h(context)}</pre></td></tr>"
+                if context else ""
+            )
+        )
+    rows_reconstructed = []
+    for recon_idx, r in enumerate((payload.get("reconstructed_strings", []) or [])[:1000]):
+        category = str(r.get("category", "reconstructed_string") or "reconstructed_string")
+        note = str(r.get("note", "") or "")
+        context = str(r.get("context", "") or "")
+        context_id = f"reconstructed-context-{recon_idx}"
+        toggle = (
+            f"<button type='button' class='context-toggle' data-context-target='{context_id}' aria-expanded='false'>▶ {_h(r.get('line', ''))}</button>"
+            if context else _h(r.get("line", ""))
+        )
+        method = note.replace("source=string_reconstruction ", "").replace("source=", "")
+        rows_reconstructed.append(
+            f"<tr><td class='tight'>{_h(r.get('file', ''))}</td>"
+            f"<td class='tight'>{toggle}</td>"
+            f"<td class='func-col'>{_h(r.get('function', ''))}</td>"
+            f"<td class='decoded-high'>{_h(r.get('decoded', ''))}</td>"
+            f"<td class='method-col'>{_h(category)}<br><span class='table-empty'>{_h(method)}</span></td></tr>"
+            + (
+                f"<tr id='{context_id}' class='source-context-row' style='display:none'><td colspan='5'><pre>{_h(context)}</pre></td></tr>"
+                if context else ""
+            )
         )
     rows_beh = []
     for r in sorted(behaviors[:2000], key=lambda x: (_html_sev_order.get(str(x.get("severity","info")).lower(), 9), str(x.get("behavior","")), str(x.get("file","")), int(x.get("line",0) or 0))):
@@ -617,14 +695,26 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
         row_class = f"row-{sev}" if sev in {"critical", "high", "medium", "low", "info"} else ""
         evidence_class = "behavior-evidence-high" if sev in {"critical", "high"} else ("behavior-evidence-medium" if sev == "medium" else "")
         hidden_attr = " style='display:none' data-behavior-extra='1'" if idx >= behavior_limit else ""
+        context_id = f"behavior-context-{idx}"
+        context = str(r.get("context", "") or "")
+        toggle = (
+            f"<button type='button' class='context-toggle' data-context-target='{context_id}' "
+            f"aria-expanded='false'>▶ {_h(r.get('line', ''))}</button>"
+            if context else _h(r.get("line", ""))
+        )
         rows_beh.append(
             f"<tr class='{row_class}'{hidden_attr}>"
             f"<td class='tight'><span class='sev sev-{_h(sev)}'>{_h(sev)}</span></td>"
             f"<td class='tight'>{_h(r.get('file', ''))}</td>"
-            f"<td class='tight'>{_h(r.get('line', ''))}</td>"
+            f"<td class='tight'>{toggle}</td>"
             f"<td>{_h(r.get('behavior', ''))}</td>"
             f"<td class='{evidence_class}'>{_h(r.get('evidence', ''))}</td>"
             "</tr>"
+            + (
+                f"<tr id='{context_id}' class='source-context-row' style='display:none'>"
+                f"<td colspan='5'><pre>{_h(context)}</pre></td></tr>"
+                if context else ""
+            )
         )
     rows_art = []
     for r in artifacts[:1000]:
@@ -936,30 +1026,44 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
 
     # ── Cryptocurrency Addresses ──
     rows_crypto_html = []
-    for f in findings[:2500]:
+    for crypto_idx, f in enumerate(findings[:2500]):
         if (f or {}).get("category") == "cryptocurrency_address":
+            context = str(f.get("context", "") or "")
+            context_id = f"crypto-context-{crypto_idx}"
+            toggle = (
+                f"<button type='button' class='context-toggle' data-context-target='{context_id}' aria-expanded='false'>▶ {_h(f.get('line', ''))}</button>"
+                if context else _h(f.get("line", ""))
+            )
             rows_crypto_html.append(
                 "<tr>"
                 f"<td class='crypto-addr'>{_h(f.get('decoded', ''))}</td>"
                 f"<td class='tight'>{_h(f.get('file', ''))}</td>"
-                f"<td class='tight'>{_h(f.get('line', ''))}</td>"
+                f"<td class='tight'>{toggle}</td>"
                 "</tr>"
+                + (f"<tr id='{context_id}' class='source-context-row' style='display:none'><td colspan='3'><pre>{_h(context)}</pre></td></tr>" if context else "")
             )
 
     # ── Discord / Webhook Indicators ──
     rows_discord_html = []
-    for f in findings[:2500]:
+    for discord_idx, f in enumerate(findings[:2500]):
         if (f or {}).get("category") == "discord_indicator":
             note = str(f.get("note", "") or "")
             if any(k in note.lower() for k in ("webhook", "token", "snowflake_id", "notification", "bot", "contextual")):
                 signal = note.replace("source=string_scanner signal=", "").replace("source=comment_scanner signal=", "")
+                context = str(f.get("context", "") or "")
+                context_id = f"discord-context-{discord_idx}"
+                toggle = (
+                    f"<button type='button' class='context-toggle' data-context-target='{context_id}' aria-expanded='false'>▶ {_h(f.get('line', ''))}</button>"
+                    if context else _h(f.get("line", ""))
+                )
                 rows_discord_html.append(
                     "<tr>"
                     f"<td class='tight'>{_h(signal[:50])}</td>"
                     f"<td>{_h(f.get('decoded', '')[:120])}</td>"
                     f"<td class='tight'>{_h(f.get('file', ''))}</td>"
-                    f"<td class='tight'>{_h(f.get('line', ''))}</td>"
+                    f"<td class='tight'>{toggle}</td>"
                     "</tr>"
+                    + (f"<tr id='{context_id}' class='source-context-row' style='display:none'><td colspan='4'><pre>{_h(context)}</pre></td></tr>" if context else "")
                 )
             if len(rows_discord_html) >= 40:
                 break
@@ -1008,7 +1112,7 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     :root {{ --bg:#0a1622; --panel:#122235; --panel-soft:#193149; --text:#ebf2f8; --muted:#9eb2c5; --good:#6fd89b; --warn:#ffd166; --bad:#ff6b6b; --accent:#2ad0ff; }}
     * {{ box-sizing:border-box; }}
     body {{ margin:0; font-family:"Segoe UI",Tahoma,Geneva,Verdana,sans-serif; background:radial-gradient(circle at top right,#1f3955,var(--bg) 55%); color:var(--text); min-height:100vh; }}
-    .wrap {{ width:min(1300px,96vw); margin:2rem auto; }}
+    .wrap {{ width:min(1900px,98vw); margin:1.25rem auto; }}
     .card {{ background:linear-gradient(160deg,var(--panel),var(--panel-soft)); border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:1.1rem; margin-bottom:1rem; box-shadow:0 16px 35px rgba(0,0,0,.28); }}
     h1,h2,h3 {{ margin:.2rem 0 .6rem; }}
     .triage-title {{ color:var(--accent); }}
@@ -1057,13 +1161,25 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
     .json-key {{ color:#9dd5ff; font-family:Consolas,Monaco,monospace; word-break:break-word; }}
     .json-val {{ color:#e9f2fa; font-family:Consolas,Monaco,monospace; word-break:break-word; }}
     .json-empty {{ color:var(--muted); font-style:italic; padding:.2rem 0 .35rem; }}
+    .finding-context summary {{ cursor:pointer; color:#9dd5ff; text-decoration:underline dotted; }}
+    .finding-context pre {{ margin-top:.5rem; width:min(100%,1100px); max-height:42rem; text-align:left; }}
+    .context-toggle {{ border:0; padding:0; background:none; color:#9dd5ff; text-decoration:underline dotted; cursor:pointer; font:inherit; }}
+    .source-context-row td {{ padding:.7rem 1rem 1rem; background:rgba(4,15,26,.72); }}
+    .source-context-row pre {{ width:100%; max-width:none; max-height:42rem; white-space:pre; overflow:auto; }}
     .findings-controls {{ margin-top:.55rem; display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }}
     .btn-link {{ display:inline-block; text-decoration:none; background:linear-gradient(120deg,#1ca4db,#58d5ff); color:#062134; border:none; border-radius:9px; padding:.45rem .75rem; font-weight:700; cursor:pointer; }}
     .table-empty {{ color:var(--muted); }}
-    .findings-table col.file-col {{ width:30ch; }}
-    .findings-table col.line-col {{ width:6ch; }}
-    .findings-table col.func-col {{ width:18ch; }}
-    .findings-table col.cat-col {{ width:16ch; }}
+    .findings-table col.file-col {{ width:24ch; }}
+    .findings-table col.line-col {{ width:7ch; }}
+    .findings-table col.func-col {{ width:16ch; }}
+    .findings-table col.cat-col {{ width:15ch; }}
+    .reconstructed-table col.file-col {{ width:28ch; }}
+    .reconstructed-table col.line-col {{ width:7ch; }}
+    .reconstructed-table col.func-col {{ width:20ch; }}
+    .reconstructed-table col.method-col {{ width:24ch; }}
+    .reconstructed-table td.func-col, .reconstructed-table td.method-col {{ white-space:normal; overflow-wrap:anywhere; word-break:normal; }}
+    .aes-table col.location-col {{ width:32ch; }}
+    .aes-table td.key-col {{ white-space:normal; overflow-wrap:anywhere; word-break:break-word; }}
     .findings-table td.func-col, .findings-table th.func-col {{ white-space:nowrap; overflow-wrap:normal; word-break:normal; }}
     .findings-table td.cat-col, .findings-table th.cat-col {{ white-space:nowrap; overflow-wrap:normal; word-break:normal; }}
     .behavior-table col.sev-col {{ width:10ch; }}
@@ -1214,11 +1330,13 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
       "<div class='table-wrap'><table class='smart-table'><thead><tr><th class='tight'>Weight</th><th class='tight'>File</th><th>Description</th></tr></thead><tbody>"
       + "".join(rows_heur) + "</tbody></table></div>"
       + "</div>") if rows_heur else ""}
-    {("<div class='card'><h2 class='triage-title'>Decoded Findings</h2>"
-      "<div class='table-wrap'><table class='smart-table findings-table'><colgroup><col class='file-col'><col class='line-col'><col class='func-col'><col class='cat-col'><col></colgroup><thead><tr><th class='tight'>File</th><th class='tight'>Line</th><th class='func-col'>Function</th><th class='cat-col'>Category</th><th>Decoded</th></tr></thead><tbody>"
+    {(("<div class='card'><h2 class='triage-title'>AES Keys Recovered</h2><div class='table-wrap'><table class='smart-table aes-table'><colgroup><col class='location-col'><col></colgroup><thead><tr><th>Location</th><th>Key material</th></tr></thead><tbody>" + "".join(rows_aes) + "</tbody></table></div></div>" if rows_aes else "")
+      + "<div class='card'><h2 class='triage-title'>Decoded Findings</h2>"
+      "<div class='table-wrap'><table class='smart-table findings-table'><colgroup><col class='file-col'><col class='line-col'><col class='func-col'><col class='cat-col'><col></colgroup><thead><tr><th class='tight'>File</th><th class='tight'>Line</th><th class='func-col'>Function</th><th class='cat-col'>Category</th><th>Decoded / Context</th></tr></thead><tbody>"
       + "".join(rows_find) + "</tbody></table></div>"
       + ("<div class='findings-controls' data-findings-controls='1' data-kind='findings' data-limit='200' data-step='200'><button type='button' class='btn-link findings-more-btn'>Show 200 more</button><button type='button' class='btn-link findings-all-btn'>Show all</button><div class='table-empty findings-toggle-status'>Showing first 200 of " + _h(len(rows_find)) + " rows.</div></div>" if len(rows_find) > findings_limit else "")
       + "</div>") if rows_find else ""}
+     {( "<div class='card'><h2 class='triage-title'>Reconstructed Strings</h2><div class='table-wrap'><table class='smart-table reconstructed-table'><colgroup><col class='file-col'><col class='line-col'><col class='func-col'><col><col class='method-col'></colgroup><thead><tr><th>File</th><th>Line</th><th>Function</th><th>Resolved string</th><th class='method-col'>Method</th></tr></thead><tbody>" + "".join(rows_reconstructed) + "</tbody></table></div></div>" if rows_reconstructed else "")}
     {("<div class='card'><h2 class='triage-title'>Behavior Indicators</h2>"
       "<div class='table-wrap'><table class='smart-table behavior-table'><colgroup><col class='sev-col'><col class='file-col'><col class='line-col'><col class='beh-col'><col></colgroup><thead><tr><th class='tight'>Severity</th><th class='tight'>File</th><th class='tight'>Line</th><th>Behavior</th><th>Evidence</th></tr></thead><tbody>"
       + "".join(rows_beh) + "</tbody></table></div>"
@@ -1232,6 +1350,16 @@ def render_html_report(payload: dict[str, Any], executive_summary: str = "") -> 
   </div>
   <script>
   (function () {{
+    document.querySelectorAll(".context-toggle").forEach(function (button) {{
+      button.addEventListener("click", function () {{
+        var target = document.getElementById(button.getAttribute("data-context-target"));
+        if (!target) return;
+        var open = target.style.display !== "none";
+        target.style.display = open ? "none" : "table-row";
+        button.setAttribute("aria-expanded", open ? "false" : "true");
+        button.textContent = (open ? "▶ " : "▼ ") + button.textContent.slice(2);
+      }});
+    }});
     // ── Show-more / show-all toggle ──
     var selectors = {{ findings: "tr[data-findings-extra='1']", behavior: "tr[data-behavior-extra='1']", artifact: "tr[data-artifact-extra='1']" }};
     document.querySelectorAll("[data-findings-controls='1']").forEach(function (ctrl) {{
@@ -2000,9 +2128,29 @@ def render_rich(
         t.add_column("Decoded", style="white", overflow="fold")
         _cat_prio = {"url": 1, "credential_or_identity_field": 2, "dynamic_execution": 3, "cryptocurrency_address": 4, "discord_indicator": 5, "rpc_template": 6, "path": 7, "http_header": 8, "comms_indicator": 9, "sensitive_game_data": 10, "hex_or_contract": 11, "string": 12, "base64_blob": 13, "hex_decoded_binary": 14, "base64_decoded_binary": 15}
         for f in sorted(findings, key=lambda x: (_cat_prio.get(x.category, 99), x.category, (x.decoded or "").lower())):
+            if f.category == "reconstructed_string":
+                continue
             decoded = f.decoded if not f.note else f"{f.decoded} [{f.note}]"
             t.add_row(f.category, f"{f.file}:{f.line}", f.function, decoded)
         console.print(t)
+
+    aes_keys = [
+        b for b in behaviors
+        if str(b.behavior) == "aes_key_recovered"
+    ]
+    if aes_keys:
+        _print_section(console, "AES Keys Recovered")
+        key_table = Table(show_lines=False, box=box.SIMPLE, expand=True)
+        key_table.add_column("Location", style="cyan")
+        key_table.add_column("Key", style="yellow", overflow="fold")
+        seen_aes = set()
+        for b in aes_keys:
+            key = (b.file, b.line, b.evidence)
+            if key in seen_aes:
+                continue
+            seen_aes.add(key)
+            key_table.add_row(f"{b.file}:{b.line}", b.evidence)
+        console.print(key_table)
 
     at = Table(show_lines=False, box=box.SIMPLE, expand=True)
     at.add_column("Category", style="green")
@@ -2063,8 +2211,9 @@ def render_rich(
     if runtime_c2.get("attempted"):
         _print_section(console, "Runtime C2 Resolution")
         if runtime_c2.get("resolved"):
+            decoy_note = " [DECOY / anti-analysis marker]" if runtime_c2.get("onchain_decoy") else ""
             console.print(f"[green]Resolved:[/green] yes via {runtime_c2.get('rpc_used')}")
-            console.print(f"C2 base URL: {runtime_c2.get('c2_base_url')}")
+            console.print(f"On-chain C2 base URL: {runtime_c2.get('c2_base_url')}{decoy_note}")
             console.print(f"Exfil endpoint: {runtime_c2.get('exfil_endpoint')}")
             console.print(f"Payload endpoint: {runtime_c2.get('payload_endpoint')}")
             console.print(f"Raw decoded response: {runtime_c2.get('decoded_response')}")
@@ -2517,12 +2666,29 @@ def _executive_summary_high_confidence_context(triage_payload: dict[str, Any]) -
         )
     )
 
-    if runtime_c2.get("resolved"):
-        lines.append(f"Resolved C2 domain: {runtime_c2.get('c2_base_url', '')}")
+    url_assembly = triage_payload.get("url_assembly", {}) or {}
+    real_domain = url_assembly.get("c2_domain", "") or ""
+    if real_domain:
+        lines.append(f"Resolved C2 domain: {real_domain} (source: {url_assembly.get('c2_domain_source', '')})")
+        for ep in url_assembly.get("assembled_urls", []) or []:
+            lines.append(f"Assembled endpoint ({ep.get('method', '?')}): {ep.get('url', '')}")
+    elif runtime_c2.get("resolved"):
+        decoy_note = " [DECOY / anti-analysis marker]" if runtime_c2.get("onchain_decoy") else ""
+        lines.append(f"Resolved C2 domain: {runtime_c2.get('c2_base_url', '')}{decoy_note}")
         if runtime_c2.get("exfil_endpoint"):
             lines.append(f"Exfil endpoint: {runtime_c2.get('exfil_endpoint')}")
         if runtime_c2.get("payload_endpoint"):
             lines.append(f"Payload endpoint: {runtime_c2.get('payload_endpoint')}")
+
+    # Surface any AES key material recovered from the sample.
+    aes_keys = [b for b in behaviors if str(b.get("behavior", "")) == "aes_key_recovered"]
+    seen_keys: set[str] = set()
+    for b in aes_keys:
+        ev = str(b.get("evidence", ""))
+        if not ev or ev in seen_keys:
+            continue
+        seen_keys.add(ev)
+        lines.append(f"Recovered AES key: {ev}")
 
     if stage2.get("enabled") or stage2.get("payload_url_resolved"):
         if stage2.get("payload_url_resolved"):
@@ -2671,7 +2837,7 @@ def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
             },
             data=json.dumps(req_body).encode("utf-8"),
         )
-        with request.urlopen(req, timeout=90) as resp:
+        with urlopen_with_proxy(req, timeout=90) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return ""
@@ -2755,7 +2921,7 @@ def build_deepseek_executive_summary(triage_payload: dict[str, Any]) -> str:
             },
             data=json.dumps(req_body).encode("utf-8"),
         )
-        with request.urlopen(req, timeout=90) as resp:
+        with urlopen_with_proxy(req, timeout=90) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return ""

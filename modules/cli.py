@@ -45,6 +45,39 @@ def _is_sha256_hex(value: str) -> bool:
     return bool(re.fullmatch(r"[a-fA-F0-9]{64}", (value or "").strip()))
 
 
+def _refresh_contexts_from_deciphered_copy(
+    detections: list,
+    scan_targets: list[tuple[Path, str]],
+) -> None:
+    """Attach a five-line clean-source window to every line-based detection."""
+    clean_roots = [root for root, prefix in scan_targets if prefix == "deciphered"]
+    original_roots = [root for root, prefix in scan_targets if prefix != "deciphered"]
+    for detection in detections:
+        rel = str(getattr(detection, "file", "") or "").replace("\\", "/")
+        if not rel.lower().endswith(".java"):
+            continue
+        try:
+            line = int(getattr(detection, "line", 0) or 0)
+        except Exception:
+            continue
+        # Line 1 and file-level synthetic findings do not identify a useful
+        # source location, so do not attach misleading package/header text.
+        if line <= 1 or rel in {".", ""}:
+            continue
+        relative = rel[len("deciphered/"):] if rel.lower().startswith("deciphered/") else rel
+        roots = clean_roots + original_roots
+        for root in roots:
+            candidate = root.joinpath(*relative.split("/"))
+            if not candidate.is_file():
+                continue
+            try:
+                source = candidate.read_text(encoding="utf-8", errors="replace")
+                detection.context = source_context(source, line, before=5, after=5)
+            except Exception:
+                pass
+            break
+
+
 def collect_ratterscanner_hashes(
     target_metadata: dict,
     artifacts: List[Any],
@@ -92,7 +125,7 @@ def lookup_ratterscanner(hashes: List[str], timeout: int = 20) -> dict:
     try:
         url = RATTERSCANNER_HASH_URL + ",".join(valid)
         req = request.Request(url, method="GET", headers={"User-Agent": "java-triage/1.0"})
-        with request.urlopen(req, timeout=timeout) as resp:
+        with urlopen_with_proxy(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
         if isinstance(data, dict) and isinstance(data.get("results"), list):
             out["results"] = data.get("results") or []
@@ -181,7 +214,7 @@ def lookup_jlab_static_scan(upload_path: Path, timeout: int = 45) -> dict:
                 "Content-Length": str(len(payload)),
             },
         )
-        with request.urlopen(req, timeout=timeout) as resp:
+        with urlopen_with_proxy(req, timeout=timeout) as resp:
             out["status_code"] = int(getattr(resp, "status", 200) or 200)
             out["retry_after"] = _parse_int_header(resp.headers, "Retry-After")
             out["rate_limit_limit"] = _parse_int_header(resp.headers, "X-RateLimit-Limit")
@@ -267,6 +300,10 @@ def _show_interactive_prompt(
     if c2_domain:
         print(f"\n  C2 domain: {c2_domain}")
         print(f"  Source: {url_assembly.get('c2_domain_source', 'unknown')}")
+    dynamic = url_assembly.get("dynamic_c2_domain", "")
+    if dynamic and dynamic != c2_domain:
+        decoy_tag = " [DECOY / anti-analysis]" if url_assembly.get("dynamic_c2_domain_decoy") else ""
+        print(f"  Dynamic on-chain C2: {dynamic} (source=blockchain_eth_call){decoy_tag}")
 
     print("\n  Assembled endpoints:")
     for entry in assembled:
@@ -279,7 +316,7 @@ def _show_interactive_prompt(
         print(f"    {entry.get('method', '?')} {entry['url']}{icon}")
 
     fallback = url_assembly.get("fallback_domain", "")
-    if fallback:
+    if fallback and fallback != c2_domain:
         print(f"\n  Fallback C2 domain: {fallback}")
 
     # ── Stage-2 download + decrypt prompt ──
@@ -297,11 +334,13 @@ def _show_interactive_prompt(
                 choice = input("  Download + decrypt this stage-2 payload? [Y/n]: ").strip().lower()
                 if choice in ("", "y", "yes"):
                     print(f"\n  \033[92mDownloading stage-2 payload...\033[0m")
+                    if load_proxies():
+                        print("  Using a random proxy from proxies.txt")
                     try:
                         # Download
                         blob_path = Path("stage2_payload.bin")
                         req = request.Request(cdn_url, headers={"User-Agent": "java-triage/1.0"}, method="GET")
-                        with request.urlopen(req, timeout=120) as resp, open(blob_path, "wb") as f:
+                        with urlopen_with_proxy(req, timeout=120) as resp, open(blob_path, "wb") as f:
                             shutil.copyfileobj(resp, f, length=1024 * 1024)
                         size = blob_path.stat().st_size
                         print(f"  Downloaded {size:,} bytes to {blob_path}")
@@ -309,9 +348,7 @@ def _show_interactive_prompt(
                         # Decrypt
                         _aes_decrypt_stage2_blob(str(blob_path))
                     except Exception as exc:
-                        print(f"  \033[91mDownload/decrypt failed: {exc}\033[0m")
-                        import traceback
-                        traceback.print_exc()
+                        print(f"  \033[91mDownload/decrypt failed: {_friendly_network_error(exc)}\033[0m")
                     break
                 elif choice in ("n", "no"):
                     print("  Skipped.")
@@ -385,7 +422,7 @@ def _dispatch_post_scan_action(action: dict, stage2_analysis: dict, url_assembly
         print(f"  Saving to: {out_name}")
         try:
             req = request.Request(url, headers={"User-Agent": "java-triage/1.0"}, method="GET")
-            with request.urlopen(req, timeout=60) as resp, open(out_name, "wb") as f:
+            with urlopen_with_proxy(req, timeout=60) as resp, open(out_name, "wb") as f:
                 shutil.copyfileobj(resp, f, length=1024 * 1024)
             size = Path(out_name).stat().st_size
             print(f"  \033[92mDownloaded {size:,} bytes to {out_name}\033[0m")
@@ -458,8 +495,7 @@ def _aes_decrypt_stage2_blob(blob_path_str: str) -> None:
       1. Read the raw blob bytes
       2. Extract first 9 bytes (version/meta header), then IV = bytes 9-24 (16 bytes)
       3. The remaining bytes are the ciphertext
-      4. Key: first 16 bytes of Base64.decoder.decode("dK9mT3nR7xQ2pL8wF4jH6yB1cN5gA0sZ12345678abc=")
-         which is bytes 32-47 of the 48-byte decoded blob
+      4. Key: bytes 16-31 of Base64.decoder.decode("dK9mT3nR7xQ2pL8wF4jH6yB1cN5gA0sZ12345678abc=")
       5. Decrypt with AES/CBC/NoPadding, strip PKCS5-style padding
       6. Write decrypted ZIP to disk
     """
@@ -1151,6 +1187,9 @@ def main() -> int:
         _deduped_findings.append(f)
     all_findings = _deduped_findings
 
+    # Findings from the original scan can have the right decoded token but an
+    # obfuscated source window. Prefer the corresponding auto-generated clean
+    # copy for the snippet whenever one was produced.
     behavior_findings.extend(detect_decoded_finding_behaviors(all_findings))
     mc_modules = detect_minecraft_modules(scan_root)
 
@@ -1306,6 +1345,9 @@ def main() -> int:
             key=lambda x: (x.file, x.line, x.behavior),
         )
 
+    # Populate HTML/JSON source windows after all behavioral detections exist.
+    _refresh_contexts_from_deciphered_copy(all_findings + behavior_findings, scan_targets)
+
     network_endpoint_assessment = assess_network_endpoints(all_findings)
     progress(show_progress, "Running Variant Signature Detections", progress_console)
     variant_detections = detect_variant_signatures(scan_root)
@@ -1368,10 +1410,11 @@ def main() -> int:
                            "and passed to the offline aes_cbc_nopadding_decrypt() helper.",
     }
     if not args.no_network:
-        progress(show_progress, "Resolving Runtime C2 From On-Chain Config", progress_console)
+        progress(show_progress, "Resolving Runtime C2 From On-Chain Config (bounded timeout; proxy failover enabled)", progress_console)
         runtime_c2 = resolve_runtime_c2(all_findings)
         if runtime_c2.get("resolved"):
-            progress(show_progress, f"Runtime C2 Resolved: {runtime_c2.get('c2_base_url')}", progress_console)
+            decoy_tag = " [DECOY/anti-analysis]" if runtime_c2.get("onchain_decoy") else ""
+            progress(show_progress, f"Runtime C2 Resolved (on-chain): {runtime_c2.get('c2_base_url')}{decoy_tag}", progress_console)
         else:
             progress(show_progress, f"Runtime C2 Unresolved: {runtime_c2.get('error', 'unknown error')}", progress_console)
 
@@ -1459,7 +1502,8 @@ def main() -> int:
                     deobf_stats.get("stringdecrypt_other_replaced", 0)
                 ) + int(deobf_stats.get("load_replaced", 0))
                 summary["reconstructed_strings"] = sum(
-                    1 for f in all_findings if "key_prefix_xor_stringbuilder" in (f.note or "")
+                    1 for f in all_findings
+                    if "key_prefix_xor_stringbuilder" in (f.note or "") or f.category == "reconstructed_string"
                 )
                 if decipher_stats:
                     summary["xor_decrypted_count"] = max(
@@ -1504,9 +1548,12 @@ def main() -> int:
                         "line": f.line,
                         "confidence": "high" if f.category != "string" else "medium",
                         "category": f.category,
+                        "function": f.function,
+                        "context": f.context,
+                        "note": f.note,
                     }
                     for f in all_findings
-                    if "key_prefix_xor_stringbuilder" in (f.note or "")
+                    if "key_prefix_xor_stringbuilder" in (f.note or "") or f.category == "reconstructed_string"
                 ],
                 "runtime_c2": runtime_c2,
                 "url_assembly": url_assembly,
@@ -1521,7 +1568,7 @@ def main() -> int:
                 "stage2_analysis": stage2_analysis,
                 "stage2_manual_payload_url": runtime_c2.get("payload_endpoint", ""),
                 "blockchain_indicators": blockchain,
-                "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
+                "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded)) if f.category != "reconstructed_string"],
                 "behavior_findings": [
                     {**b.__dict__, "severity": behavior_severity(b.behavior), "verdict_tier": behavior_verdict_tier(b.behavior)}
                     for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))
@@ -1616,13 +1663,18 @@ def main() -> int:
                     "decoded": f.decoded,
                     "file": f.file,
                     "line": f.line,
-                    "confidence": "high" if f.category != "string" else "medium",
-                    "category": f.category,
-                }
-                for f in all_findings
-                if "key_prefix_xor_stringbuilder" in (f.note or "")
+                "confidence": "high" if f.category != "string" else "medium",
+                "category": f.category,
+                "function": f.function,
+                "context": f.context,
+                "note": f.note,
+            }
+            for f in all_findings
+            if "key_prefix_xor_stringbuilder" in (f.note or "") or f.category == "reconstructed_string"
             ],
             "runtime_c2": runtime_c2,
+            "url_assembly": url_assembly,
+            "infra_probe": infra_probe,
             "ratter_scanner": ratter_scanner,
             "jlab_static_scan": jlab_static_scan,
             "network_endpoint_assessment": network_endpoint_assessment,
@@ -1633,7 +1685,7 @@ def main() -> int:
             "stage2_analysis": stage2_analysis,
             "stage2_manual_payload_url": runtime_c2.get("payload_endpoint", ""),
             "blockchain_indicators": blockchain,
-            "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded))],
+            "findings": [f.__dict__ for f in sorted(all_findings, key=lambda x: (x.file, x.line, x.decoded)) if f.category != "reconstructed_string"],
             "behavior_findings": [
                 {**b.__dict__, "severity": behavior_severity(b.behavior), "verdict_tier": behavior_verdict_tier(b.behavior)}
                 for b in sorted(behavior_findings, key=lambda x: (x.file, x.line, x.behavior))

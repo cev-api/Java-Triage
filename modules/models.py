@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 from urllib import error, request
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 try:
     from rich.console import Console
     from rich.table import Table
@@ -37,6 +38,105 @@ try:
     from magika import Magika
 except Exception:
     Magika = None
+
+
+def load_proxies(path: Path | str = "proxies.txt") -> list[dict[str, Any]]:
+    """Load proxy entries from ``ip:port`` or ``ip:port:user:password``.
+
+    A scheme may optionally be supplied (for example ``socks5://``); plain
+    entries are tried as HTTP and then SOCKS5. Blank lines and ``#`` comments are
+    ignored. Invalid entries are skipped so one bad line cannot disable the
+    scanner's network operations.
+    """
+    proxy_path = Path(path)
+    if not proxy_path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in proxy_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        value = raw.strip()
+        if not value or value.startswith("#"):
+            continue
+        scheme = "auto"
+        if "://" in value:
+            scheme, value = value.split("://", 1)
+            scheme = scheme.lower().strip()
+        parts = value.rsplit(":", 3)
+        if len(parts) not in (2, 4):
+            continue
+        host, port = parts[0].strip(), parts[1].strip()
+        if not host or not port.isdigit() or not 1 <= int(port) <= 65535:
+            continue
+        username = password = ""
+        if len(parts) == 4:
+            username, password = parts[2], parts[3]
+            if not username:
+                continue
+        if scheme not in {"auto", "http", "https", "socks5", "socks5h"}:
+            continue
+        out.append({"scheme": scheme, "host": host, "port": int(port), "username": username, "password": password})
+    return out
+
+
+def _proxy_url(proxy: dict[str, Any]) -> str:
+    auth = ""
+    if proxy.get("username"):
+        auth = f"{quote(str(proxy['username']), safe='')}:{quote(str(proxy.get('password', '')), safe='')}@"
+    scheme = "http" if proxy.get("scheme") == "auto" else str(proxy["scheme"])
+    return f"{scheme}://{auth}{proxy['host']}:{proxy['port']}"
+
+
+def urlopen_with_proxy(req: Any, timeout: int | float = 30):
+    """Open a URL through one random entry in proxies.txt when available.
+
+    HTTP(S) proxies use urllib's normal ProxyHandler. SOCKS5 support is
+    provided by optional PySocks; without it, the request fails with a clear
+    install message instead of silently making a direct connection.
+    """
+    proxies = load_proxies()
+    if not proxies:
+        return request.urlopen(req, timeout=timeout)
+    last_exc: Exception | None = None
+    # Randomize the order, but fail over so one dead/blocked proxy does not
+    # abort the stage-2 download immediately.
+    max_attempts = min(len(proxies), 3)
+    for proxy in random.sample(proxies, len(proxies))[:max_attempts]:
+        scheme = str(proxy["scheme"]).lower()
+        try:
+            if scheme in {"auto", "http", "https"}:
+                handler = request.ProxyHandler({"http": _proxy_url(proxy), "https": _proxy_url(proxy)})
+                try:
+                    return request.build_opener(handler).open(req, timeout=timeout)
+                except Exception:
+                    if scheme != "auto":
+                        raise
+                    # Plain entries can be either protocol; try SOCKS5 below.
+                    scheme = "socks5"
+            try:
+                import socks  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError("SOCKS5 proxy selected but PySocks is not installed; run: pip install PySocks") from exc
+            import socket
+            old_socket = socket.socket
+            socks.set_default_proxy(
+                socks.SOCKS5,
+                proxy["host"],
+                proxy["port"],
+                True,
+                proxy.get("username") or None,
+                proxy.get("password") or None,
+            )
+            socket.socket = socks.socksocket
+            try:
+                return request.urlopen(req, timeout=timeout)
+            finally:
+                socket.socket = old_socket
+                socks.set_default_proxy()
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise RuntimeError(f"All {max_attempts} proxy attempts failed; last error: {last_exc}") from last_exc
+    raise RuntimeError("No usable proxies found in proxies.txt")
 
 BANNER = r"""                                                 
      ██  █████  ██    ██  █████  ████████ ██████  ██  █████   ██████  ███████ 
@@ -238,6 +338,7 @@ BEHAVIOR_SEVERITY_MAP = {
     "dynamic_urlclassloader_usage": "medium",
     "obfuscator_or_packer_marker": "medium",
     "aes_string_constant_encryption": "medium",
+    "aes_key_recovered": "info",
     "binary_payload_download": "medium",
     "dynamic_class_execution": "medium",
     "stealth_relaunch": "medium",
@@ -490,6 +591,10 @@ class Finding:
     decoded: str
     category: str
     note: str = ""
+    # Source context is populated for high-signal findings (credentials,
+    # process execution, and stealer/payload markers).  Keeping it separate
+    # from ``decoded`` preserves the exact recovered string for JSON users.
+    context: str = ""
 
 
 @dataclass
@@ -498,6 +603,7 @@ class BehaviorFinding:
     line: int
     behavior: str
     evidence: str
+    context: str = ""
 
 
 @dataclass
