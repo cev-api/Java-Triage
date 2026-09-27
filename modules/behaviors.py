@@ -2868,6 +2868,209 @@ def detect_token_source_sink_behaviors(root: Path) -> List[BehaviorFinding]:
     return out
 
 
+def _resolve_java_string_expression(expression: str, constants: dict[str, str]) -> str | None:
+    parts = re.split(r"\s*\+\s*", expression.strip())
+    resolved: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            return None
+        if len(part) >= 2 and part[0] == '"' and part[-1] == '"':
+            try:
+                value = json.loads(part)
+            except Exception:
+                return None
+            if not isinstance(value, str):
+                return None
+            resolved.append(value)
+        elif re.fullmatch(r"[A-Za-z_$][\w$]*", part) and part in constants:
+            resolved.append(constants[part])
+        else:
+            return None
+    return "".join(resolved)
+
+
+def _resolve_java_string_constants(text: str) -> dict[str, str]:
+    declarations = [
+        (match.group("name"), match.group("expression"))
+        for match in re.finditer(
+            r"\bString\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?P<expression>[^;]+);",
+            text,
+        )
+    ]
+    constants: dict[str, str] = {}
+    for _ in range(len(declarations) + 1):
+        changed = False
+        for name, expression in declarations:
+            value = _resolve_java_string_expression(expression, constants)
+            if value is not None and constants.get(name) != value:
+                constants[name] = value
+                changed = True
+        if not changed:
+            break
+    return constants
+
+
+def analyze_static_credential_exfiltration(root: Path) -> dict[str, Any]:
+    """Correlate decoded credential sources, JSON aggregation, and HTTP POST sinks."""
+    sources: dict[str, tuple[str, str]] = {}
+    for path in iter_java_files(root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        sources[path.stem] = (str(path.relative_to(root)).replace("\\", "/"), text)
+
+    entry = sources.get("UnrealClient", ("", ""))
+    profile = sources.get("ProfileReader", ("", ""))
+    egress = sources.get("NetEgress", ("", ""))
+    entry_rel, entry_text = entry
+    profile_rel, profile_text = profile
+    egress_rel, egress_text = egress
+    if not all((entry_text, profile_text, egress_text)):
+        return {"status": "not_detected", "confirmed": False, "data_sources": [], "endpoints": []}
+
+    constants = _resolve_java_string_constants(egress_text)
+    endpoints: list[dict[str, Any]] = []
+    for call in re.finditer(r"\bsend\s*\(\s*(?P<endpoint>[^,;]+)\s*,", egress_text):
+        endpoint = _resolve_java_string_expression(call.group("endpoint"), constants)
+        parsed = urlparse(endpoint or "")
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        if any(item.get("url") == endpoint for item in endpoints):
+            continue
+        path = parsed.path or "/"
+        if path.rstrip("/").endswith("/ssid"):
+            purpose = "Minecraft username, UUID, and session token"
+            source_method = "sendSsid"
+        elif path.rstrip("/").endswith("/delivery"):
+            purpose = "Minecraft session fields plus collected Discord, browser, and client-account data"
+            source_method = "sendDelivery"
+        else:
+            purpose = "collected account data"
+            source_method = "send"
+        endpoints.append({
+            "method": "POST",
+            "url": endpoint,
+            "purpose": purpose,
+            "source_method": source_method,
+            "line": find_line(egress_text, f"{source_method}("),
+        })
+
+    post_sink = bool(
+        "HttpURLConnection" in egress_text
+        and "setRequestMethod" in egress_text
+        and any(value.upper() == "POST" for value in constants.values())
+        and "getOutputStream()" in egress_text
+        and re.search(r"\bos\.write\(", egress_text)
+    )
+    session_flow = bool(
+        "onInitializeClient()" in entry_text
+        and "new ProfileReader().getMcInfo()" in entry_text
+        and "getAccessToken()" in profile_text
+        and "ssidRoot.add(" in entry_text
+        and "NetEgress.sendSsid(ssidRoot.toString())" in entry_text
+        and "delivery.add(" in entry_text
+        and "NetEgress.sendDelivery(delivery.toString())" in entry_text
+    )
+    if not post_sink or not session_flow or not endpoints:
+        return {
+            "status": "not_proven",
+            "confirmed": False,
+            "data_sources": [],
+            "endpoints": endpoints,
+            "note": "Static cross-file source-to-sink conditions were incomplete.",
+        }
+
+    data_sources: list[dict[str, str]] = [{
+        "type": "Minecraft identity and session access token",
+        "file": profile_rel,
+        "line": find_line(profile_text, "getAccessToken()"),
+    }]
+    module_specs = [
+        (
+            "MessageIndex",
+            "Discord session tokens from local LevelDB stores",
+            "getTokens()",
+            "tokenRegex",
+            "Local Storage",
+            "delivery.add(K_DC",
+            "dTokens",
+        ),
+        (
+            "VaultModule",
+            "saved browser passwords decrypted from Chromium databases",
+            "grabPassword()",
+            "Codec.decrypt",
+            "Login Data",
+            "delivery.add(K_PW",
+            "pwArr",
+        ),
+        (
+            "WebStoreReader",
+            "browser cookies decrypted from Chromium databases",
+            "grabCookies()",
+            "Codec.decrypt",
+            "Network",
+            "delivery.addProperty(K_CK",
+            "cookieB64",
+        ),
+        (
+            "ArchiveReader",
+            "Lunar Client account data",
+            "grabLunar()",
+            "accounts.json",
+            "lunarclient",
+            "delivery.addProperty(K_LUNAR",
+            "lunarB64",
+        ),
+        (
+            "LocalCacheReader",
+            "Essential account data",
+            "grabEssential()",
+            "microsoft_accounts.json",
+            "essential",
+            "delivery.addProperty(K_ESS",
+            "essB64",
+        ),
+    ]
+    called_methods = set(re.findall(r"\b(?:\.\s*)?(grabPassword|grabCookies|grabLunar|grabEssential|getTokens)\s*\(", entry_text))
+    for class_name, label, required_call, source_marker, second_marker, delivery_marker, value_marker in module_specs:
+        rel, text = sources.get(class_name, ("", ""))
+        method_name = required_call.removesuffix("()")
+        if (
+            rel
+            and method_name in called_methods
+            and source_marker.lower() in text.lower()
+            and second_marker.lower() in text.lower()
+            and delivery_marker.lower() in entry_text.lower()
+            and value_marker.lower() in entry_text.lower()
+        ):
+            data_sources.append({"type": label, "file": rel, "line": find_line(text, required_call)})
+
+    endpoints = sorted(endpoints, key=lambda item: item["url"])
+    data_types = [item["type"] for item in data_sources]
+    delivery_endpoint = next((item for item in endpoints if item["url"].rstrip("/").endswith("/delivery")), None)
+    if delivery_endpoint:
+        delivery_endpoint["data_types"] = data_types
+    return {
+        "status": "confirmed_static_source_to_sink",
+        "confirmed": True,
+        "assessment": "Credential and account data are collected and sent to non-vendor HTTP endpoints.",
+        "trigger": "Fabric client initialization starts a worker that waits five seconds before collection.",
+        "collection_to_delivery": [
+            "Minecraft session fields are read by ProfileReader and sent through UnrealClient.",
+            "Credential modules collect local tokens, browser passwords/cookies, and supported client account data.",
+            "UnrealClient aggregates those values into JSON and calls NetEgress.sendDelivery.",
+            "NetEgress sends the JSON body using HTTP POST.",
+        ],
+        "data_sources": data_sources,
+        "endpoints": endpoints,
+        "network_sink": {"method": "HTTP POST", "file": egress_rel, "line": find_line(egress_text, "setRequestMethod")},
+        "entrypoint": {"file": entry_rel, "line": find_line(entry_text, "onInitializeClient()")},
+    }
+
+
 def detect_reachability_proof_chains(root: Path) -> List[BehaviorFinding]:
     out: List[BehaviorFinding] = []
     idx = _build_source_index(root)
@@ -4038,6 +4241,16 @@ def assemble_c2_urls(findings: List[Finding], runtime_c2: dict) -> dict:
                     fallback_source = "suspicious_domain_string"
                     break
 
+    static_sink_findings = [
+        finding for finding in findings
+        if "source=static_aes_gcm_source_to_sink" in str(finding.note or "")
+        and urlparse(str(finding.decoded or "")).hostname
+    ]
+    if static_sink_findings:
+        parsed_static = urlparse(str(static_sink_findings[0].decoded))
+        fallback_domain = parsed_static.hostname or fallback_domain
+        fallback_source = "statically_decoded_http_post_sink"
+
     onchain_domain = ""
     if runtime_c2.get("resolved"):
         cand = str(runtime_c2.get("decoded_response", "")).split("|", 1)[0].strip()
@@ -4108,12 +4321,21 @@ def assemble_c2_urls(findings: List[Finding], runtime_c2: dict) -> dict:
             if not result["cdn_path"]:
                 result["cdn_path"] = cdn_p
 
+    for finding in static_sink_findings:
+        full_url = str(finding.decoded).strip()
+        parsed = urlparse(full_url)
+        path = parsed.path or "/"
+        purpose = "Minecraft session identity and access token" if path.rstrip("/").endswith("/ssid") else "Collected credentials and account data"
+        description = f"HTTP POST: {purpose}; statically traced from collection code"
+        if not any(item.get("path") == path and item.get("method") == "POST" for item in result["endpoints"]):
+            result["endpoints"].append({"path": path, "description": description, "method": "POST", "url": full_url})
+
     # 4. Assemble full URLs
     domain = result["c2_domain"]
     result["assembled_urls"] = []
     for ep in result["endpoints"]:
-        if domain and ep["path"]:
-            full = f"https://{domain}{ep['path']}"
+        if ep["path"] and (domain or ep.get("url")):
+            full = ep.get("url") or f"https://{domain}{ep['path']}"
             result["assembled_urls"].append({
                 "url": full,
                 "path": ep["path"],
@@ -4855,6 +5077,7 @@ def build_contradiction_notes(behaviors: List[BehaviorFinding]) -> List[str]:
         "proof_token_source_to_network_sink",
         "proof_reachable_command_token_disclosure_chain",
         "proof_minecraft_token_raw_socket_exfil_chain",
+        "proof_credential_collection_to_network_sink",
     }
     if "minecraft_access_token_access" in by_behavior and not (by_behavior & token_proofs):
         notes.append("Access token is read, but no confirmed automatic token exfiltration path was proven.")

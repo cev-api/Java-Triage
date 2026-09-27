@@ -1158,6 +1158,21 @@ def main() -> int:
             all_findings.extend(_apply_prefix_findings(c_items, prefix))
             target_finding_counts[str(target_root.resolve())] = target_finding_counts.get(str(target_root.resolve()), 0) + len(c_items)
 
+    analysis_root = deciphered_root if deciphered_root is not None else scan_root
+    exfiltration_analysis = analyze_static_credential_exfiltration(analysis_root)
+    if exfiltration_analysis.get("confirmed"):
+        for endpoint in exfiltration_analysis.get("endpoints", []) or []:
+            all_findings.append(
+                Finding(
+                    file=str(exfiltration_analysis.get("network_sink", {}).get("file", "")),
+                    line=int(endpoint.get("line", 1) or 1),
+                    function=str(endpoint.get("source_method", "")),
+                    decoded=str(endpoint.get("url", "")),
+                    category="url",
+                    note="source=static_aes_gcm_source_to_sink signal=credential_exfiltration_endpoint",
+                )
+            )
+
     all_findings = sorted(
         {(f.file, f.line, f.function, f.decoded, f.category, f.note): f for f in all_findings}.values(),
         key=lambda x: (x.file, x.line, x.decoded, x.category),
@@ -1318,6 +1333,29 @@ def main() -> int:
             f"(detected {mc_modules['module_count']} hack modules — these are expected in a client mod)",
             progress_console,
         )
+
+    if exfiltration_analysis.get("confirmed"):
+        sink = exfiltration_analysis.get("network_sink", {}) or {}
+        source_summary = "; ".join(item.get("type", "") for item in exfiltration_analysis.get("data_sources", []) or [])
+        endpoint_summary = ", ".join(item.get("url", "") for item in exfiltration_analysis.get("endpoints", []) or [])
+        evidence = (
+            f"Cross-file source-to-sink chain confirmed: {source_summary}. "
+            f"Aggregated JSON is sent by HTTP POST to {endpoint_summary}."
+        )
+        behavior_findings.extend([
+            BehaviorFinding(
+                file=str(sink.get("file", "")),
+                line=int(sink.get("line", 1) or 1),
+                behavior="proof_credential_collection_to_network_sink",
+                evidence=evidence,
+            ),
+            BehaviorFinding(
+                file=str(sink.get("file", "")),
+                line=int(sink.get("line", 1) or 1),
+                behavior="assessment_suspicious_static_credential_exfiltration",
+                evidence=evidence,
+            ),
+        ])
 
     # Initialize runtime C2 state before any downstream classification uses it.
     runtime_c2 = {"attempted": False, "resolved": False}
@@ -1556,6 +1594,7 @@ def main() -> int:
                     if "key_prefix_xor_stringbuilder" in (f.note or "") or f.category == "reconstructed_string"
                 ],
                 "runtime_c2": runtime_c2,
+                "exfiltration_analysis": exfiltration_analysis,
                 "url_assembly": url_assembly,
                 "infra_probe": infra_probe,
                 "ratter_scanner": ratter_scanner,
@@ -1673,6 +1712,7 @@ def main() -> int:
             if "key_prefix_xor_stringbuilder" in (f.note or "") or f.category == "reconstructed_string"
             ],
             "runtime_c2": runtime_c2,
+            "exfiltration_analysis": exfiltration_analysis,
             "url_assembly": url_assembly,
             "infra_probe": infra_probe,
             "ratter_scanner": ratter_scanner,

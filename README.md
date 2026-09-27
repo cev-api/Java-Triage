@@ -50,6 +50,8 @@ Under the hood, it combines bytecode-aware decompilation, constant-pool fallback
 ### Infrastructure & Enrichment
 - Resolves runtime C2 from on-chain Ethereum/Polygon `eth_call` data.
 - Assembles full C2 URLs from decoded fragments and probes endpoints without downloading payloads.
+- Statically decrypts Java AES-GCM string helpers when the fixed key and call sites are present, and reports recovered key material.
+- Correlates credential sources, JSON aggregation, and HTTP POST sinks across Java files so reports show collection-to-delivery flow and full endpoints.
 - Uses `proxies.txt` for runtime C2, stage-2 downloads, endpoint probes, and external lookups when the file is present. Proxy attempts are randomized and bounded; blocked proxies are retried with other entries.
 - Enriches results with RatterScanner when network access is allowed. JLab public static scan uploads are temporarily disabled while the service is offline.
 - Extracts blockchain indicators, custom header fingerprints, and payload/persistence endpoint clues.
@@ -209,9 +211,11 @@ The tool can generate an AI executive summary using either OpenAI or DeepSeek.
   - `openai`: use only OpenAI
   - `deepseek`: use only DeepSeek
 - `TRIAGE_OPENAI_MODEL`: OpenAI model override (default: `gpt-4.1-mini`)
-- `TRIAGE_DEEPSEEK_MODEL`: DeepSeek model override (default: `deepseek-v4-flash`)
-  - Common values: `deepseek-v4-flash`, `deepseek-v4-pro`
+- `TRIAGE_DEEPSEEK_MODEL`: DeepSeek model override (default: `deepseek-flash`)
+  - Common values: `deepseek-flash`, `deepseek-v4-pro`
 - `TRIAGE_DEEPSEEK_REASONING_EFFORT`: DeepSeek reasoning effort (default: `high`)
+- DeepSeek requests use `https://api.deepseek.com/chat/completions` and connect directly by default. Set `TRIAGE_LLM_USE_PROXY=1` to route summary requests through the configured `proxies.txt` list.
+- JSON and HTML reports record whether summary generation succeeded and include a sanitized provider error when it fails.
 
 If neither API key is present, the tool behaves as if this feature does not exist and does not mention AI in the output.
 

@@ -289,6 +289,8 @@ ASSESSMENT_PREFIX = "assessment_"
 BEHAVIOR_SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
 BEHAVIOR_SEVERITY_MAP = {
+    "proof_credential_collection_to_network_sink": "critical",
+    "assessment_suspicious_static_credential_exfiltration": "critical",
     "assessment_suspicious_possible_credential_exfiltration": "high",
     "assessment_suspicious_remote_mod_dropper": "high",
     "assessment_suspicious_embedded_mod_dropper": "high",
@@ -544,7 +546,7 @@ MAJOR_ENCRYPTED_MIN_CALLS = 200
 MAJOR_ENCRYPTED_MIN_FILE_RATIO = 0.20
 MAJOR_ENCRYPTED_MIN_FILES_WITH_CALLS = 5
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
-DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 RATTERSCANNER_HASH_URL = "https://api.ratterscanner.com/hash/"
 JLAB_STATIC_SCAN_URL = "https://jlab.threat.rip/api/public/static-scan"
 JLAB_MAX_UPLOAD_BYTES = 50 * 1024 * 1024

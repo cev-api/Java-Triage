@@ -2680,15 +2680,23 @@ def _executive_summary_high_confidence_context(triage_payload: dict[str, Any]) -
         if runtime_c2.get("payload_endpoint"):
             lines.append(f"Payload endpoint: {runtime_c2.get('payload_endpoint')}")
 
-    # Surface any AES key material recovered from the sample.
-    aes_keys = [b for b in behaviors if str(b.get("behavior", "")) == "aes_key_recovered"]
-    seen_keys: set[str] = set()
-    for b in aes_keys:
-        ev = str(b.get("evidence", ""))
-        if not ev or ev in seen_keys:
-            continue
-        seen_keys.add(ev)
-        lines.append(f"Recovered AES key: {ev}")
+    exfiltration = triage_payload.get("exfiltration_analysis", {}) or {}
+    if exfiltration.get("confirmed"):
+        lines.append("Static source-to-sink analysis: confirmed credential and session data collection followed by HTTP POST delivery.")
+        lines.append(str(exfiltration.get("trigger", "")))
+        for step in exfiltration.get("collection_to_delivery", []) or []:
+            lines.append(f"- {step}")
+        for source in exfiltration.get("data_sources", []) or []:
+            lines.append(f"Collected data: {source.get('type', '')}")
+
+    # This is the sample's static Java string-decryption key. It is separate
+    # from any per-user browser credential key protected by Windows DPAPI.
+    decipher = triage_payload.get("decipher", {}) or {}
+    for key in decipher.get("recovered_crypto_keys", []) or []:
+        lines.append(
+            f"Recovered {key.get('algorithm', 'AES')} key for {key.get('purpose', 'static decryption')}: "
+            f"hex={key.get('key_hex', '')}"
+        )
 
     if stage2.get("enabled") or stage2.get("payload_url_resolved"):
         if stage2.get("payload_url_resolved"):
@@ -2754,6 +2762,9 @@ def _force_malicious_verdict(triage_payload: dict[str, Any]) -> bool:
     if confirmed <= 0:
         return False
 
+    if (triage_payload.get("exfiltration_analysis", {}) or {}).get("confirmed"):
+        return True
+
     if runtime_c2.get("resolved") and (runtime_c2.get("exfil_endpoint") or runtime_c2.get("payload_endpoint")):
         if behavior_names & {
             "two_payload_exfil_architecture",
@@ -2797,16 +2808,67 @@ def _reinforce_executive_summary_text(text: str, triage_payload: dict[str, Any])
     if any("cheat client" in line.lower() for line in lines[1:]):
         lines.insert(
             1,
-            "- Cheat-client modules are present, but the resolved C2, staged payload path, and exfiltration architecture make this malware.",
+            "- The confirmed credential collection and HTTP POST delivery to the recovered C2 establish malicious behavior.",
         )
 
     return "\n".join(lines).strip()
 
 
-def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+def _append_recovered_string_keys(summary: str, triage_payload: dict[str, Any]) -> str:
+    keys = (triage_payload.get("decipher", {}) or {}).get("recovered_crypto_keys", []) or []
+    if not summary or not keys:
+        return summary
+    lines = [summary.rstrip(), "", "RECOVERED STATIC STRING KEY"]
+    for key in keys:
+        lines.append(
+            f"{key.get('algorithm', 'AES')} ({key.get('purpose', 'static Java string decryption')}): "
+            f"hex={key.get('key_hex', '')}; base64={key.get('key_base64', '')}"
+        )
+    lines.append("This key decrypts embedded Java strings; browser credential decryption uses separate per-user Windows-protected material.")
+    return "\n".join(lines)
+
+
+def _safe_llm_error(exc: Exception, api_key: str = "") -> str:
+    if isinstance(exc, error.HTTPError):
+        reason = str(exc.reason or "request rejected")
+        message = f"HTTP {exc.code}: {reason}"
+    elif isinstance(exc, error.URLError):
+        message = f"Network error: {exc.reason}"
+    else:
+        message = f"{exc.__class__.__name__}: {exc}"
+    if api_key:
+        message = message.replace(api_key, "[redacted]")
+    message = re.sub(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@", r"\1[credentials]@", message)
+    message = re.sub(r"(?i)Bearer\s+[^\s,;]+", "Bearer [redacted]", message)
+    return message[:300]
+
+
+def _open_llm_request(req: Any, timeout: int = 90):
+    # LLM calls go direct by default. The scanner's proxy list is often used
+    # for unrelated infrastructure probes and may contain dead or SOCKS-only
+    # entries. Proxy routing remains available as an explicit opt-in.
+    if os.getenv("TRIAGE_LLM_USE_PROXY", "").strip() == "1":
+        return urlopen_with_proxy(req, timeout=timeout)
+    opener = request.build_opener(request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
+
+
+def _request_executive_summary(provider: str, triage_payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    provider = provider.lower()
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        model = os.getenv("TRIAGE_OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+        endpoint = OPENAI_CHAT_COMPLETIONS_URL
+    else:
+        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        model = os.getenv("TRIAGE_DEEPSEEK_MODEL", "deepseek-flash").strip() or "deepseek-flash"
+        endpoint = DEEPSEEK_CHAT_COMPLETIONS_URL
+
+    attempt: dict[str, Any] = {"provider": provider, "model": model}
     if not api_key:
-        return ""
+        attempt.update(status="skipped", error=f"{provider.upper()}_API_KEY is not set")
+        return "", attempt
+
     compact_json = json.dumps(triage_payload, ensure_ascii=False, separators=(",", ":"))
     max_chars = 120000
     if len(compact_json) > max_chars:
@@ -2818,18 +2880,21 @@ def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
         + "\n\nTriage JSON (truncated where necessary):\n"
         + compact_json
     )
-    model = os.getenv("TRIAGE_OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
-    req_body = {
+    req_body: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": "You are a senior malware analyst. Be concise, structured, and objective."},
             {"role": "user", "content": user_text},
         ],
-        "temperature": 0.2,
     }
+    if provider == "deepseek":
+        req_body["reasoning_effort"] = os.getenv("TRIAGE_DEEPSEEK_REASONING_EFFORT", "high").strip() or "high"
+        req_body["thinking"] = {"type": "enabled"}
+    else:
+        req_body["temperature"] = 0.2
     try:
         req = request.Request(
-            OPENAI_CHAT_COMPLETIONS_URL,
+            endpoint,
             method="POST",
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -2837,11 +2902,21 @@ def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
             },
             data=json.dumps(req_body).encode("utf-8"),
         )
-        with urlopen_with_proxy(req, timeout=90) as resp:
+        with _open_llm_request(req, timeout=90) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
-        return ""
-    return _reinforce_executive_summary_text(_extract_chat_completions_output_text(data), triage_payload)
+        summary = _reinforce_executive_summary_text(_extract_chat_completions_output_text(data), triage_payload)
+        if not summary:
+            attempt.update(status="error", error="API response did not contain summary text")
+            return "", attempt
+        attempt["status"] = "ok"
+        return summary, attempt
+    except Exception as exc:
+        attempt.update(status="error", error=_safe_llm_error(exc, api_key))
+        return "", attempt
+
+
+def build_openai_executive_summary(triage_payload: dict[str, Any]) -> str:
+    return _request_executive_summary("openai", triage_payload)[0]
 
 
 def _extract_chat_completions_output_text(payload: dict[str, Any]) -> str:
@@ -2886,56 +2961,28 @@ def _normalize_executive_summary_text(text: str) -> str:
 
 
 def build_deepseek_executive_summary(triage_payload: dict[str, Any]) -> str:
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        return ""
-    compact_json = json.dumps(triage_payload, ensure_ascii=False, separators=(",", ":"))
-    max_chars = 120000
-    if len(compact_json) > max_chars:
-        compact_json = compact_json[:max_chars] + "...<truncated>"
-    user_text = (
-        OPENAI_EXEC_SUMMARY_INSTRUCTION
-        + "\n\nHIGH-CONFIDENCE FACTS:\n"
-        + _executive_summary_high_confidence_context(triage_payload)
-        + "\n\nTriage JSON (truncated where necessary):\n"
-        + compact_json
-    )
-    model = os.getenv("TRIAGE_DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
-    req_body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a senior malware analyst. Be concise, structured, and objective."},
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": 0.2,
-        "reasoning_effort": os.getenv("TRIAGE_DEEPSEEK_REASONING_EFFORT", "high").strip() or "high",
-        "thinking": {"type": "enabled"},
-    }
-    try:
-        req = request.Request(
-            DEEPSEEK_CHAT_COMPLETIONS_URL,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(req_body).encode("utf-8"),
-        )
-        with urlopen_with_proxy(req, timeout=90) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
-        return ""
-    return _reinforce_executive_summary_text(_extract_chat_completions_output_text(data), triage_payload)
+    return _request_executive_summary("deepseek", triage_payload)[0]
 
 
 def build_executive_summary(triage_payload: dict[str, Any]) -> str:
     provider = os.getenv("TRIAGE_LLM_PROVIDER", "auto").strip().lower()
-    if provider in {"openai", "oai"}:
-        return build_openai_executive_summary(triage_payload)
-    if provider in {"deepseek", "ds"}:
-        return build_deepseek_executive_summary(triage_payload)
-    summary = build_openai_executive_summary(triage_payload)
-    if summary:
-        return summary
-    return build_deepseek_executive_summary(triage_payload)
+    aliases = {"oai": "openai", "ds": "deepseek"}
+    provider = aliases.get(provider, provider)
+    configured = [name for name, env_name in (("openai", "OPENAI_API_KEY"), ("deepseek", "DEEPSEEK_API_KEY")) if os.getenv(env_name, "").strip()]
+    if provider not in {"auto", "openai", "deepseek"}:
+        return ""
+
+    if provider == "auto":
+        providers = configured
+    else:
+        providers = [provider]
+
+    if not providers:
+        return ""
+
+    for selected in providers:
+        summary, _attempt = _request_executive_summary(selected, triage_payload)
+        if summary:
+            return _append_recovered_string_keys(summary, triage_payload)
+    return ""
 __all__ = [name for name in globals() if not name.startswith("__")]

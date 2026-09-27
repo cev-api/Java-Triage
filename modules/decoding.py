@@ -455,6 +455,119 @@ def aes_cbc_pkcs5_literal_decrypt(raw_literal: str) -> str | None:
         return None
 
 
+_AES_GCM_STATIC_KEY_RE = re.compile(
+    r"\b(?:private\s+|protected\s+|public\s+)?(?:static\s+)?(?:final\s+)?"
+    r"byte\s*\[\s*\]\s*(?P<name>[A-Za-z_$][\w$]*)\s*=\s*new\s+byte\s*\[\s*\]"
+    r"\s*\{(?P<values>[^}]*)\}",
+    re.DOTALL,
+)
+_AES_GCM_STATIC_CALL_RE = re.compile(
+    r"(?P<owner>[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)"
+    r"\s*\.\s*(?P<method>[A-Za-z_$][\w$]*)\s*\(\s*"
+    r"new\s+byte\s*\[\s*\]\s*\{(?P<iv>[^{}]*)\}\s*,\s*"
+    r"new\s+byte\s*\[\s*\]\s*\{(?P<ciphertext>[^{}]*)\}\s*\)",
+    re.DOTALL,
+)
+
+
+def _discover_static_aes_gcm_keys(java_files: Iterable[Path]) -> tuple[dict[str, bytes], list[dict[str, str]]]:
+    """Read fixed AES/GCM keys from Java decryptor helpers without loading classes."""
+    keys_by_class: dict[str, bytes] = {}
+    records: list[dict[str, str]] = []
+    seen: set[tuple[str, bytes]] = set()
+    for path in java_files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if "AES/GCM/NoPadding" not in text or "GCMParameterSpec" not in text or "SecretKeySpec" not in text:
+            continue
+        package_match = re.search(r"\bpackage\s+([A-Za-z_$][\w$.]*)\s*;", text)
+        class_name = path.stem
+        qualified_name = f"{package_match.group(1)}.{class_name}" if package_match else class_name
+        candidates: list[tuple[int, bytes]] = []
+        for match in _AES_GCM_STATIC_KEY_RE.finditer(text):
+            name = match.group("name")
+            if name.lower() not in {"key", "aeskey", "stringkey", "strkey"}:
+                continue
+            values = parse_java_byte_list(match.group("values"))
+            key = bytes(value & 0xFF for value in values)
+            if len(key) not in {16, 24, 32}:
+                continue
+            priority = 0 if name.upper() == "KEY" else 1
+            candidates.append((priority, key))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: item[0])
+        key = candidates[0][1]
+        keys_by_class[class_name.lower()] = key
+        record_id = (qualified_name, key)
+        if record_id in seen:
+            continue
+        seen.add(record_id)
+        records.append({
+            "class": qualified_name,
+            "field": next(
+                (m.group("name") for m in _AES_GCM_STATIC_KEY_RE.finditer(text)
+                 if bytes(value & 0xFF for value in parse_java_byte_list(m.group("values"))) == key),
+                "KEY",
+            ),
+            "algorithm": f"AES-{len(key) * 8}-GCM",
+            "purpose": "static Java string decryption",
+            "key_hex": key.hex(),
+            "key_base64": base64.b64encode(key).decode("ascii"),
+        })
+    return keys_by_class, records
+
+
+def _decrypt_static_aes_gcm_call(match: re.Match[str], keys_by_class: dict[str, bytes]) -> str | None:
+    if AES is None:
+        return None
+    owner = re.sub(r"\s+", "", match.group("owner")).split(".")[-1].lower()
+    key = keys_by_class.get(owner)
+    if key is None:
+        return None
+    iv_values = parse_java_byte_list(match.group("iv"))
+    ciphertext_values = parse_java_byte_list(match.group("ciphertext"))
+    iv = bytes(value & 0xFF for value in iv_values)
+    ciphertext = bytes(value & 0xFF for value in ciphertext_values)
+    if not iv or len(ciphertext) < 16:
+        return None
+    try:
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv, mac_len=16)
+        plaintext = cipher.decrypt_and_verify(ciphertext[:-16], ciphertext[-16:])
+        decoded = plaintext.decode("utf-8")
+    except Exception:
+        return None
+    if not decoded or not all(ch.isprintable() or ch in "\r\n\t" for ch in decoded):
+        return None
+    return decoded
+
+
+def _rewrite_static_aes_gcm_calls(
+    java_source: str,
+    keys_by_class: dict[str, bytes],
+) -> tuple[str, int, int]:
+    """Replace statically decryptable helper calls such as StrCrypt.d(iv, ct)."""
+    spans: list[tuple[int, int, str]] = []
+    failed = 0
+    for match in _AES_GCM_STATIC_CALL_RE.finditer(java_source):
+        owner = re.sub(r"\s+", "", match.group("owner")).split(".")[-1].lower()
+        if owner not in keys_by_class:
+            continue
+        decoded = _decrypt_static_aes_gcm_call(match, keys_by_class)
+        if decoded is None:
+            failed += 1
+            continue
+        spans.append((match.start(), match.end(), _java_string_literal_escape(decoded)))
+    result = java_source
+    replaced = 0
+    for start, end, replacement in sorted(spans, key=lambda item: item[0], reverse=True):
+        result = result[:start] + replacement + result[end:]
+        replaced += 1
+    return result, replaced, failed
+
+
 def aes_decryptable_literal_count(text: str) -> int:
     """Count AES-encrypted string constants in a source file (probe helper)."""
     n = 0
@@ -667,8 +780,13 @@ def produce_deciphered_copy(
     total_failed = 0
     total_aes_replaced = 0
     total_aes_failed = 0
+    total_aes_gcm_replaced = 0
+    total_aes_gcm_failed = 0
     files_changed = 0
     total_java = len(java_files)
+    gcm_keys_by_class, recovered_crypto_keys = _discover_static_aes_gcm_keys(
+        p for p in scan_root.rglob("*.java") if p.is_file()
+    )
     for idx, path in enumerate(java_files, start=1):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -676,27 +794,34 @@ def produce_deciphered_copy(
             continue
         new_text, repl, fail = _rewrite_xor_strings_in_java_source(text)
         aes_text, aes_repl, aes_fail = _rewrite_aes_string_decrypt_calls(new_text)
-        if repl + aes_repl > 0:
+        gcm_text, gcm_repl, gcm_fail = _rewrite_static_aes_gcm_calls(aes_text, gcm_keys_by_class)
+        if repl + aes_repl + gcm_repl > 0:
             try:
-                path.write_text(aes_text, encoding="utf-8")
+                path.write_text(gcm_text, encoding="utf-8")
                 files_changed += 1
                 total_replaced += repl
                 total_failed += fail
                 total_aes_replaced += aes_repl
                 total_aes_failed += aes_fail
+                total_aes_gcm_replaced += gcm_repl
+                total_aes_gcm_failed += gcm_fail
             except Exception:
                 total_failed += repl
                 total_aes_failed += aes_repl
+                total_aes_gcm_failed += gcm_repl
         if show_progress and (idx == 1 or idx % 50 == 0 or idx == total_java):
-            progress(show_progress, f"deciphering {idx}/{total_java} replaced={total_replaced} aes={total_aes_replaced} files_changed={files_changed}", progress_console)
+            progress(show_progress, f"deciphering {idx}/{total_java} replaced={total_replaced} aes={total_aes_replaced + total_aes_gcm_replaced} files_changed={files_changed}", progress_console)
     stats = {
         "java_files": total_java, "files_changed": files_changed,
         "strings_replaced": total_replaced + total_aes_replaced,
-        "strings_failed": total_failed + total_aes_failed,
+        "strings_failed": total_failed + total_aes_failed + total_aes_gcm_failed,
         "xor_strings_replaced": total_replaced,
         "xor_strings_failed": total_failed,
-        "aes_strings_replaced": total_aes_replaced,
-        "aes_strings_failed": total_aes_failed,
+        "aes_strings_replaced": total_aes_replaced + total_aes_gcm_replaced,
+        "aes_strings_failed": total_aes_failed + total_aes_gcm_failed,
+        "aes_gcm_strings_replaced": total_aes_gcm_replaced,
+        "aes_gcm_strings_failed": total_aes_gcm_failed,
+        "recovered_crypto_keys": recovered_crypto_keys,
         "output_root": str(out_root),
     }
     return out_root, stats
